@@ -1,0 +1,39 @@
+[package]
+name = "vals-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Enables the SPDK-backed zone storage provider (SpdkZoneStore: many per-zone
+# engines over one NVMe namespace via the device-region allocator). Pulls in the
+# real SPDK backend; filled in on hardware with a dedicated scratch NVMe.
+spdk = ["vals-spdk/spdk"]
+
+# Leaderless (Dynamo-style) data path: versioning (HLC), the consistent-hash
+# ring, the replication coordinator (W/R quorum), and healing. The coordinator
+# fans writes/reads out concurrently on the thread-per-core executor (vals-rt).
+[dependencies]
+# The slim client-facing crate (coordinator + transport + wire types). This
+# crate re-exports it so `vals_cluster::…` paths stay stable; a plain client
+# depends on `vals-client` directly and never compiles the server/PD/store code.
+vals-client = { path = "../vals-client" }
+vals-spdk = { path = "../vals-spdk" }
+vals-store = { path = "../vals-store" }
+vals-rt = { path = "../vals-rt" }
+# Control plane (placement driver): cluster membership agreed via Raft.
+vals-raft = { path = "../vals-raft" }
+# epoll/timerfd for the socket readiness reactor (the executor's poll_io for
+# network I/O); std exposes no readiness primitive.
+libc = "0.2"
+# Non-blocking connect (std only offers blocking connect); keeps the executor
+# thread from stalling on pool growth to a slow/dead peer.
+socket2 = { version = "0.5", features = ["all"] }
+# The observability facade (see `observe`): state-changing transitions log
+# through it; already in the graph transitively via raft/slog.
+log = "0.4"
+
+[dev-dependencies]
+vals-store = { path = "../vals-store", features = ["test-fixtures"] }

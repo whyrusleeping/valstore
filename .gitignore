@@ -1,0 +1,13 @@
+/target
+*.img
+__pycache__/
+*.pyc
+# Vendored SPDK (built locally, linked via FFI; not committed to our history).
+/third_party
+# Agent session state / machine-local locks (not project history).
+/.ycc/
+/.claude/
+/.wt/
+# Local-only: agent memory notes and hardware experiment data/harnesses.
+/memory.md
+/bench/

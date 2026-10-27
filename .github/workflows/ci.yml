@@ -1,0 +1,28 @@
+name: Software CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  software:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          channel=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal -c clippy -c rustfmt
+      - name: Run locked software lane
+        run: scripts/ci.sh
+      - name: Retain software CI logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: software-ci-logs
+          path: target/ci-logs/
+          if-no-files-found: warn

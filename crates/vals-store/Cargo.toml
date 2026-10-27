@@ -1,0 +1,25 @@
+[package]
+name = "vals-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+test-fixtures = []
+heap-profile = []
+
+[dependencies]
+vals-rt = { path = "../vals-rt" }
+vals-spdk = { path = "../vals-spdk" }
+# Facade for the one info-level log a large-device format emits (mirrors the
+# cluster's `wipe_region`); a multi-second format must be visible, never silent.
+log = "0.4"
+# Inline small vectors for the staged point-read probes (task 0104): a cold key's
+# candidate-block locators (and each locator's covered-segment LBAs) stay
+# allocation-free on the hot Apply/BatchApply resolve path.
+smallvec = "1"
+libc = "0.2"
+
+[dev-dependencies]
+backtrace = "0.3"

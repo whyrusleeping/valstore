@@ -1,0 +1,20 @@
+[package]
+name = "vals-raft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# First external dependencies in the project: TiKV's raft-rs (sans-IO Raft) and
+# slog (its logging facade). We drive the RawNode and provide storage/transport.
+[dependencies]
+raft = "0.7"
+slog = "2"
+# Bridge raft-rs's slog records onto the standard facade (see `SlogToLog`), so
+# control-plane events surface through the same logger as the rest of vals.
+log = "0.4"
+# raft-rs's Message is a rust-protobuf type; we (de)serialize it for the peer
+# transport. Pinned to raft-rs's protobuf version.
+protobuf = "2.28"
+vals-spdk = { path = "../vals-spdk" }
+vals-store = { path = "../vals-store" }

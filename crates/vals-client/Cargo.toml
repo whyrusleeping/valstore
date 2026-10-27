@@ -1,0 +1,26 @@
+[package]
+name = "vals-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The slim client-facing crate: the leaderless coordinator (W/R quorum
+# writes/reads), the pluggable transport (with the TCP `NetTransport`), and the
+# wire types — everything an application needs to talk to a vals cluster, with
+# NONE of the server/PD/store code in its dependency graph. `vals-cluster`
+# depends on this crate and re-exports it, so a server embeds `vals-cluster`
+# while a plain client depends only on `vals-client`.
+[dependencies]
+# The thread-per-core async runtime the coordinator's fan-out runs on. std-only,
+# zero further dependencies — safe to pull into a slim client.
+vals-rt = { path = "../vals-rt" }
+# epoll/timerfd for the socket readiness reactor (the executor's poll_io for
+# network I/O); std exposes no readiness primitive.
+libc = "0.2"
+# Non-blocking connect (std only offers blocking connect); keeps the executor
+# thread from stalling on pool growth to a slow/dead peer.
+socket2 = "0.5"
+# The observability facade (see `observe`): state-changing transitions log
+# through it.
+log = "0.4"

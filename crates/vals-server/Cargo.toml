@@ -1,0 +1,27 @@
+[package]
+name = "vals-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "valsd"
+path = "src/main.rs"
+
+[dependencies]
+vals-cluster = { path = "../vals-cluster" }
+vals-store = { path = "../vals-store" }
+vals-spdk = { path = "../vals-spdk" }
+# SIGTERM/SIGINT handling (sigaction); already a workspace dependency.
+libc = "0.2"
+# The logging facade vals-cluster's `observe` floor logs through.
+log = "0.4"
+
+[dev-dependencies]
+# The end-to-end test is a real client against spawned valsd processes.
+vals-rt = { path = "../vals-rt" }
+
+[features]
+# Real-NVMe nodes (backend = spdk): forwards to the cluster/device crates.
+spdk = ["vals-cluster/spdk", "vals-spdk/spdk"]

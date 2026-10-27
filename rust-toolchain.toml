@@ -1,0 +1,7 @@
+# Pin the toolchain so `cargo`, `clippy`, and `rustfmt` all agree across the dev
+# box and CI. The workspace is verified clean (build, test, clippy, fmt) on this
+# version; newer toolchains have drifted lints/fmt defaults (e.g. a stricter
+# `clippy::uninit_vec`), so pin rather than chase them.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

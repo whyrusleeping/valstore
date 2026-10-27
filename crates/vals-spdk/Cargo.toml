@@ -1,0 +1,16 @@
+[package]
+name = "vals-spdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The block layer is deliberately dependency-free (std only) so the storage
+# engine can be developed and tested against the mem/file backends without any
+# external crates or network access. The real SPDK backend lives behind the
+# `spdk` feature and is filled in on hardware with a dedicated scratch NVMe.
+[features]
+default = []
+spdk = []
+
+[dependencies]

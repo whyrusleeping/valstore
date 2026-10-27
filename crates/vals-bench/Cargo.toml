@@ -1,0 +1,19 @@
+[package]
+name = "vals-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Enables the `spdk` backend arm (runs the engine on a real NVMe via SPDK).
+# Also enables the SPDK-backed zone storage provider in vals-cluster (distzone).
+spdk = ["vals-spdk/spdk", "vals-cluster/spdk"]
+
+[dependencies]
+vals-rt = { path = "../vals-rt" }
+vals-spdk = { path = "../vals-spdk" }
+vals-store = { path = "../vals-store" }
+vals-cluster = { path = "../vals-cluster" }
+libc = "0.2"

@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vals-rt",
+    "crates/vals-spdk",
+    "crates/vals-store",
+    "crates/vals-raft",
+    "crates/vals-client",
+    "crates/vals-cluster",
+    "crates/vals-bench",
+    "crates/vals-server",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+repository = "https://github.com/whyrusleeping/valstore"
+
+# Build the engine in release for any IOPS-sensitive measurement.
+[profile.release]
+lto = "thin"
+codegen-units = 1
