@@ -24,3 +24,12 @@ socket2 = "0.5"
 # The observability facade (see `observe`): state-changing transitions log
 # through it.
 log = "0.4"
+
+[dev-dependencies]
+# Only the `tokio_bridge` example and its tests use Tokio; the client itself
+# does not depend on it.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "sync", "macros"] }
+
+[[example]]
+name = "tokio_bridge"
+test = true

@@ -1,5 +1,6 @@
 use super::*;
 
+/// A running data node; see [`Node`].
 pub struct NodeHandle {
     pub(super) shards: Vec<ShardHandle>,
     pub(super) maint_join: crate::maint::MaintJoin,
@@ -142,6 +143,13 @@ impl NodeHandle {
         }
     }
 
+    /// Stops the node: signals every shard, which stops accepting, makes a
+    /// bounded attempt to finish in-flight requests, syncs its stores and
+    /// persists its liveness state, then joins the shards and maintenance
+    /// threads. Errors are logged, not returned, so do not treat a clean
+    /// return as proof that every buffered write reached the device; use
+    /// device-durable writes for that. Dropping the handle instead leaves the
+    /// threads running.
     pub fn shutdown(mut self) {
         let start = std::time::Instant::now();
         for s in &self.shards {

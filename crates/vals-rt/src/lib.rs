@@ -1,3 +1,27 @@
+//! `vals-rt`: a small single-threaded async executor for vals's
+//! thread-per-core design.
+//!
+//! Each core runs its own executor with [`block_on`] or a [`LocalExecutor`].
+//! The executor takes a `poll_io` hook, which it calls between task polls, so
+//! one loop can drive both NVMe completions and network readiness. The crate
+//! also has the combinators the replication code needs: [`join_all`],
+//! [`race`], and the first-k-of-n [`quorum_ok`] and [`quorum_collect`].
+//!
+//! ```
+//! let doubled = vals_rt::block_on(
+//!     vals_rt::join_all((1..=3).map(|i| async move { i * 2 }).collect()),
+//!     || {},
+//! );
+//! assert_eq!(doubled, vec![2, 4, 6]);
+//! ```
+//!
+//! Applications need this crate to drive `vals-client`: the supported API is
+//! [`block_on`], [`LocalExecutor`] (with [`Spawner`]), [`join_all`] and
+//! [`race`]. The quorum combinators and the other helpers are internal to
+//! vals and may change. Executors are single-threaded: futures are polled
+//! only on the thread that calls `block_on` or a `run*` method, and the
+//! executor types are not `Send`.
+
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -151,6 +175,8 @@ impl Spawner {
     }
 }
 
+/// A single-threaded executor for spawned background tasks plus one
+/// foreground future at a time.
 pub struct LocalExecutor {
     shared: Rc<Shared>,
 }
@@ -177,6 +203,8 @@ impl LocalExecutor {
         }
     }
 
+    /// Adds a background task. It runs only while this thread is inside
+    /// [`run`](Self::run) or [`run_until`](Self::run_until).
     pub fn spawn(&self, fut: impl Future<Output = ()> + 'static) {
         self.shared.spawn(fut);
     }
@@ -217,6 +245,7 @@ impl LocalExecutor {
         }
     }
 
+    /// Runs until every spawned task has finished.
     pub fn run(&self, mut poll_io: impl FnMut()) {
         loop {
             self.drain_ready();
@@ -259,6 +288,8 @@ impl LocalExecutor {
         }
     }
 
+    /// Runs `fut` to completion, running spawned tasks meanwhile. Tasks still
+    /// pending when `fut` completes stay spawned for the next run.
     pub fn run_until<F: Future>(&self, fut: F, mut poll_io: impl FnMut()) -> F::Output {
         let mut fut = Box::pin(fut);
         let woken = Arc::new(WakeFlag::new());
@@ -278,6 +309,10 @@ impl LocalExecutor {
     }
 }
 
+/// Runs `fut` to completion on this thread, calling `poll_io` whenever the
+/// future is not ready to make progress. `poll_io` is where the thread waits
+/// for I/O (for `vals-client`, `vals_client::reactor::poll_io`); with an
+/// empty hook the loop spins until the future completes.
 pub fn block_on<F: Future>(fut: F, mut poll_io: impl FnMut()) -> F::Output {
     let mut fut = Box::pin(fut);
     let woken = Arc::new(WakeFlag::new());
@@ -293,6 +328,7 @@ pub fn block_on<F: Future>(fut: F, mut poll_io: impl FnMut()) -> F::Output {
     }
 }
 
+/// Runs all `futures` concurrently and returns their outputs in input order.
 pub fn join_all<F: Future>(futures: Vec<F>) -> impl Future<Output = Vec<F::Output>> {
     let n = futures.len();
     JoinAll {
@@ -306,11 +342,16 @@ struct JoinAll<F: Future> {
     out: Vec<Option<F::Output>>,
 }
 
+/// The output of [`race`]: which future finished first.
 pub enum Either<A, B> {
+    /// The first future's output.
     Left(A),
+    /// The second future's output.
     Right(B),
 }
 
+/// Polls `a` and `b` together and returns the output of whichever finishes
+/// first (`a` on a tie), dropping the other.
 pub fn race<A: Future, B: Future>(
     a: A,
     b: B,

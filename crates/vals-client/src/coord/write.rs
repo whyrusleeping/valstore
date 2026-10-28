@@ -53,11 +53,20 @@ pub(super) fn quorum_shortfall_error(
 
 
 impl<T: Transport> Coordinator<T> {
+    /// Writes `value` under `key` in the default zone with
+    /// [`WriteOptions::default()`] (every replica acknowledges, buffered) and
+    /// returns the version written.
+    ///
+    /// The `All` default fails the write when any replica is unreachable;
+    /// most applications want [`write_with`](Self::write_with) and
+    /// [`WriteConcern::Majority`].
     pub async fn write(&self, key: &[u8], value: &[u8]) -> Result<Version, CoordError> {
         self.write_in(DEFAULT_ZONE, key, value, WriteOptions::default())
             .await
     }
 
+    /// Writes `value` under `key` in the default zone with the given concern
+    /// and persistence, and returns the version written.
     pub async fn write_with(
         &self,
         key: &[u8],
@@ -67,6 +76,20 @@ impl<T: Transport> Coordinator<T> {
         self.write_in(DEFAULT_ZONE, key, value, options).await
     }
 
+    /// Writes `value` under `key` in `zone_id` and returns the version
+    /// written.
+    ///
+    /// The write is stamped with a new version and sent to the key's
+    /// replicas; it succeeds once the [`WriteOptions`] concern is met. It
+    /// first waits for client credits if this coordinator's request budget is
+    /// exhausted. On error the write may still be on some replicas (see
+    /// [`CoordError`]). An unknown zone triggers one catalog refresh before
+    /// failing with [`CoordError::UnknownZone`].
+    ///
+    /// Size limit: a key and value together must fit in one value-log segment
+    /// of the replicas' engines (`seg_blocks * block_size`, 1 MiB with the
+    /// `valsd` defaults, less a small record header). Replicas refuse larger
+    /// records, so the write fails with [`CoordError::QuorumFailed`].
     pub async fn write_in(
         &self,
         zone_id: ZoneId,
@@ -90,6 +113,9 @@ impl<T: Transport> Coordinator<T> {
         .map(|c| c.version)
     }
 
+    /// Like [`write_with`](Self::write_with), but returns
+    /// [`CoordError::Overloaded`] at once instead of waiting when the
+    /// coordinator's request budget is exhausted. Use it to shed load.
     pub async fn try_write(
         &self,
         key: &[u8],
@@ -114,6 +140,7 @@ impl<T: Transport> Coordinator<T> {
         .map(|c| c.version)
     }
 
+    /// Deletes `key` in the default zone; see [`delete_in`](Self::delete_in).
     pub async fn delete(
         &self,
         key: &[u8],
@@ -122,6 +149,13 @@ impl<T: Transport> Coordinator<T> {
         self.delete_in(DEFAULT_ZONE, key, options).await
     }
 
+    /// Deletes `key` in `zone_id` by writing a tombstone at a new version,
+    /// which it returns.
+    ///
+    /// The tombstone wins over every older version of the key, so a delayed
+    /// older write cannot bring the value back. Deleting a missing key
+    /// succeeds. Acknowledgement and failure rules are those of
+    /// [`write_in`](Self::write_in).
     pub async fn delete_in(
         &self,
         zone_id: ZoneId,
@@ -143,6 +177,15 @@ impl<T: Transport> Coordinator<T> {
         .map(|c| c.version)
     }
 
+    /// Writes with a sloppy quorum in the default zone: if the key's home
+    /// replicas cannot meet the concern, the write also goes to fallback nodes
+    /// further along the ring, and the coordinator keeps hints to replay to
+    /// the unreachable homes.
+    ///
+    /// This trades consistency for availability. Unless
+    /// [`SloppyAck::is_strict`] is true, a quorum read may not see the write
+    /// until the hints are delivered. Hints live in this coordinator's
+    /// [`HintStore`] (in memory by default) and are lost if the process exits.
     pub async fn write_sloppy(
         &self,
         key: &[u8],
@@ -165,6 +208,7 @@ impl<T: Transport> Coordinator<T> {
         .map(Committed::into_sloppy_ack)
     }
 
+    /// The delete counterpart of [`write_sloppy`](Self::write_sloppy).
     pub async fn delete_sloppy(
         &self,
         key: &[u8],
@@ -187,6 +231,7 @@ impl<T: Transport> Coordinator<T> {
         .map(Committed::into_sloppy_ack)
     }
 
+    /// Compare-and-set in the default zone; see [`cas_in`](Self::cas_in).
     pub async fn cas(
         &self,
         key: &[u8],
@@ -196,6 +241,20 @@ impl<T: Transport> Coordinator<T> {
         self.cas_in(DEFAULT_ZONE, key, value, expected).await
     }
 
+    /// Writes `value` only if the key's current version is `expected`.
+    ///
+    /// The current version includes deletes: after a delete it is the
+    /// delete's version (as returned by [`delete_in`](Self::delete_in)), not
+    /// `None`. `None` matches only a key with no stored version at all
+    /// (never written, or its tombstone has been garbage-collected).
+    ///
+    /// The coordinator reads the key from a majority of replicas, compares the
+    /// winning version with `expected`, and if they match writes with
+    /// [`WriteConcern::Majority`]. The check and the write are separate steps,
+    /// so two racing calls can both succeed, and a write from another client
+    /// can land between them. Use it for low-contention optimistic updates,
+    /// not as a lock or a counter. Returns [`CasResult::Mismatch`] with the
+    /// current version when the check fails.
     pub async fn cas_in(
         &self,
         zone_id: ZoneId,
@@ -645,6 +704,8 @@ impl<T: Transport> Coordinator<T> {
         })
     }
 
+    /// Writes a batch in the default zone; see
+    /// [`write_batch_in`](Self::write_batch_in).
     pub async fn write_batch(
         &self,
         writes: &[(&[u8], &[u8])],
@@ -653,6 +714,17 @@ impl<T: Transport> Coordinator<T> {
         self.write_batch_in(DEFAULT_ZONE, writes, options).await
     }
 
+    /// Writes many keys, grouping them into one request per destination node.
+    ///
+    /// Each write gets its own version and its own outcome, in input order; a
+    /// batch is not atomic and its writes may land in any order. Per-write
+    /// failures are in [`BatchResult::outcomes`]. The outer `Err` means the
+    /// call produced no per-write outcomes: either it failed before sending
+    /// (an unknown zone, or a batch larger than the client budget), or some
+    /// writes were refused for a stale ring and the automatic refresh and
+    /// retry of the batch failed. In the second case some writes may already
+    /// be applied, so treat every write in the batch as unknown. With
+    /// [`Persistence::Device`], concurrent batches share device syncs.
     pub async fn write_batch_in(
         &self,
         zone_id: ZoneId,
@@ -664,6 +736,8 @@ impl<T: Transport> Coordinator<T> {
             .await
     }
 
+    /// Like [`write_batch`](Self::write_batch), but returns
+    /// [`CoordError::Overloaded`] instead of waiting for credits.
     pub async fn try_write_batch(
         &self,
         writes: &[(&[u8], &[u8])],
@@ -841,10 +915,14 @@ impl<T: Transport> Coordinator<T> {
         Ok(BatchResult { outcomes })
     }
 
+    /// How many hinted writes this coordinator holds for `node`.
     pub fn pending_hints(&self, node: NodeId) -> usize {
         self.hints.borrow().pending(node)
     }
 
+    /// Tries to deliver the hints held for `node` now and returns how many
+    /// were delivered; the rest stay queued. Hints are also replayed
+    /// automatically when a later write reaches that node.
     pub async fn replay_hints(&self, node: NodeId) -> usize {
         let held = self.hints.borrow_mut().drain(node);
         let mut delivered = 0;

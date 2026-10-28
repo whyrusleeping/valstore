@@ -1,10 +1,17 @@
 use super::*;
 
 impl<D: BlockDevice> Engine<D> {
+    /// Every key in `[lo, hi)` with its greatest version's value, in key
+    /// order. `None` bounds are open. Only for [`Ordering::Sorted`] engines
+    /// (otherwise [`EngineError::NotSorted`]); the whole result is held in
+    /// memory, so use [`scan_bounded`](Self::scan_bounded) to page.
     pub fn scan(&self, lo: Option<&[u8]>, hi: Option<&[u8]>) -> Result<Vec<KvPair>, EngineError> {
         Ok(self.scan_bounded(lo, hi, usize::MAX, usize::MAX)?.0)
     }
 
+    /// Like [`scan`](Self::scan), stopping after `max_entries` keys or about
+    /// `max_bytes`; the flag is `true` if keys remain. Resume from the last
+    /// key returned plus a `0x00` byte.
     pub fn scan_bounded(
         &self,
         lo: Option<&[u8]>,

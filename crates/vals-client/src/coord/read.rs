@@ -1,18 +1,36 @@
 use super::*;
 
 impl<T: Transport> Coordinator<T> {
+    /// Reads `key` from the default zone at this coordinator's `R` (the `r`
+    /// given to [`Coordinator::new`]); see
+    /// [`read_quorum_in`](Self::read_quorum_in).
     pub async fn read(&self, key: &[u8]) -> Result<Option<Stored>, CoordError> {
         self.read_quorum(key, self.r).await
     }
 
+    /// Reads `key` from `zone_id` at this coordinator's `R`; see
+    /// [`read_quorum_in`](Self::read_quorum_in).
     pub async fn read_in(&self, zone_id: ZoneId, key: &[u8]) -> Result<Option<Stored>, CoordError> {
         self.read_quorum_in(zone_id, key, self.r).await
     }
 
+    /// Reads `key` from the default zone, waiting for `r` replicas; see
+    /// [`read_quorum_in`](Self::read_quorum_in).
     pub async fn read_quorum(&self, key: &[u8], r: usize) -> Result<Option<Stored>, CoordError> {
         self.read_quorum_in(DEFAULT_ZONE, key, r).await
     }
 
+    /// Reads `key` from `zone_id`, waiting for `r` of its replicas, and returns
+    /// the value with the greatest version, or `None` if the key is absent or
+    /// its newest version is a delete.
+    ///
+    /// `r` is capped at the key's replica count. If `r` plus the write
+    /// concern's `W` exceeds the replica count, the read sees every write
+    /// acknowledged by `W` home replicas (or something newer). Before
+    /// returning, the call sends the winning version to any replica that
+    /// answered with an older version or none (read repair). Fails with
+    /// [`CoordError::QuorumFailed`] if fewer than `r` replicas answer. How the
+    /// replicas are asked depends on [`ReadFanout`].
     pub async fn read_quorum_in(
         &self,
         zone_id: ZoneId,
@@ -25,6 +43,12 @@ impl<T: Transport> Coordinator<T> {
             .filter(|s| s.value.is_some()))
     }
 
+    /// Reads many keys from `zone_id` at this coordinator's `R`, grouping the
+    /// requests by node.
+    ///
+    /// Returns one result per key, in input order, each with the same meaning
+    /// as [`read_quorum_in`](Self::read_quorum_in). The outer `Err` covers
+    /// failures of the whole call, such as an unknown zone.
     pub async fn read_many_in(
         &self,
         zone_id: ZoneId,
@@ -509,6 +533,7 @@ impl<T: Transport> Coordinator<T> {
         Ok(out)
     }
 
+    /// [`read_many_in`](Self::read_many_in) for the default zone.
     pub async fn read_many(
         &self,
         keys: &[Vec<u8>],
@@ -800,6 +825,10 @@ impl<T: Transport> Coordinator<T> {
         Ok(Some(winner))
     }
 
+    /// Reads `key` from the default zone from a single replica, trying the
+    /// key's replicas one at a time (starting at a rotating position) until
+    /// one answers. Fast, but eventually consistent: the answer may be stale
+    /// or miss a recent write.
     pub async fn read_any(&self, key: &[u8]) -> Result<Option<Stored>, CoordError> {
         self.retry_stale(|| self.read_any_once(key)).await
     }

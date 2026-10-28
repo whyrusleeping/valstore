@@ -199,6 +199,8 @@ impl<D: BlockDevice> Engine<D> {
         Ok(with_cover(self.resolve_for(key, caller)?, cover))
     }
 
+    /// The value of `key`'s greatest version, or `None` if the key has no
+    /// entry or is covered by a newer range tombstone. Reads unsynced writes.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
         let entry = match self.resolve_logical(key, crate::attribution::LookupCaller::Get)? {
             None | Some(Winner::Covered(_)) => return Ok(None),
@@ -214,6 +216,8 @@ impl<D: BlockDevice> Engine<D> {
         }
     }
 
+    /// The greatest version stored for `key` (or of a range tombstone
+    /// covering it), or `None` if there is none.
     pub fn version(&self, key: &[u8]) -> Result<Option<u128>, EngineError> {
         self.version_for(key, crate::attribution::LookupCaller::Exists)
     }

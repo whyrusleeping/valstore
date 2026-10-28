@@ -72,6 +72,9 @@ impl<D: BlockDevice> Engine<D> {
         }
     }
 
+    /// Formats `dev` as a new, empty store and opens it. Any store already on
+    /// the device is destroyed. Call [`sync`](Self::sync) before relying on
+    /// the new store surviving a crash.
     pub fn create(dev: D, cfg: Config) -> Result<Self, EngineError> {
         Self::format_device(&dev, &cfg)?;
         Ok(Self::create_prewiped(dev, cfg))
@@ -169,6 +172,12 @@ impl<D: BlockDevice> Engine<D> {
         )
     }
 
+    /// Recovers the store on `dev`, which must have been created with the same
+    /// block size and `cfg`. Recovery errors are returned; never fall back to
+    /// [`create`](Self::create) on error, which would destroy the store. There
+    /// is no "is this a store" check: a device with no store on it (for
+    /// example, all zeroes) opens as an empty store, so keep track yourself of
+    /// which devices hold data.
     pub fn open(dev: D, cfg: Config) -> Result<Self, EngineError> {
         Self::open_inner(dev, cfg)
     }

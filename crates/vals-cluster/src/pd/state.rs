@@ -17,6 +17,20 @@ impl PdMirrors {
     }
 }
 
+/// A running PD (placement driver) replica: the Raft-replicated control
+/// plane that owns membership, the zone catalog and sorted-zone range maps,
+/// and pushes them to data nodes.
+///
+/// Start one with `spawn_single_durable` (one PD, no PD fault tolerance) or
+/// `spawn_durable` (one voter of a fixed multi-PD group); the non-durable
+/// `spawn`/`spawn_single` keep Raft state in memory and are for tests.
+/// Growing a single PD into a group in place is not supported. Membership
+/// and zone methods propose a change and return once the leader accepted
+/// the proposal, not when it is committed or pushed: followers answer
+/// `NotLeader`, and a new leader may answer `NotReady`. Watch
+/// [`members`](Self::members), [`catalog`](Self::catalog) or
+/// [`range_map`](Self::range_map) for the committed state. Call
+/// [`shutdown`](Self::shutdown) before the process exits.
 pub struct PdDaemon {
     pub(super) cmd: mpsc::Sender<PdCmd>,
     pub(super) admin_timeout_ms: Arc<std::sync::atomic::AtomicU64>,

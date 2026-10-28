@@ -248,6 +248,14 @@ pub(super) enum SeedEnd {
     Dropped,
 }
 
+/// One replica's store: a `vals-store` engine plus the versioned
+/// last-writer-wins rules of the cluster.
+///
+/// Writes and deletes carry a client [`Version`]; the greater
+/// version wins, deletes are tombstones that hide older values, and a
+/// replica refuses versions too far ahead of its clock. A data node owns its
+/// stores; hand one to a [`Node`](crate::Node) constructor rather than
+/// writing to it yourself while it is served.
 pub struct VersionedStore<D: BlockDevice> {
     engine: Engine<D>,
     hlc: Hlc,

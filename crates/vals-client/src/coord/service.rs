@@ -59,6 +59,13 @@ async fn hedge_tick_loop(clock: Rc<crate::HedgeClock>, period: Duration, stop: R
 /// A [`Coordinator`] hosted on a persistent [`LocalExecutor`]; background tasks
 /// (ring refresh, hedge ticker) advance as passengers of each foreground op.
 ///
+/// Like the coordinator, the service is neither `Send` nor `Sync`: create and
+/// use it on one thread. Background tasks make progress only while that
+/// thread is inside [`run`](Self::run) or a `submit_*` call, so an idle
+/// service does not refresh its ring. Dropping the service stops the
+/// background tasks and runs the executor until every spawned task finishes,
+/// including submitted batches.
+///
 /// ```no_run
 /// # use std::time::Duration;
 /// # use vals_client::{CoordinatorService, Coordinator};
@@ -78,6 +85,8 @@ pub struct CoordinatorService<T: Transport> {
 }
 
 impl<T: Transport + 'static> CoordinatorService<T> {
+    /// Hosts `coord`, starting the digest-hedge ticker if the coordinator was
+    /// built [`with_digest_hedge`](Coordinator::with_digest_hedge).
     pub fn new(coord: Coordinator<T>) -> Self {
         let coord = Rc::new(coord);
         let stop = Rc::new(Notify::new());
@@ -88,6 +97,9 @@ impl<T: Transport + 'static> CoordinatorService<T> {
         Self { ex, coord, stop }
     }
 
+    /// Also refreshes the ring and catalog from a live member every `period`,
+    /// so membership changes are picked up before an operation is refused
+    /// for a stale ring.
     pub fn with_proactive_refresh(self, period: Duration) -> Self {
         self.ex.spawn(proactive_refresh_loop(
             self.coord.clone(),
@@ -97,14 +109,21 @@ impl<T: Transport + 'static> CoordinatorService<T> {
         self
     }
 
+    /// The hosted coordinator, for building operation futures to pass to
+    /// [`run`](Self::run).
     pub fn coordinator(&self) -> &Rc<Coordinator<T>> {
         &self.coord
     }
 
+    /// Blocks the thread running `fut` to completion on the service's
+    /// executor (with [`reactor::poll_io`]), advancing the background tasks
+    /// meanwhile.
     pub fn run<F: std::future::Future>(&self, fut: F) -> F::Output {
         self.ex.run_until(fut, reactor::poll_io)
     }
 
+    /// [`submit_write_batch_in`](Self::submit_write_batch_in) for the default
+    /// zone.
     pub fn submit_write_batch(
         &self,
         writes: Vec<(Vec<u8>, Vec<u8>)>,
@@ -113,6 +132,14 @@ impl<T: Transport + 'static> CoordinatorService<T> {
         self.submit_write_batch_in(DEFAULT_ZONE, writes, options)
     }
 
+    /// Starts a batch write as a task on the service's executor and returns a
+    /// handle to its result.
+    ///
+    /// The call blocks until the batch has acquired its client credits, then
+    /// returns, so callers can pipeline batches while the budget bounds how
+    /// many are in flight. The batch keeps running while the service runs
+    /// anything else; await the handle inside [`run`](Self::run) to get its
+    /// [`BatchResult`]. Dropping the handle does not cancel the batch.
     pub fn submit_write_batch_in(
         &self,
         zone_id: ZoneId,
@@ -148,6 +175,8 @@ impl<T: Transport + 'static> CoordinatorService<T> {
         BatchWriteHandle { slot: outcome }
     }
 
+    /// Stops the background tasks and runs the executor until every spawned
+    /// task, including submitted batches, has finished.
     pub fn shutdown(&self) {
         self.stop.signal();
         self.ex.run(reactor::poll_io);
@@ -203,6 +232,8 @@ impl<T> Future for SlotFuture<T> {
     }
 }
 
+/// The pending result of [`CoordinatorService::submit_write_batch`]. Poll it
+/// only on the service's thread, inside [`CoordinatorService::run`].
 pub struct BatchWriteHandle {
     slot: Rc<RefCell<Slot<Result<BatchResult, CoordError>>>>,
 }

@@ -1,4 +1,16 @@
-//! `vals-client`: the slim client-facing crate for the leaderless data path.
+//! `vals-client`: the Rust client for a vals cluster.
+//!
+//! A [`Coordinator`] over a [`NetTransport`] reads and writes keys on a
+//! running cluster of `valsd` data nodes (or nodes embedded in another
+//! application). The coordinator does the quorum work itself: it picks each
+//! key's replicas from the placement [`Ring`], stamps writes with a
+//! [`Version`], waits for the requested number of acknowledgements, and merges
+//! replica replies by last-writer-wins. This crate contains no storage engine,
+//! server or control-plane code; it is not an embedded database. To store data
+//! in your own process, see the `vals-store` engine and the `vals-cluster`
+//! node and PD crates instead.
+//!
+//! # Example
 //!
 //! ```no_run
 //! use std::net::SocketAddr;
@@ -33,6 +45,97 @@
 //!     vals_client::reactor::poll_io, // drive socket readiness
 //! );
 //! ```
+//!
+//! The initial ring is only a boot guess. Call [`Coordinator::refresh_ring`]
+//! and [`Coordinator::refresh_catalog`] against a live node before traffic to
+//! adopt the cluster's current membership, replication factor and zones. The
+//! `kv` and `tokio_bridge` examples in this crate are complete programs.
+//!
+//! # Supported API
+//!
+//! These items are the supported client surface:
+//!
+//! - Connecting: [`NetTransport`] (`connect*` constructors), [`ClientConfig`],
+//!   [`ClientBudgets`] and [`ClientConfigError`], [`Ring`] and [`NodeId`] for
+//!   the boot ring.
+//! - Operations: the public `async` methods of [`Coordinator`] (reads,
+//!   writes, deletes, batches, CAS, scans, range deletes, routing refresh),
+//!   and [`CoordinatorService`] for hosting a coordinator with background
+//!   refresh.
+//! - Options and results: [`WriteConcern`], [`Persistence`], [`WriteOptions`],
+//!   [`ReadFanout`], [`Stored`], [`Version`], [`CasResult`], [`SloppyAck`],
+//!   [`BatchResult`], [`WriteOutcome`], [`ScanQuery`], [`CreditStats`], and
+//!   the errors [`CoordError`], [`ReplicaError`], [`RangeDeleteMiss`] and
+//!   [`TransportError`].
+//! - Zones: [`ZoneId`], [`DEFAULT_ZONE`], [`Catalog`], [`ZoneConfig`],
+//!   [`Ordering`].
+//! - Driving I/O: [`reactor::poll_io`].
+//!
+//! Everything else that is public exists so that `vals-cluster`, `valsd` and
+//! the benchmarks can share code with the client: the `#[doc(hidden)]`
+//! modules and items (wire codec, protocol constants, partition helpers,
+//! anti-entropy peers, connection internals), the methods marked hidden on
+//! the types above, the [`observe`] counters, and implementing [`Transport`]
+//! yourself. Those may change in any revision. There is no API freeze: the
+//! crates are not published, so pin a git revision and keep the client on the
+//! same revision as the servers it talks to.
+//!
+//! # Threads and executors
+//!
+//! A [`Coordinator<NetTransport>`](Coordinator) is neither `Send` nor `Sync`.
+//! Its connections register with a thread-local readiness reactor, so build
+//! it, and poll every future it returns, on one OS thread, driven by
+//! [`vals_rt::block_on`] (or a [`vals_rt::LocalExecutor`]) with
+//! [`reactor::poll_io`] as the I/O hook. Another executor that does not call
+//! `poll_io` on that thread leaves socket I/O stalled; an empty hook is only
+//! enough for in-process transports. Methods take `&self`, so one thread can
+//! run many operations at once (for example with [`vals_rt::join_all`]). To
+//! scale across cores, run one coordinator per thread; coordinators are
+//! independent. From a Tokio application, run the coordinator on a dedicated
+//! thread and send it requests over a channel, as the `tokio_bridge` example
+//! does.
+//!
+//! # Failures, retries and cancellation
+//!
+//! - **A failed write may still have been applied.** When a write or delete
+//!   returns an error, any replica that received it may have applied it, and
+//!   anti-entropy can later copy it to the others. A timeout, a quorum
+//!   shortfall or a lost connection is never proof that nothing changed.
+//! - **Retries create new versions.** The client never resends a write on its
+//!   own, except that a write refused for a stale ring is retried once, after
+//!   the coordinator adopts the current ring, with a fresh version (turn this
+//!   off with [`Coordinator::with_manual_refresh`]). If you retry a failed
+//!   write, the retry is a new write with a newer version; it overwrites the
+//!   earlier attempt if both land, which is safe for idempotent puts and
+//!   deletes but not for read-modify-write logic. Reads refused for a stale
+//!   ring are retried the same way, and a read on a connection the server
+//!   closed while idle is resent once.
+//! - **Cancellation is local.** Dropping an operation's future stops waiting
+//!   for it and releases its client credits. A request not yet written to the
+//!   socket is withdrawn; one already sent may still be applied by its
+//!   replica. Dropping a request whose frame was only partly written closes
+//!   that connection, which fails the other requests in flight on it.
+//! - **Deadlines.** Each RPC has the deadline from [`ClientConfig`] (5 s by
+//!   default). An operation that refreshes the ring or waits for client
+//!   credits can take longer than one deadline; wrap it in your own timeout if
+//!   you need an end-to-end bound.
+//!
+//! # Persistence and consistency
+//!
+//! A write succeeds when `W` replicas acknowledge it, where [`WriteConcern`]
+//! picks `W`. With [`Persistence::Buffered`] (the default) a replica
+//! acknowledges once the write is in its memory, so losing power on every
+//! acknowledging replica can lose it; [`Persistence::Device`] waits for each
+//! acknowledging replica's device sync. Replicas resolve conflicts by
+//! last-writer-wins on [`Version`] (a hybrid logical clock plus a random
+//! writer id), so the greatest version wins, not the last request to finish.
+//! A read that asks `R` replicas with `W + R > RF` observes the version of
+//! any write acknowledged by `W` home replicas, or a greater one (a sloppy
+//! write acknowledged by fallback nodes does not count until its hints are
+//! delivered). This is not linearizability: there are no
+//! transactions, and [`Coordinator::cas`] is a best-effort check-then-write.
+//! Scans read each range from `R` replicas page by page; they are not a
+//! point-in-time snapshot across pages or ranges.
 
 pub mod coord;
 pub mod net;
@@ -59,25 +162,37 @@ pub mod proto;
 pub mod wire;
 
 pub use coord::{
-    BatchAck, BatchEntry, BatchResult, BatchWriteHandle, CoordError, Coordinator, CoordinatorService,
-    HedgeClock, Persistence, ReadFanout, RingView, SloppyAck, Transport, TransportError,
-    WriteConcern, WriteOptions, WriteOutcome,
+    BatchResult, BatchWriteHandle, ClientBudgets, CoordError, Coordinator, CoordinatorService,
+    CreditStats, Persistence, RangeDeleteMiss, ReadFanout, ReplicaError, ScanQuery, SloppyAck,
+    Transport, TransportError, WriteConcern, WriteOptions, WriteOutcome,
 };
-pub use failure::{FailureDetector, FdConfig};
+#[doc(hidden)]
+pub use coord::{BatchAck, BatchEntry, HedgeClock, RingView};
+pub use failure::FdConfig;
+#[doc(hidden)]
+pub use failure::FailureDetector;
 pub use hints::{Hint, HintStore, MemHintStore};
-pub use hlc::{Hlc, Version};
+pub use hlc::Version;
+#[doc(hidden)]
+pub use hlc::Hlc;
 pub use net::{
-    ClientConfig, ClientConfigError, ConnectionStats, NetPeer, NetTransport, CONNECTS,
-    DEFAULT_CLIENT_MAX_BYTES, DEFAULT_CLIENT_MAX_OPS, DEFAULT_CLIENT_NODE_MAX_BYTES,
-    DEFAULT_CLIENT_NODE_MAX_OPS, DEFAULT_CONNECT_DEADLINE, DEFAULT_RPC_DEADLINE,
+    ClientConfig, ClientConfigError, ConnectionStats, NetTransport, DEFAULT_CLIENT_MAX_BYTES,
+    DEFAULT_CLIENT_MAX_OPS, DEFAULT_CLIENT_NODE_MAX_BYTES, DEFAULT_CLIENT_NODE_MAX_OPS,
+    DEFAULT_CONNECT_DEADLINE, DEFAULT_RPC_DEADLINE,
 };
+#[doc(hidden)]
+pub use net::{NetPeer, CONNECTS};
+pub use partition::RangeMap;
+#[doc(hidden)]
 pub use partition::{
-    data_shard, even_boundaries, opaque_placement_token, scan_shard, RangeMap, RangeSlice,
+    data_shard, even_boundaries, opaque_placement_token, scan_shard, RangeSlice,
     OPAQUE_TOKEN_LEN, OPAQUE_TOKEN_MAGIC, OPAQUE_TOKEN_SEED_LEN, OPAQUE_TOKEN_VERSION,
 };
 pub use ring::{NodeId, Ring};
+pub use types::{CasResult, Stored};
+#[doc(hidden)]
 pub use types::{
-    split_stored_blob, Applied, CasResult, DigestCursorPage, DigestPage, EntryPage, MixedReadEntry, MixedReadReply,
-    MixedReadRole, Stored,
+    split_stored_blob, Applied, DigestCursorPage, DigestPage, EntryPage, MixedReadEntry,
+    MixedReadReply, MixedReadRole,
 };
 pub use zone::{Catalog, Ordering, ZoneConfig, ZoneConfigError, ZoneId, DEFAULT_ZONE};

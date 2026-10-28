@@ -1,23 +1,49 @@
 use super::*;
 
+/// Limits on a client's outstanding requests; see
+/// [`ClientConfig::budgets`](crate::ClientConfig::budgets).
+///
+/// The same limits apply to two separate pools. The coordinator's pool counts
+/// each in-flight write as one operation plus its key and value bytes (a
+/// delete counts its key), charged globally and to every destination node;
+/// when it is full, new writes wait for earlier ones to finish (the `try_`
+/// methods fail with [`CoordError::Overloaded`] instead). The transport's pool
+/// counts wire requests, encoded frames and buffered responses, including
+/// reads and scans. A single request larger than a limit fails at once with
+/// `Overloaded`. Plan memory for both byte limits. See `docs/backpressure.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClientBudgets {
+    /// Most operations in flight from this client.
     pub max_ops: usize,
+    /// Most bytes in flight from this client.
     pub max_bytes: usize,
+    /// Most operations in flight to any one node.
     pub node_max_ops: usize,
+    /// Most bytes in flight to any one node.
     pub node_max_bytes: usize,
 }
 
+/// A snapshot of a coordinator's request budget; see
+/// [`Coordinator::credit_stats`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CreditStats {
+    /// Operations currently holding credits.
     pub in_flight_ops: usize,
+    /// Bytes currently holding credits.
     pub in_flight_bytes: usize,
+    /// The global operation limit.
     pub max_ops: usize,
+    /// The global byte limit.
     pub max_bytes: usize,
+    /// The per-node operation limit.
     pub node_max_ops: usize,
+    /// The per-node byte limit.
     pub node_max_bytes: usize,
+    /// Operations waiting for credits now.
     pub waiters: usize,
+    /// Total operations that ever had to wait.
     pub blocked_total: u64,
+    /// The most operations ever in flight at once.
     pub peak_ops: usize,
 }
 

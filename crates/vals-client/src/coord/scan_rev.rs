@@ -47,6 +47,8 @@ fn merge_lww(mut pages: Vec<ScanPage>, bound: Option<&[u8]>) -> BTreeMap<Vec<u8>
 }
 
 impl<T: Transport> Coordinator<T> {
+    /// [`scan_in`](Self::scan_in) in descending key order: the last `limit`
+    /// live keys of `[lo, hi)`, largest first.
     pub async fn scan_in_rev(
         &self,
         zone_id: ZoneId,
@@ -60,6 +62,7 @@ impl<T: Transport> Coordinator<T> {
             .map(|(k, s)| (k, s.value.expect("live winners only"))).collect())
     }
 
+    /// [`scan_many_in`](Self::scan_many_in) in descending key order.
     pub async fn scan_many_in_rev(
         &self,
         zone_id: ZoneId,

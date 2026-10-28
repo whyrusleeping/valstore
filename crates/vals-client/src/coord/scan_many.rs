@@ -1,6 +1,8 @@
 use super::*;
 use super::scan::{scan_merge_bound, scan_merge_lww};
 
+/// One scan in a [`Coordinator::scan_many_in`] call: `(lo, hi, limit)` with
+/// the meaning of [`Coordinator::scan_in`]'s arguments.
 pub type ScanQuery<'a> = (Option<&'a [u8]>, Option<&'a [u8]>, Option<usize>);
 
 struct Cursor {
@@ -11,6 +13,13 @@ struct Cursor {
 }
 
 impl<T: Transport> Coordinator<T> {
+    /// Runs several scans of sorted zone `zone_id` together, batching the
+    /// requests each node receives.
+    ///
+    /// Returns one list per query, in input order, of `(key, Stored)` pairs in
+    /// ascending key order; deleted keys are omitted. With `keys_only` the
+    /// replicas send no values and each value is empty. Consistency is that of [`scan_in`](Self::scan_in); one
+    /// failed query fails the whole call.
     pub async fn scan_many_in(
         &self,
         zone_id: ZoneId,

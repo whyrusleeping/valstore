@@ -10,6 +10,9 @@ use crate::zone::{Catalog, ZoneId, DEFAULT_ZONE};
 
 use super::{BatchAck, BatchEntry, RingView, ScanPage, Transport, TransportError};
 
+/// An in-process [`Transport`] that calls [`VersionedStore`]s directly, for
+/// tests and demos. Nothing is persisted, there is no network, failure
+/// detection or anti-entropy, and it is not a deployment option.
 pub struct LocalCluster<D: BlockDevice> {
     nodes: HashMap<(NodeId, ZoneId), RefCell<VersionedStore<D>>>,
     down: RefCell<HashSet<NodeId>>,

@@ -1,3 +1,6 @@
+//! Process-wide client counters and the logging facade, for diagnostics.
+//! The counter names and set may change in any revision.
+
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 const STRIPES: usize = 16;

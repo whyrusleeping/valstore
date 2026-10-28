@@ -14,14 +14,31 @@ use crate::ring::{NodeId, Ring};
 use crate::types::{Applied, CasResult, MixedReadEntry, MixedReadReply, MixedReadRole, Stored};
 use crate::zone::{Catalog, Ordering, ZoneId, DEFAULT_ZONE};
 
+/// Why one request to one replica failed.
+///
+/// The coordinator folds these into a [`CoordError`] for the whole operation;
+/// they appear directly in [`ReplicaError`] and from the transport's own
+/// methods.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportError {
+    /// The node could not be reached: no connection, a refused or reset
+    /// connection, an unknown node, or a node marked down.
     Unavailable,
+    /// The connect/hello or RPC deadline expired. The request may still have
+    /// been applied.
     Timeout,
+    /// The replica's storage engine failed the request.
     Engine(String),
+    /// The replica answered with an error, or with a reply this client could
+    /// not use.
     Remote(String),
+    /// The replica runs a newer ring epoch (carried here) than the request was
+    /// routed with, and refused it.
     StaleEpoch(u64),
+    /// The replica is healthy but refused retryably (reserve floor, memory
+    /// budget, admission gate, or anti-entropy not ready). Retry with backoff.
     Busy,
+    /// This client's own request budget is exhausted; nothing was sent.
     Overloaded,
 }
 
@@ -50,9 +67,12 @@ impl std::fmt::Display for TransportError {
     }
 }
 
+/// One replica's failure, reported in [`CoordError::ScanQuorumFailed`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicaError {
+    /// The replica.
     pub node: NodeId,
+    /// What went wrong.
     pub error: TransportError,
 }
 
@@ -62,6 +82,7 @@ impl std::fmt::Display for ReplicaError {
     }
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RingView {
     pub epoch: u64,
@@ -71,12 +92,14 @@ pub struct RingView {
     pub addrs: Vec<(NodeId, Vec<std::net::SocketAddr>)>,
 }
 
+#[doc(hidden)]
 pub struct BatchEntry<'a> {
     pub key: &'a [u8],
     pub value: Option<&'a [u8]>,
     pub version: Version,
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchAck {
     Applied(Applied),
@@ -88,6 +111,7 @@ pub enum BatchAck {
     Unreachable,
 }
 
+#[doc(hidden)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScanPage {
     pub entries: Vec<(Vec<u8>, Stored)>,
@@ -148,6 +172,14 @@ type MixedNodeResult = (
 );
 type MixedNodeFuture<'a> = Pin<Box<dyn Future<Output = MixedNodeResult> + 'a>>;
 
+/// How a [`Coordinator`] reaches replicas.
+///
+/// [`NetTransport`](crate::NetTransport) speaks the vals TCP protocol to data
+/// nodes, and `vals-cluster`'s `LocalCluster` calls in-process stores. The
+/// trait appears in public signatures as the coordinator's type parameter, but
+/// its methods are an internal interface between the coordinator and those
+/// two transports and change with the wire protocol; implementing it outside
+/// this repository is not supported.
 pub trait Transport {
     #[doc(hidden)]
     fn client_budgets(&self) -> Option<ClientBudgets> {
@@ -405,28 +437,63 @@ pub trait Transport {
     }
 }
 
+/// How many of a key's replicas (`W`) must acknowledge a write.
+///
+/// The coordinator sends the write to every replica of the key and returns
+/// once `W` have acknowledged. Requests to slower replicas that are still
+/// unsent at that point are dropped, and background repair (read repair,
+/// hints, anti-entropy) brings those replicas up to date. `RF` below is the key's
+/// replica count (the zone's replication factor, or fewer if the cluster has
+/// fewer eligible nodes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteConcern {
+    /// `W = 0`: send and return without waiting for any replica. Success only
+    /// means the client could send the request. Not allowed with
+    /// [`Persistence::Device`].
     Unacknowledged,
+    /// `W = 1`.
     One,
+    /// `W = RF / 2 + 1`. Paired with a majority read, `W + R > RF` at every
+    /// replication factor.
     Majority,
+    /// `W = RF`: every replica must acknowledge, so one unreachable replica
+    /// fails the write.
     All,
+    /// An explicit `W` with `1 <= W <= RF`; anything else is refused with
+    /// [`CoordError::InvalidWriteOptions`] rather than clamped.
     Quorum(usize),
 }
 
+/// What a replica's acknowledgement means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Persistence {
+    /// The replica acknowledges once the write is installed in its memory,
+    /// before any device sync. An acknowledged
+    /// write survives as long as one acknowledging replica keeps running; a
+    /// power loss or crash of every acknowledging replica before their next
+    /// sync can lose it (and a lost delete can let an older value return).
     Buffered,
+    /// The replica acknowledges after a device sync that covers the write.
+    /// Concurrent writes share syncs, but each write still waits for one.
     Device,
 }
 
+/// The write concern and persistence for a write, delete, batch or range
+/// delete.
+///
+/// Every write method takes `impl Into<WriteOptions>`, so a bare
+/// [`WriteConcern`] works and means [`Persistence::Buffered`]. The default is
+/// `WriteOptions::buffered(WriteConcern::All)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteOptions {
+    /// How many replicas must acknowledge.
     pub concern: WriteConcern,
+    /// What each acknowledgement means.
     pub persistence: Persistence,
 }
 
 impl WriteOptions {
+    /// `concern` with [`Persistence::Buffered`].
     pub const fn buffered(concern: WriteConcern) -> Self {
         WriteOptions {
             concern,
@@ -434,6 +501,7 @@ impl WriteOptions {
         }
     }
 
+    /// `concern` with [`Persistence::Device`].
     pub const fn device_durable(concern: WriteConcern) -> Self {
         WriteOptions {
             concern,
@@ -441,6 +509,8 @@ impl WriteOptions {
         }
     }
 
+    /// The `W` these options need when the key has `replicas` replicas, or
+    /// [`CoordError::InvalidWriteOptions`] if they cannot be met.
     pub fn required_acks(self, replicas: usize) -> Result<usize, CoordError> {
         let w = match self.concern {
             WriteConcern::Unacknowledged => 0,
@@ -476,53 +546,117 @@ impl From<WriteConcern> for WriteOptions {
     }
 }
 
+/// Why a coordinator operation failed.
+///
+/// For writes, deletes and range deletes, every variant except
+/// [`InvalidWriteOptions`](Self::InvalidWriteOptions),
+/// [`InvalidRange`](Self::InvalidRange), [`UnknownZone`](Self::UnknownZone),
+/// [`NotSorted`](Self::NotSorted), [`NoReplicas`](Self::NoReplicas) and
+/// [`Unsupported`](Self::Unsupported) can follow a partial apply: some
+/// replicas may hold the write. Treat the outcome as unknown, and if you retry,
+/// expect the retry to be a new write with a newer version.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CoordError {
+    /// Fewer than `needed` replicas acknowledged (writes) or answered (reads).
+    /// Usually replicas are down or unreachable.
     QuorumFailed {
+        /// Acknowledgements or replies required.
         needed: usize,
+        /// How many arrived.
         got: usize,
     },
+    /// A scan could not read one range from `needed` replicas. `cursor` is the
+    /// key the failed page started at (`None` for the start of the range), and
+    /// `replicas` lists each replica's failure.
     ScanQuorumFailed {
+        /// The zone scanned.
         zone_id: ZoneId,
+        /// Where the failed page started.
         cursor: Option<Vec<u8>>,
+        /// Replies required.
         needed: usize,
+        /// Replies received.
         got: usize,
+        /// The replicas that failed and why.
         replicas: Vec<ReplicaError>,
     },
+    /// The write missed its quorum because `rejected` replicas refused its
+    /// version: too far ahead of their clocks or, with tombstone GC enabled,
+    /// older than their GC grace allows. Check clock synchronization.
     SkewRejected {
+        /// Acknowledgements required.
         needed: usize,
+        /// Acknowledgements received.
         got: usize,
+        /// Replicas that refused on clock skew.
         rejected: usize,
     },
+    /// The ring has no eligible replica for the key (for example, an empty
+    /// ring or a zone scope with no members). Nothing was sent.
     NoReplicas,
+    /// The zone is not in the catalog, even after refreshing it from a member.
     UnknownZone(ZoneId),
+    /// The operation needs a sorted zone (scans, range deletes) and this zone
+    /// is unsorted. Zone 0 is always unsorted.
     NotSorted(ZoneId),
+    /// A node needed for the operation (or for a ring or catalog refresh)
+    /// could not be reached.
     Unavailable,
+    /// This client's request budget ([`ClientBudgets`], or the coordinator's
+    /// credits) is exhausted: a single request larger than a budget, a
+    /// shedding call such as [`Coordinator::try_write`] under load, or the
+    /// transport's response budget.
     Overloaded,
+    /// A replica runs a newer ring epoch. With automatic refresh (the default)
+    /// this is returned only if refreshing and retrying once did not help.
     StaleRing {
+        /// The replica's epoch.
         epoch: u64,
     },
+    /// The quorum was missed because `busy` healthy replicas refused
+    /// retryably (full reserve, memory budget, admission gate). Retry with
+    /// backoff.
     Busy {
+        /// Acknowledgements required.
         needed: usize,
+        /// Acknowledgements received.
         got: usize,
+        /// Replicas that refused retryably.
         busy: usize,
     },
+    /// A range delete's `lo` is not below its `hi`. Nothing was sent.
     InvalidRange,
+    /// The [`WriteOptions`] cannot be met for a key with `replicas` replicas:
+    /// `Quorum(0)`, `Quorum(n)` with `n > replicas`, or `Unacknowledged` with
+    /// `Device` persistence. Nothing was sent for that key.
     InvalidWriteOptions {
+        /// The options given.
         options: WriteOptions,
+        /// The key's replica count.
         replicas: usize,
     },
+    /// The node does not support range deletes. Nothing was sent.
     Unsupported(NodeId),
+    /// A range delete reached its write quorum on some ranges but not on the
+    /// ranges listed in `missed`, which may hold the tombstone on some
+    /// replicas. A retry is a new range delete at a newer version.
     RangeDeleteIncomplete {
+        /// The version the range delete was written at.
         version: Version,
+        /// The ranges that missed their quorum, and why.
         missed: Vec<RangeDeleteMiss>,
     },
 }
 
+/// One range a range delete could not complete; see
+/// [`CoordError::RangeDeleteIncomplete`].
 #[derive(Debug, PartialEq, Eq)]
 pub struct RangeDeleteMiss {
+    /// Inclusive lower bound of the range (`None` = start of the zone).
     pub lo: Option<Vec<u8>>,
+    /// Exclusive upper bound of the range (`None` = end of the zone).
     pub hi: Option<Vec<u8>>,
+    /// Why it failed.
     pub error: CoordError,
 }
 
@@ -625,30 +759,44 @@ impl std::fmt::Display for CoordError {
 
 impl std::error::Error for CoordError {}
 
+/// The outcome of one write in a batch.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WriteOutcome {
+    /// The write met its concern.
     Ok {
+        /// The version it was written at.
         version: Version,
+        /// Replicas that acknowledged by the time the batch returned.
         acks: usize,
     },
+    /// The write missed its concern. If `acks > 0` it is on some replicas;
+    /// even with `acks == 0` it may be (see [`CoordError`]).
     Failed {
+        /// Why.
         error: CoordError,
+        /// Replicas that acknowledged.
         acks: usize,
     },
 }
 
+/// Per-write outcomes of a batch, in input order.
+///
+/// A batch is not atomic: each write succeeds or fails on its own.
 #[derive(Debug)]
 pub struct BatchResult {
+    /// One outcome per input write, in the same order.
     pub outcomes: Vec<WriteOutcome>,
 }
 
 impl BatchResult {
+    /// Whether every write met its concern.
     pub fn all_ok(&self) -> bool {
         self.outcomes
             .iter()
             .all(|o| matches!(o, WriteOutcome::Ok { .. }))
     }
 
+    /// The input index and error of each failed write.
     pub fn failures(&self) -> impl Iterator<Item = (usize, &CoordError)> {
         self.outcomes
             .iter()
@@ -660,15 +808,23 @@ impl BatchResult {
     }
 }
 
+/// What a sloppy-quorum write ([`Coordinator::write_sloppy`]) achieved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SloppyAck {
+    /// The version written.
     pub version: Version,
+    /// Acknowledgements from the key's home replicas.
     pub home_acks: usize,
+    /// Acknowledgements from fallback nodes outside the home set.
     pub fallback_acks: usize,
+    /// Unreachable home replicas for which this coordinator kept a hint to
+    /// deliver later.
     pub hinted: usize,
 }
 
 impl SloppyAck {
+    /// Whether the concern was met by home replicas alone, so the write has
+    /// the same read guarantee as a strict write.
     pub fn is_strict(&self) -> bool {
         self.fallback_acks == 0
     }
@@ -692,13 +848,33 @@ impl Committed {
     }
 }
 
+/// How a quorum read contacts replicas; see [`Coordinator::with_read_fanout`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadFanout {
+    /// The default. Asks `R` replicas: one returns the value and the others
+    /// return only the version they hold, so a strong read costs about one
+    /// device read. A spare replica is asked when one fails, and if the value
+    /// holder is not the newest, the newest value is fetched in a second step.
     Digest,
+    /// Ask every replica for the value and use the first `R` replies.
     All,
+    /// Ask exactly `R` replicas for the value, and others only if some fail.
     Quorum,
 }
 
+/// The client: routes each operation to its key's replicas and applies the
+/// quorum rules.
+///
+/// Build one with [`Coordinator::new`] over a transport, usually a
+/// [`NetTransport`](crate::NetTransport), then refresh its ring and catalog
+/// from a live node. See the [crate documentation](crate) for the threading,
+/// retry, cancellation and consistency rules that apply to every method.
+///
+/// Methods without a zone argument use [`DEFAULT_ZONE`]; the `_in` variants
+/// take a zone. Reads return only live values: a deleted key reads as `None`.
+/// Every write is stamped with a [`Version`] from this coordinator's hybrid
+/// logical clock, whose writer id is random per coordinator, so two
+/// coordinators never produce the same version.
 pub struct Coordinator<T: Transport> {
     node: NodeId,
     ring: RefCell<Ring>,

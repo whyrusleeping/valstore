@@ -1579,6 +1579,7 @@ impl Transport for NetTransport {
 }
 
 impl NetTransport {
+    #[doc(hidden)]
     pub async fn range_delete(
         &self,
         node: NodeId,

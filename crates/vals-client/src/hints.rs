@@ -3,28 +3,45 @@ use std::collections::{HashMap, VecDeque};
 use crate::hlc::Version;
 use crate::ring::NodeId;
 
+/// Hints [`MemHintStore::default`] keeps per node.
 pub const DEFAULT_HINT_CAP: usize = 4096;
 
+/// A default-zone write held for a replica that missed it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hint {
+    /// The key.
     pub key: Vec<u8>,
+    /// The value, or `None` for a delete.
     pub value: Option<Vec<u8>>,
+    /// The write's version.
     pub version: Version,
 }
 
+/// Where a coordinator keeps hints for unreachable replicas; see
+/// [`Coordinator::with_hint_store`](crate::Coordinator::with_hint_store).
+///
+/// Hints only speed up convergence; anti-entropy repairs replicas without
+/// them, so a store may drop hints.
 pub trait HintStore {
+    /// Keeps `hint` for `node`.
     fn record(&mut self, node: NodeId, hint: Hint);
+    /// Removes and returns every hint for `node`, oldest first.
     fn drain(&mut self, node: NodeId) -> Vec<Hint>;
+    /// Puts back hints that could not be delivered.
     fn restore(&mut self, node: NodeId, hints: Vec<Hint>);
+    /// How many hints are held for `node`.
     fn pending(&self, node: NodeId) -> usize;
 }
 
+/// An in-memory [`HintStore`] keeping at most a fixed number of hints per
+/// node, dropping the oldest when full.
 pub struct MemHintStore {
     cap: usize,
     queues: HashMap<NodeId, VecDeque<Hint>>,
 }
 
 impl MemHintStore {
+    /// A store keeping up to `cap_per_node` hints per node (at least 1).
     pub fn new(cap_per_node: usize) -> Self {
         MemHintStore {
             cap: cap_per_node.max(1),

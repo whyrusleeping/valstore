@@ -472,6 +472,7 @@ pub(crate) struct RecountPrefetched {
 }
 
 impl<D: BlockDevice> VersionedStore<D> {
+    /// Wraps a freshly created engine as replica `node`'s store.
     pub fn new(engine: Engine<D>, node: u32) -> Result<Self, EngineError> {
         Ok(Self::lazy(engine, node))
     }
@@ -2008,6 +2009,9 @@ impl<D: BlockDevice> VersionedStore<D> {
         self.seed_started.set(None);
     }
 
+    /// Recovers replica `node`'s store from `dev` (see
+    /// `vals_store::Engine::open`; the same `cfg`, block size and node id as
+    /// before are required).
     pub fn open(dev: D, cfg: vals_store::Config, node: u32) -> Result<Self, EngineError> {
         let engine = Engine::open(dev, cfg)?;
         Ok(Self::lazy(engine, node))

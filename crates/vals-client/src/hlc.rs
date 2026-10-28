@@ -16,20 +16,35 @@ pub fn physical_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// A write's version: a hybrid logical clock reading plus the writer's id.
+///
+/// Versions are totally ordered (by `hlc`, then `node`) and the greater one
+/// wins on every replica (last-writer-wins). The clock follows the writer's
+/// wall clock in milliseconds and moves past any version the coordinator has
+/// read, so a write issued after a read of the same key from the same
+/// coordinator gets a greater version. Writes from different coordinators
+/// are ordered by their clocks, so keep clocks synchronized; replicas refuse
+/// versions too far ahead of their own clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Version {
+    /// Wall-clock milliseconds (high bits) and a logical counter (low 16
+    /// bits).
     pub hlc: u64,
+    /// The writer id, random per coordinator.
     pub node: u64,
 }
 
 impl Version {
+    /// Whether `self` beats `other` under last-writer-wins.
     pub fn wins_over(&self, other: &Version) -> bool {
         self > other
     }
 
+    /// The wall-clock milliseconds since the Unix epoch.
     pub fn physical_ms(&self) -> u64 {
         self.hlc >> COUNTER_BITS
     }
+    /// The logical counter within that millisecond.
     pub fn counter(&self) -> u64 {
         self.hlc & COUNTER_MASK
     }

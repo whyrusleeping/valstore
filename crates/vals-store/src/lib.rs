@@ -1,3 +1,35 @@
+//! `vals-store`: the single-node storage engine under every vals replica.
+//!
+//! An [`Engine`] stores keys and values on one [`vals_spdk::BlockDevice`]
+//! region. Writes append to a checksummed value log (`vlog`), and an index
+//! maps each key to its newest record. The index starts in memory and is
+//! flushed to sorted on-disk runs, which are merged in the background, so the
+//! index does not have to fit in RAM. On open, the engine loads its manifest
+//! and runs and replays the log tail. Compaction reclaims space held by
+//! overwritten and deleted values.
+//!
+//! Keys can be unordered (hash index) or ordered (for range scans); see
+//! [`Config`]. Every record carries a caller-supplied version, which the
+//! cluster layer uses for last-writer-wins replication. Most applications use
+//! the engine through `vals-cluster` rather than directly.
+//!
+//! # Supported API
+//!
+//! For direct use, the supported surface is [`Engine::create`],
+//! [`Engine::open`], [`Engine::put`], [`Engine::get`], [`Engine::version`],
+//! [`Engine::scan`], [`Engine::scan_bounded`], [`Engine::sync`] and the
+//! low-level [`Engine::delete`], with [`Config`], [`Ordering`] and
+//! [`EngineError`], over a `vals_spdk` block device. The [`Engine`] type
+//! documents the version, delete, durability and maintenance rules, which
+//! differ from the replicated API: the engine is not interchangeable with
+//! `vals-cluster`'s `VersionedStore`, which adds replication's versioned
+//! deletes and clock checks on top of an engine.
+//!
+//! Every other public item (flush, compaction and reclaim plans, runs,
+//! manifests, snapshots, dump and log-scan helpers, pacing) is the interface
+//! `vals-cluster` uses to drive maintenance and recovery. It may change in
+//! any revision. The crate is not published and has no API freeze.
+
 
 #[cfg(all(test, feature = "heap-profile"))]
 mod heap_profile;

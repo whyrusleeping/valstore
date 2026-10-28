@@ -1,6 +1,8 @@
 use super::*;
 
 impl Node {
+    /// Binds a nonblocking listener on `127.0.0.1` with an ephemeral port, for
+    /// tests and demos. A real node binds the address its peers dial.
     pub fn bind() -> io::Result<(TcpListener, SocketAddr)> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         listener.set_nonblocking(true)?;
@@ -12,6 +14,11 @@ impl Node {
         (0..count).map(|_| Self::bind()).collect()
     }
 
+    /// Serves a single-zone, single-shard node on `listener` (which must be
+    /// nonblocking) with `store` as zone 0, running anti-entropy sweeps every
+    /// `sweep_every`. Tombstones are kept forever (no GC); use
+    /// [`serve_with_liveness`](Self::serve_with_liveness) for GC, and
+    /// [`serve_zoned`](Self::serve_zoned) for more zones.
     pub fn serve<D>(
         node_id: NodeId,
         listener: TcpListener,

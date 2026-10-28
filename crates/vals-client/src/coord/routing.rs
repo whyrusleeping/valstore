@@ -1,6 +1,21 @@
 use super::*;
 
 impl<T: Transport> Coordinator<T> {
+    /// Creates a coordinator.
+    ///
+    /// `node` labels this coordinator (use an id that is not a data node's);
+    /// versions carry a random writer id, not this label. `ring` is the boot
+    /// placement, replaced by [`refresh_ring`](Self::refresh_ring) or by the
+    /// automatic refresh after a stale-ring refusal. `r` is the replica count
+    /// [`read`](Self::read), [`read_in`](Self::read_in) and
+    /// [`read_many`](Self::read_many) wait for; with RF 3 use 2 so that
+    /// majority writes and reads overlap. A coordinator over a
+    /// [`NetTransport`](crate::NetTransport) takes its request budgets from
+    /// the transport's [`ClientConfig`](crate::ClientConfig); other transports
+    /// are unbounded unless you call [`with_credits`](Self::with_credits).
+    ///
+    /// The coordinator starts with digest reads, automatic stale-ring refresh,
+    /// in-memory hints, and no failure detector.
     pub fn new(node: NodeId, ring: Ring, r: usize, transport: T) -> Self {
         Self::new_with_hlc(node, ring, r, transport, Hlc::new(node))
     }
@@ -45,25 +60,37 @@ impl<T: Transport> Coordinator<T> {
         }
     }
 
+    /// Turns off the automatic ring refresh and single retry after a
+    /// stale-ring refusal; such operations then fail with
+    /// [`CoordError::StaleRing`] and you refresh yourself.
     pub fn with_manual_refresh(self) -> Self {
         self.auto_refresh.set(false);
         self
     }
 
+    /// Whether unlimited scans request the next page while merging the
+    /// current one (on by default).
     pub fn set_scan_prefetch(&self, on: bool) {
         self.scan_prefetch.set(on);
     }
 
+    /// Adds a per-node circuit breaker: after `cfg.failure_threshold`
+    /// consecutive failed requests to a node, requests to it fail immediately
+    /// as unavailable, except one probe every `cfg.open_cooldown_ms`, until a
+    /// request succeeds. This saves waiting for deadlines on a dead node.
     pub fn with_failure_detector(mut self, cfg: crate::failure::FdConfig) -> Self {
         self.fd = Some(RefCell::new(FailureDetector::new(cfg)));
         self
     }
 
+    #[doc(hidden)]
     pub fn with_clock(mut self, clock: impl Fn() -> u64 + 'static) -> Self {
         self.clock = Box::new(clock);
         self
     }
 
+    /// Whether the failure detector currently treats `node` as down (always
+    /// false without [`with_failure_detector`](Self::with_failure_detector)).
     pub fn is_node_down(&self, node: NodeId) -> bool {
         match &self.fd {
             Some(fd) => fd.borrow().is_down(node, (self.clock)()),
@@ -71,6 +98,7 @@ impl<T: Transport> Coordinator<T> {
         }
     }
 
+    /// The nodes the failure detector currently treats as down.
     pub fn down_nodes(&self) -> Vec<NodeId> {
         match &self.fd {
             Some(fd) => fd.borrow().down_nodes((self.clock)()),
@@ -78,11 +106,16 @@ impl<T: Transport> Coordinator<T> {
         }
     }
 
+    /// Replaces where hints for unreachable replicas are kept. The default
+    /// [`MemHintStore`] is in memory, bounded per node, and lost with the
+    /// process. Hints are kept only for default-zone writes.
     pub fn with_hint_store(mut self, hints: Box<dyn HintStore>) -> Self {
         self.hints = RefCell::new(hints);
         self
     }
 
+    /// Sets the global write budget (operations and key-plus-value bytes in
+    /// flight); see [`ClientBudgets`]. Zero is raised to one.
     pub fn with_credits(self, max_ops: usize, max_bytes: usize) -> Self {
         let mut credits = self.credits.borrow_mut();
         let node_max_ops = credits.node_max_ops;
@@ -93,6 +126,8 @@ impl<T: Transport> Coordinator<T> {
         self
     }
 
+    /// Sets the per-node write budget; see [`ClientBudgets`]. Zero is raised
+    /// to one.
     pub fn with_node_credits(self, max_ops: usize, max_bytes: usize) -> Self {
         {
             let mut p = self.credits.borrow_mut();
@@ -102,11 +137,16 @@ impl<T: Transport> Coordinator<T> {
         self
     }
 
+    /// Chooses how quorum reads contact replicas (default
+    /// [`ReadFanout::Digest`]).
     pub fn with_read_fanout(mut self, mode: ReadFanout) -> Self {
         self.read_fanout = mode;
         self
     }
 
+    /// In digest reads, also asks a spare replica if the needed replies have
+    /// not arrived after `delay` (zero turns hedging off, the default).
+    /// Needs a [`CoordinatorService`] to run the hedge timer.
     pub fn with_digest_hedge(mut self, delay: Duration) -> Self {
         if delay.is_zero() {
             self.digest_hedge = None;
@@ -133,6 +173,7 @@ impl<T: Transport> Coordinator<T> {
         self.digest_hedge.as_ref().map(|h| h.tick_period)
     }
 
+    /// A snapshot of this coordinator's write budget.
     pub fn credit_stats(&self) -> CreditStats {
         self.credits.borrow().stats()
     }
@@ -284,6 +325,7 @@ impl<T: Transport> Coordinator<T> {
         }
     }
 
+    /// The label given to [`new`](Self::new).
     pub fn node_id(&self) -> NodeId {
         self.node
     }
@@ -293,18 +335,29 @@ impl<T: Transport> Coordinator<T> {
         self.hlc.now(physical_ms)
     }
 
+    /// The transport, for its statistics and peer management.
     pub fn transport(&self) -> &T {
         &self.transport
     }
 
+    /// The current placement ring. Do not hold the borrow across an `.await`
+    /// of this coordinator's operations; they may need to update it.
     pub fn ring(&self) -> std::cell::Ref<'_, Ring> {
         self.ring.borrow()
     }
 
+    /// Mutable access to the ring, for setting up a boot ring by hand. The
+    /// next refresh replaces it.
     pub fn ring_mut(&self) -> std::cell::RefMut<'_, Ring> {
         self.ring.borrow_mut()
     }
 
+    /// Asks node `from` for the cluster's membership and adopts it (ring
+    /// members, weights, replication factor, epoch and member addresses) if
+    /// it is not older than what this coordinator already has. Returns the
+    /// member ids. Call it, and [`refresh_catalog`](Self::refresh_catalog),
+    /// once before traffic; fails with [`CoordError::Unavailable`] if `from`
+    /// cannot be reached.
     pub async fn refresh_ring(&self, from: NodeId) -> Result<Vec<NodeId>, CoordError> {
         let view = self
             .transport
@@ -341,14 +394,21 @@ impl<T: Transport> Coordinator<T> {
         view.members.into_iter().map(|(n, _)| n).collect()
     }
 
+    /// The epoch of the adopted ring (0 before any refresh).
     pub fn ring_epoch(&self) -> u64 {
         self.epoch.get()
     }
 
+    /// The zone catalog as last refreshed. Look up a zone id by name with
+    /// [`Catalog::by_name`]. The same borrow rule as [`ring`](Self::ring)
+    /// applies.
     pub fn catalog(&self) -> std::cell::Ref<'_, Catalog> {
         self.catalog.borrow()
     }
 
+    /// Asks node `from` for the zone catalog and the sorted zones' range maps
+    /// and adopts them. Operations on a zone missing from the catalog refresh
+    /// it once by themselves.
     pub async fn refresh_catalog(&self, from: NodeId) -> Result<(), CoordError> {
         let mut cat = self
             .transport
@@ -378,6 +438,7 @@ impl<T: Transport> Coordinator<T> {
         self.transport.set_sorted_ranges(&ranges);
     }
 
+    /// Asks node `from` for the sorted zones' range maps only.
     pub async fn refresh_range_maps(&self, from: NodeId) -> Result<(), CoordError> {
         let maps = self
             .transport
@@ -389,6 +450,8 @@ impl<T: Transport> Coordinator<T> {
         Ok(())
     }
 
+    /// The replicas this coordinator would send `key` in `zone_id` to, from
+    /// its current ring and catalog.
     pub fn replicas_for(&self, zone_id: ZoneId, key: &[u8]) -> Result<Vec<NodeId>, CoordError> {
         let ring = self.ring.borrow();
         let reps = if zone_id == DEFAULT_ZONE {
@@ -420,11 +483,14 @@ impl<T: Transport> Coordinator<T> {
         }
     }
 
+    #[doc(hidden)]
     pub fn set_range_map(&self, zone_id: ZoneId, map: RangeMap) {
         self.range_maps.borrow_mut().insert(zone_id, map);
         self.push_sorted_ranges();
     }
 
+    /// The adopted range map of sorted zone `zone_id` (a single range if none
+    /// was received).
     pub fn range_map(&self, zone_id: ZoneId) -> RangeMap {
         self.range_maps
             .borrow()

@@ -1,16 +1,37 @@
 use super::*;
 
+/// Default [`ClientConfig::connect_deadline`].
 pub const DEFAULT_CONNECT_DEADLINE: Duration = Duration::from_secs(5);
+/// Default [`ClientConfig::rpc_deadline`].
 pub const DEFAULT_RPC_DEADLINE: Duration = Duration::from_secs(5);
+/// Default global operation budget.
 pub const DEFAULT_CLIENT_MAX_OPS: usize = 32_768;
+/// Default global byte budget (512 MiB).
 pub const DEFAULT_CLIENT_MAX_BYTES: usize = 512 * 1024 * 1024;
+/// Default per-node operation budget.
 pub const DEFAULT_CLIENT_NODE_MAX_OPS: usize = 8_192;
+/// Default per-node byte budget (128 MiB).
 pub const DEFAULT_CLIENT_NODE_MAX_BYTES: usize = 128 * 1024 * 1024;
 
+/// Deadlines and request budgets for a [`NetTransport`] and the coordinator
+/// built on it.
+///
+/// The default has finite deadlines and budgets (the `DEFAULT_*`
+/// constants). `None` disables a deadline or the budgets; that is meant for
+/// benchmarks ([`ClientConfig::benchmark_unbounded`]), since a dead peer can
+/// then hold a request, and its memory, forever.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClientConfig {
+    /// How long opening a connection and completing its protocol handshake
+    /// may take, counted for each request sent while the connection is not
+    /// yet ready.
     pub connect_deadline: Option<Duration>,
+    /// How long each request may wait for its reply once the connection is
+    /// ready. An expired request fails with [`TransportError::Timeout`]; its
+    /// effect on the replica is unknown.
     pub rpc_deadline: Option<Duration>,
+    /// Limits on outstanding requests and buffered bytes; see
+    /// [`ClientBudgets`](crate::ClientBudgets).
     pub budgets: Option<crate::coord::ClientBudgets>,
 }
 
@@ -30,6 +51,7 @@ impl Default for ClientConfig {
 }
 
 impl ClientConfig {
+    /// No deadlines and no budgets. For benchmarks only.
     pub fn benchmark_unbounded() -> Self {
         ClientConfig {
             connect_deadline: None,
@@ -38,6 +60,9 @@ impl ClientConfig {
         }
     }
 
+    /// Checks that deadlines and budgets are positive and per-node budgets do
+    /// not exceed the global ones. The `connect_*_with_config` constructors
+    /// call this.
     pub fn validate(self) -> Result<Self, ClientConfigError> {
         if self.connect_deadline.is_some_and(|deadline| deadline.is_zero()) {
             return Err(ClientConfigError::ZeroConnectDeadline);
@@ -63,11 +88,16 @@ impl ClientConfig {
     }
 }
 
+/// Why [`ClientConfig::validate`] refused a configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientConfigError {
+    /// `connect_deadline` is `Some(0)`.
     ZeroConnectDeadline,
+    /// `rpc_deadline` is `Some(0)`.
     ZeroRpcDeadline,
+    /// A budget is zero.
     ZeroBudget,
+    /// A per-node budget is larger than the matching global budget.
     NodeBudgetExceedsGlobal,
 }
 
@@ -86,6 +116,8 @@ impl std::fmt::Display for ClientConfigError {
 
 impl std::error::Error for ClientConfigError {}
 
+/// Counters for one connection; see [`NetTransport::connection_stats`].
+/// Diagnostic only: the fields may change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectionStats {
     pub node: NodeId,
@@ -316,6 +348,18 @@ fn is_idempotent_read(request: &Request<'_>) -> bool {
     )
 }
 
+/// The TCP transport: one multiplexed connection per node address.
+///
+/// Constructors take the seed nodes as `(node id, address)` pairs; a node
+/// that serves several shards on separate listeners is given all its
+/// addresses (`connect_sharded*`). Nothing is dialed until the first request
+/// to a node, and a failed connection is reopened by a later request. After a
+/// ring refresh the transport also learns the addresses of members it was not
+/// given. Like the coordinator, it is neither `Send` nor `Sync` and needs
+/// [`reactor::poll_io`](crate::reactor::poll_io) on its thread.
+///
+/// Data requests carry no credentials: anyone who can reach a node's data
+/// port can read and write. Run clients and nodes on a trusted network.
 pub struct NetTransport {
     conns: RefCell<HashMap<NodeId, Vec<Rc<MuxConn>>>>,
     connect_deadline: Cell<Option<Duration>>,
@@ -332,16 +376,20 @@ pub struct NetTransport {
 }
 
 impl NetTransport {
+    /// A transport to single-address nodes with the default [`ClientConfig`].
     pub fn connect(addrs: &[(NodeId, SocketAddr)]) -> Self {
         Self::connect_with_config(addrs, ClientConfig::default())
             .expect("valid default client config")
     }
 
+    /// [`connect`](Self::connect) with
+    /// [`ClientConfig::benchmark_unbounded`]. For benchmarks only.
     pub fn connect_unbounded(addrs: &[(NodeId, SocketAddr)]) -> Self {
         Self::connect_with_config(addrs, ClientConfig::benchmark_unbounded())
             .expect("valid benchmark client config")
     }
 
+    /// [`connect`](Self::connect) with an explicit, validated configuration.
     pub fn connect_with_config(
         addrs: &[(NodeId, SocketAddr)],
         config: ClientConfig,
@@ -349,11 +397,15 @@ impl NetTransport {
         Self::connect_sharded_with_config(addrs.iter().map(|&(n, a)| (n, vec![a])), config)
     }
 
+    /// A transport to nodes with one or more shard addresses each, with the
+    /// default [`ClientConfig`]. List a node's addresses in its shard order.
     pub fn connect_sharded(nodes: impl IntoIterator<Item = (NodeId, Vec<SocketAddr>)>) -> Self {
         Self::connect_sharded_with_config(nodes, ClientConfig::default())
             .expect("valid default client config")
     }
 
+    /// [`connect_sharded`](Self::connect_sharded) with
+    /// [`ClientConfig::benchmark_unbounded`]. For benchmarks only.
     pub fn connect_sharded_unbounded(
         nodes: impl IntoIterator<Item = (NodeId, Vec<SocketAddr>)>,
     ) -> Self {
@@ -361,6 +413,8 @@ impl NetTransport {
             .expect("valid benchmark client config")
     }
 
+    /// [`connect_sharded`](Self::connect_sharded) with an explicit, validated
+    /// configuration.
     pub fn connect_sharded_with_config(
         nodes: impl IntoIterator<Item = (NodeId, Vec<SocketAddr>)>,
         config: ClientConfig,
@@ -424,6 +478,9 @@ impl NetTransport {
         conn
     }
 
+    /// Sets both the connect and RPC deadlines to `deadline`, for existing
+    /// and future connections. Panics if `deadline` is zero. Prefer
+    /// [`ClientConfig`], which sets them separately.
     pub fn with_rpc_deadline(self, deadline: Duration) -> Self {
         assert!(!deadline.is_zero(), "RPC deadline must be positive");
         self.connect_deadline.set(Some(deadline));
@@ -440,10 +497,14 @@ impl NetTransport {
         self
     }
 
+    /// Whether the transport knows an address for `node`.
     pub fn has_peer(&self, node: NodeId) -> bool {
         self.conns.borrow().contains_key(&node)
     }
 
+    /// Sets `node`'s shard addresses, replacing its connections if they
+    /// changed. Returns whether anything changed. Ring refreshes call this
+    /// for every member.
     pub fn add_peer(&self, node: NodeId, addrs: &[SocketAddr]) -> bool {
         if addrs.is_empty() {
             return false;
@@ -476,6 +537,7 @@ impl NetTransport {
         true
     }
 
+    #[doc(hidden)]
     pub fn set_down(&self, node: NodeId, down: bool) {
         if down {
             self.down.borrow_mut().insert(node);
@@ -550,6 +612,7 @@ impl NetTransport {
         support
     }
 
+    #[doc(hidden)]
     pub fn range_tombstones_supported(&self, node: NodeId) -> Option<bool> {
         let shards = self.conns.borrow().get(&node).cloned()?;
         let mut supported = None;
@@ -764,10 +827,12 @@ impl NetTransport {
         Ok(())
     }
 
+    #[doc(hidden)]
     pub fn peer(&self, node: NodeId) -> NetPeer<'_> {
         self.peer_shard(node, 0)
     }
 
+    #[doc(hidden)]
     pub fn peer_shard(&self, node: NodeId, shard: usize) -> NetPeer<'_> {
         NetPeer {
             transport: self,
@@ -776,6 +841,7 @@ impl NetTransport {
         }
     }
 
+    #[doc(hidden)]
     pub fn peer_shard_count(&self, node: NodeId) -> usize {
         self.conns.borrow().get(&node).map_or(0, Vec::len)
     }
@@ -785,16 +851,19 @@ impl NetTransport {
         (self.mixed_batch_rpcs.get(), self.mixed_scalar_probes.get())
     }
 
+    /// Requests sent so far, counting retries.
     pub fn rpc_attempts(&self) -> u64 {
         self.rpc_attempts.get()
     }
 
+    /// A snapshot of the transport's request budget (`None` when unbounded).
     pub fn transport_credit_stats(&self) -> Option<crate::coord::CreditStats> {
         self.transport_credits
             .as_ref()
             .map(|pool| pool.borrow().stats())
     }
 
+    /// Per-connection counters, for diagnostics.
     pub fn connection_stats(&self) -> Vec<ConnectionStats> {
         self.conns
             .borrow()
@@ -834,6 +903,7 @@ impl NetTransport {
         true
     }
 
+    #[doc(hidden)]
     pub async fn watermark(&self, node: NodeId) -> Result<u64, TransportError> {
         match self
             .rpc(
@@ -851,6 +921,7 @@ impl NetTransport {
         }
     }
 
+    #[doc(hidden)]
     pub async fn range_write_mark(
         &self,
         node: NodeId,

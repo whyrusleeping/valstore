@@ -200,6 +200,11 @@ impl<D: BlockDevice> FlushPlan<D> {
 }
 
 impl<D: BlockDevice> Engine<D> {
+    /// Writes out the buffered value log and flushes the device, so every
+    /// earlier successful write survives a crash. How durable a device flush
+    /// is depends on the device (for a file, `fsync`; a memory device has no
+    /// durability). On error, treat the writes since the last successful sync
+    /// as possibly lost.
     pub fn sync(&mut self) -> Result<(), EngineError> {
         self.log.sync(&self.dev)?;
         Ok(())

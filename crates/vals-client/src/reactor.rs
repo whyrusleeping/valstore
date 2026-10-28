@@ -108,6 +108,13 @@ fn poll_io_with(timeout_ms: i32) {
     }
 }
 
+/// Waits up to 1 ms for socket readiness on this thread and wakes the tasks
+/// whose sockets are ready, after flushing queued requests.
+///
+/// Pass it as the I/O hook of [`vals_rt::block_on`] or a
+/// [`vals_rt::LocalExecutor`] that drives a [`NetTransport`](crate::NetTransport);
+/// the reactor is per thread, so it must run on the thread that owns the
+/// transport.
 pub fn poll_io() {
     run_flush_hook();
     poll_io_with(POLL_IO_TIMEOUT_MS);

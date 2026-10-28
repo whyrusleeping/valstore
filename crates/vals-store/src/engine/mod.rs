@@ -237,10 +237,17 @@ fn note_mutable_tombstone(current: Option<(u128, u64)>, version: u128, seq: u64)
     current.map_or((version, seq), |(min, max_seq)| (min.min(version), max_seq.max(seq)))
 }
 
+/// Engine geometry and key ordering. Open a store with the same `Config` it
+/// was created with.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
+    /// Blocks per value-log segment (default 256). One key plus value, with a
+    /// small header, must fit in a segment.
     pub seg_blocks: u64,
+    /// Blocks at the start of the device the engine leaves alone (default 0).
     pub reserved_blocks: u64,
+    /// [`Ordering::Sorted`] keeps keys ordered for [`Engine::scan`];
+    /// [`Ordering::Unsorted`] (the default) supports point operations only.
     pub ordering: Ordering,
 }
 
@@ -460,6 +467,37 @@ struct ShadowState {
     disarms: u64,
 }
 
+/// A single-node key/value store on one block device.
+///
+/// This is the raw storage engine under each vals replica, without
+/// replication, quorums or a clock. Its contract, for applications that use
+/// it directly:
+///
+/// - **Versions are yours.** Every write takes a caller-chosen `u128`
+///   version. Reads return the entry with the greatest version, wherever it
+///   is stored. The engine does not allocate versions or check that they
+///   increase; a [`put`](Self::put) with a lower version than the key's newest
+///   unflushed entry is silently ignored. Allocate versions so that the write
+///   you want to win has the greatest one.
+/// - **No logical delete.** [`delete`](Self::delete) is a low-level removal of
+///   the key's newest unflushed entry, not a tombstone. The replica layer in
+///   `vals-cluster` implements deletes by writing a marker value at a newer
+///   version; do the same if you need deletes that hide older data.
+/// - **Durability is explicit.** Writes are buffered in memory. Only a
+///   successful [`sync`](Self::sync) makes the writes before it durable, as
+///   far as the device's flush is; dropping the engine does not sync.
+/// - **Recovery.** [`open`](Self::open) recovers a store by loading its
+///   on-disk state and replaying the value log; synced writes come back,
+///   unsynced ones may not. [`create`](Self::create) formats the device and
+///   destroys any store on it.
+/// - **One owner.** Methods that change the engine take `&mut self`, and the
+///   engine is not `Sync`. Use it from one thread at a time, and never open
+///   the same device through two engines.
+/// - **Maintenance is the caller's job.** The engine runs no background
+///   threads. Flushing the in-memory index to on-disk runs, compaction and
+///   space reclamation happen only when the caller drives them, as
+///   `vals-cluster`'s node maintenance does; without them memory use and
+///   value-log space only grow, and writes fail once the device is full.
 pub struct Engine<D: BlockDevice> {
     dev: Arc<D>,
     alloc: Allocator,

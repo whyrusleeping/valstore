@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::zone::ZoneId;
 
+/// A data node's id, as registered with the PD.
 pub type NodeId = u32;
 
 pub const DEFAULT_VNODES: u32 = 128;
@@ -24,6 +25,14 @@ fn vnode_pos(node: NodeId, i: u32) -> u64 {
     hash64(&buf)
 }
 
+/// Consistent-hash placement: a key's replicas are the next `rf` distinct
+/// members clockwise from the key's hash, with each member owning a number
+/// of virtual nodes proportional to its weight.
+///
+/// A client only builds a boot ring ([`Ring::new`] plus
+/// [`set_members_weighted`](Ring::set_members_weighted)); the coordinator
+/// replaces it with the cluster's ring on refresh. Sorted zones and zone
+/// scopes place by range token and scope on top of this ring.
 #[derive(Debug, Clone)]
 pub struct Ring {
     rf: usize,
@@ -33,6 +42,8 @@ pub struct Ring {
 }
 
 impl Ring {
+    /// An empty ring with replication factor `rf` and the default virtual
+    /// node count. Panics if `rf` is 0.
     pub fn new(rf: usize) -> Self {
         Self::with_vnodes(rf, DEFAULT_VNODES)
     }
@@ -68,10 +79,12 @@ impl Ring {
         r
     }
 
+    /// The default zone's replication factor.
     pub fn rf(&self) -> usize {
         self.rf
     }
 
+    /// The member ids, ascending.
     pub fn members(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.weights.keys().copied()
     }
@@ -127,6 +140,7 @@ impl Ring {
         self.rebuild();
     }
 
+    /// Replaces the members with these `(id, weight)` pairs.
     pub fn set_members_weighted(&mut self, nodes: impl IntoIterator<Item = (NodeId, u32)>) {
         self.weights = nodes.into_iter().map(|(n, w)| (n, w.max(1))).collect();
         self.rebuild();
@@ -170,6 +184,7 @@ impl Ring {
         self.replicas(key).into_iter().next()
     }
 
+    /// The default zone's replicas of `key`, in preference order.
     pub fn replicas(&self, key: &[u8]) -> Vec<NodeId> {
         self.replicas_n(key, self.rf)
     }

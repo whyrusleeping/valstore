@@ -39,6 +39,38 @@
 //!     || {}, // poll_io hook: nothing to poll in-process
 //! );
 //! ```
+//!
+//! # Supported API
+//!
+//! This crate is for applications that host vals data nodes or the PD
+//! (control plane) in their own process; `valsd` is built on it. A program
+//! that only talks to a cluster needs `vals-client` instead, which this crate
+//! re-exports. The supported embedding surface is:
+//!
+//! - Data nodes: [`VersionedStore`] (`new` for a freshly created engine,
+//!   `open` to recover one), [`Node`] (`serve*` constructors) and
+//!   [`node::NodeHandle`], whose `shutdown` drains and stops the node. The
+//!   zone store providers [`MemZoneStore`] and [`FileZoneStore`] (and the
+//!   SPDK one behind the `spdk` feature), the persistent catalog store, and
+//!   the liveness logs [`FileLivenessLog`] and [`MemLivenessLog`] for
+//!   tombstone GC.
+//! - Control plane: [`PdDaemon`]'s `spawn*_durable*` constructors, its
+//!   membership and zone methods, and `shutdown`; [`RingConfig`].
+//! - Security: [`init_cluster_secret`], which control-plane traffic needs.
+//! - [`LocalCluster`], an in-memory transport for tests and demos only.
+//!
+//! The lifecycle, persistence, liveness and security rules are in
+//! `docs/embedding.md`; the data semantics are those of `vals-client`.
+//! [`VersionedStore`] applies versioned writes and deletes (tombstones) on
+//! top of a raw `vals-store` engine and is the layer that gives deletes and
+//! last-writer-wins their meaning; do not mix raw engine writes into a store
+//! it owns.
+//!
+//! The many other public modules and items (anti-entropy, backup and dump
+//! internals, drive layout, PD internals, server plumbing, test helpers) are
+//! shared with `valsd`, the tools and the tests. They may change in any
+//! revision. The crates are not published and there is no API freeze; keep
+//! every vals crate, and the servers you talk to, on one revision.
 
 pub mod observe;
 pub use vals_client::{reactor, ring, zone};

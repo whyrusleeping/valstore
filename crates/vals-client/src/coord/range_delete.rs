@@ -13,6 +13,19 @@ struct PlannedSlice {
 }
 
 impl<T: Transport> Coordinator<T> {
+    /// Deletes every key of sorted zone `zone_id` in `[lo, hi)` with one
+    /// range tombstone at a new version, which it returns.
+    ///
+    /// The tombstone hides every version of a key in the range that is older
+    /// than it, including writes still in flight with older versions; keys
+    /// written later with newer versions are not affected. The range is split
+    /// at the zone's range boundaries and each piece must meet the
+    /// [`WriteOptions`] concern on its own replicas. If some pieces miss it,
+    /// the call fails with [`CoordError::RangeDeleteIncomplete`] listing them;
+    /// the other pieces are already deleted. A retry writes a new tombstone
+    /// at a newer version, so it also deletes keys written into the range
+    /// since the first attempt. Fails with [`CoordError::NotSorted`] for unsorted zones (including
+    /// zone 0) and [`CoordError::InvalidRange`] if `lo >= hi`.
     pub async fn delete_range_in(
         &self,
         zone_id: ZoneId,

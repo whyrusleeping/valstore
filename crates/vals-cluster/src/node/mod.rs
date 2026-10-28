@@ -23,6 +23,14 @@ use crate::replica::VersionedStore;
 use crate::ring::{NodeId, Ring};
 use crate::zone::{ZoneId, DEFAULT_ZONE};
 
+/// Constructors that start a data node serving the vals protocol.
+///
+/// Each `serve*` call spawns the node's shard threads (each with its own
+/// executor and reactor) and maintenance threads, starts accepting on the
+/// given nonblocking listeners, and returns a [`NodeHandle`]. The boot ring
+/// and peers seed startup; under a PD the node adopts the PD's membership
+/// and zones when they are pushed. Call [`NodeHandle::shutdown`] before the
+/// process exits.
 pub struct Node;
 
 

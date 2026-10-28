@@ -2296,6 +2296,7 @@ impl PdDaemon {
         })
     }
 
+    /// Stops the PD's Raft, push and accept threads and waits for them.
     pub fn shutdown(self) {
         let _ = self.cmd.send(PdCmd::Shutdown);
         self.accept_stop
@@ -2376,6 +2377,9 @@ impl PdDaemon {
         }
     }
 
+    /// Queues the cluster's initial membership as one atomic change, retried
+    /// until a leader commits it. For first start only; returns before the
+    /// change is committed, so wait for [`members`](Self::members).
     pub fn bootstrap_members(&self, members: AddressedMembers) {
         self.submit_boot(PdCmd::Bootstrap(members), "bootstrap_members");
     }
@@ -2396,6 +2400,8 @@ impl PdDaemon {
         self.submit_admin(AdminMutation::Add(node, weight, Vec::new()))
     }
 
+    /// Proposes adding data node `node` with `weight` and its shard
+    /// addresses, so peers and clients can reach it without a restart.
     pub fn add_node_addressed(
         &self,
         node: NodeId,
@@ -2405,10 +2411,14 @@ impl PdDaemon {
         self.submit_admin(AdminMutation::Add(node, weight, addrs))
     }
 
+    /// Proposes removing data node `node`. Its replicas move to other nodes
+    /// by anti-entropy and handoff; see `docs/deploy.md` before removing a
+    /// node, especially at replication factor 1.
     pub fn remove_node(&self, node: NodeId) -> Result<(), PartitionError> {
         self.submit_admin(AdminMutation::Remove(node))
     }
 
+    /// Proposes creating a zone with `cfg`.
     pub fn create_zone(&self, cfg: ZoneConfig) -> Result<(), PartitionError> {
         self.submit_admin(AdminMutation::CreateZone(cfg, Vec::new()))
     }
@@ -2483,6 +2493,8 @@ impl PdDaemon {
         self.push_state.lock().unwrap().auto_merge_threshold = threshold;
     }
 
+    /// The committed range map of sorted zone `zone_id` as this PD last saw
+    /// it.
     pub fn range_map(&self, zone_id: ZoneId) -> RangeMap {
         self.mirrors
             .range_maps
@@ -2493,6 +2505,7 @@ impl PdDaemon {
             .unwrap_or_else(RangeMap::single)
     }
 
+    /// The committed data-node membership as this PD last saw it.
     pub fn members(&self) -> Vec<NodeId> {
         self.mirrors
             .members
@@ -2517,6 +2530,7 @@ impl PdDaemon {
         self.mirrors.members.lock().unwrap().clone()
     }
 
+    /// The committed zone catalog as this PD last saw it.
     pub fn catalog(&self) -> Catalog {
         self.mirrors.zones.lock().unwrap().clone()
     }

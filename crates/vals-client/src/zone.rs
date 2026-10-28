@@ -2,16 +2,24 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::ring::NodeId;
 
+/// How a zone orders its keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ordering {
+    /// Keys are kept in order and split into contiguous ranges, so the zone
+    /// supports range scans and range deletes.
     Sorted,
+    /// Keys are placed by hash; point operations only.
     Unsorted,
 }
 
+/// A zone's numeric id. Find it by name with [`Catalog::by_name`].
 pub type ZoneId = u32;
 
+/// Zone 0, named `default`: always present and unsorted, with the cluster's
+/// replication factor.
 pub const DEFAULT_ZONE: ZoneId = 0;
 
+#[doc(hidden)]
 pub fn ordering_to_u8(o: Ordering) -> u8 {
     match o {
         Ordering::Unsorted => 0,
@@ -19,6 +27,7 @@ pub fn ordering_to_u8(o: Ordering) -> u8 {
     }
 }
 
+#[doc(hidden)]
 pub fn ordering_from_u8(b: u8) -> Option<Ordering> {
     match b {
         0 => Some(Ordering::Unsorted),
@@ -27,15 +36,23 @@ pub fn ordering_from_u8(b: u8) -> Option<Ordering> {
     }
 }
 
+/// A zone's settings, as the PD holds them. Zones are created and dropped
+/// through the PD (`valsd admin`), not by the client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ZoneConfig {
+    /// Unique name, without whitespace.
     pub name: String,
+    /// Replication factor.
     pub rf: usize,
+    /// Key ordering.
     pub ordering: Ordering,
+    /// The nodes the zone may be placed on (`None` = every member).
     pub scope: Option<BTreeSet<NodeId>>,
 }
 
 impl ZoneConfig {
+    /// The default zone's settings for a cluster of replication factor
+    /// `global_rf`.
     pub fn default_config(global_rf: usize) -> Self {
         ZoneConfig {
             name: "default".to_string(),
@@ -45,6 +62,7 @@ impl ZoneConfig {
         }
     }
 
+    /// Checks the settings against the cluster's `members`.
     pub fn validate(&self, members: &BTreeSet<NodeId>) -> Result<(), ZoneConfigError> {
         if self.name.is_empty()
             || self.name.trim() != self.name
@@ -88,6 +106,7 @@ impl ZoneConfig {
     }
 }
 
+/// Why [`ZoneConfig::validate`] refused a zone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ZoneConfigError(pub String);
 
@@ -99,6 +118,8 @@ impl std::fmt::Display for ZoneConfigError {
 
 impl std::error::Error for ZoneConfigError {}
 
+/// The cluster's zones by id and name; see
+/// [`Coordinator::catalog`](crate::Coordinator::catalog).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Catalog {
     zones: HashMap<ZoneId, ZoneConfig>,
@@ -116,10 +137,12 @@ impl Catalog {
         c
     }
 
+    /// The zone with this id.
     pub fn get(&self, id: ZoneId) -> Option<&ZoneConfig> {
         self.zones.get(&id)
     }
 
+    /// The id of the zone with this name.
     pub fn by_name(&self, name: &str) -> Option<ZoneId> {
         self.by_name.get(name).copied()
     }

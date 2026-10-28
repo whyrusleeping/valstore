@@ -2,9 +2,12 @@ use std::collections::HashMap;
 
 use crate::ring::NodeId;
 
+/// Settings for [`Coordinator::with_failure_detector`](crate::Coordinator::with_failure_detector).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FdConfig {
+    /// Consecutive failures that mark a node down (default 3, at least 1).
     pub failure_threshold: u32,
+    /// Milliseconds between probes of a down node (default 1000).
     pub open_cooldown_ms: u64,
 }
 

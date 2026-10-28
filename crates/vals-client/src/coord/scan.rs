@@ -93,6 +93,23 @@ pub fn scan_merge_lww(mut responses: Vec<ScanPage>, bound: Option<&[u8]>) -> BTr
 }
 
 impl<T: Transport> Coordinator<T> {
+    /// Returns the live keys of sorted zone `zone_id` in `[lo, hi)`, in
+    /// ascending key order, with their values. `None` bounds mean the start or
+    /// end of the zone; `limit` caps the number of keys returned.
+    ///
+    /// Each range of the zone is read page by page from `r` of its replicas
+    /// (capped at the replica count) and the pages are merged by
+    /// last-writer-wins, dropping deleted keys. With `W + r` above the replica
+    /// count the scan sees every acknowledged write that finished before it
+    /// started. It is not a snapshot: writes that land while the scan runs
+    /// may or may not appear, and different pages can reflect different
+    /// moments. Without a `limit` the whole result is held in memory, so page
+    /// large ranges yourself by passing the last key returned plus a `0x00`
+    /// byte as the next `lo`.
+    ///
+    /// Fails with [`CoordError::NotSorted`] on an unsorted zone and
+    /// [`CoordError::ScanQuorumFailed`] when a range cannot reach `r`
+    /// replicas. Scans do no read repair.
     pub async fn scan_in(
         &self,
         zone_id: ZoneId,
