@@ -126,7 +126,7 @@ NetTransport hooks, and TCP tests for split/shard routing, limits, keys-only mod
 RT quorum pages, small budgets, re-home fences and old-peer rejection. Scalar
 reverse uses a one-query MultiScan; legacy ascending opcode 11 is unchanged.
 The batched transport/serving loops specialize by direction. The
-[0484 aged-graph comparison](../bench/0484-reverse/FINDINGS.md) verifies natural-time
+0484 aged-graph comparison (`bench/0484-reverse/FINDINGS.md`) verifies natural-time
 latest-N with exact values on file and SPDK backends. Versus inverted-time
 ascending scans, reverse latest-N costs 1.89× local / 1.67× SPDK median latency
 on this many-overlapping-run shape. Matched pre-reverse/candidate arms show no

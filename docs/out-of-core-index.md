@@ -638,7 +638,8 @@ exactly the blocks' `(key, version)` sequence a second time (~20 B + the full ke
 v5 runs derive that stream from the data blocks instead: every entry, tombstones included, in
 strictly increasing key order, modulus from the footer's `num_buckets`, block CRC failures
 reported as `Corrupt`. v1–v4 runs keep their sidecar paths; merges converge to v5. Format and
-rollback rules: [deploy.md](deploy.md#run-format-v5-task-0365).
+rollback rules: [deploy.md](deploy.md#on-disk-format-and-compatibility) and
+[format-history.md](format-history.md#run-format-v5-no-per-run-sidecar).
 
 ### Maintenance scheduling — keeping compaction off the hot path
 

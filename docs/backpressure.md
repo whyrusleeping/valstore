@@ -229,7 +229,7 @@ explicitly chosen mode. External Rust consumers must deliberately adopt the
 finite defaults, pass reviewed custom values, or opt out. Independent Go
 clients are unchanged and do not acquire these Rust limits. Task 0279 supplies
 the reviewed benchmark/probe prerequisite. The task 0287 SPDK RF2 hardware gate
-([findings](../bench/0287-hardware-20260909/FINDINGS.md), "Disposition") is an
+(findings in `bench/0287-hardware-20260909/FINDINGS.md`, "Disposition") is an
 executed no-go for performance adoption: it validated finite-client fault
 behavior, but finite defaults cost 4.59%/6.78% median width-32 Digest/Quorum
 read throughput versus explicit-unbounded, and hardware hedge-loser
@@ -499,9 +499,9 @@ SCALE01-Y5). Admitted staged work stays bounded at about 32 sub-batches per shar
 mirror and 5 s client RPC deadlines. Depth 24 still shed against 32 (SCALE01-Y2).
 
 The gate is a startup-only typed node setting (see [configuration.md](configuration.md)).
-bootes's `--vals-server-gate` must match the server's `batch_apply_gate`; raising
-`--vals-depth` requires raising this gate as well, with room for fanout and mirror
-work. A larger limit also increases staged memory and tail latency; it does not
+A client that caps its own in-flight batches to match the server should use the
+same value as `batch_apply_gate`. Raising a client's pipeline depth requires
+raising this gate as well, with room for fanout and mirror work. A larger limit also increases staged memory and tail latency; it does not
 change the one-Flush-per-controller rule.
 
 ## Off-core maintenance I/O pacing

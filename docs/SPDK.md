@@ -1,156 +1,96 @@
-# SPDK backend bring-up
+# The SPDK backend
 
 The production block backend is userspace poll-mode NVMe via SPDK
 (`vals_spdk::spdk::SpdkBlockDevice`, behind the `spdk` cargo feature). SPDK is
-vendored under `third_party/spdk` (gitignored). The mem/file backends cover all
-engine development; SPDK is only needed for real raw-NVMe IOPS.
+built from source under `third_party/spdk`, which is gitignored. The in-memory
+and file backends cover all engine development and testing; SPDK is only needed
+for real raw-NVMe throughput.
 
-## Status
+This guide covers building SPDK, running on a machine with dedicated drives,
+how the backend uses NVMe queue pairs, and what has been measured.
 
-The SPDK backend is **implemented, optimized, and validated on real NVMe**. The
-single-drive and JBOD scaling numbers below were measured on a 256-core EPYC box
-with 8× Samsung PM9A3 (3.84 TB) datacenter NVMe. Through 2026-07 the test box
-was `oldbox` (96 cores, Samsung datacenter NVMe), where the SPDK
-single-node and 3-node-RF=2 cluster paths (incl. the 1B-key stress) were
-re-exercised in 2026-06. *(That box was retired 2026-07-15;
-box validation now runs on the lab-1/2/3 fleet — see
-`plans/box-provisioning-runbook.md`.)*
+## What the backend does
 
-- ✅ **Backend** (`crates/vals-spdk/src/spdk.rs` over `csrc/spdk_shim.c`): attach
-  controller + namespace, one I/O qpair per core, sync `read/write`, batched
-  `read_batch`, async `read_at_async`/`write_at_async` (non-blocking submit +
-  completion→waker bridge), `poll`. `build.rs` compiles the shim and links SPDK
-  when `VALS_SPDK_LINK=1`. Correctness verified (round-trip, crash recovery).
-- ✅ **Single-drive performance (one core), at the device's raw ceilings:**
-  - Reads: random-read scales with queue depth to **~1.0M IOPS / 4 GiB/s** (QD128+).
-    QD1 is ~56 µs (NAND latency). *Note: benchmark reads must hit populated LBAs —
-    reading unmapped/TRIMmed blocks returns zeros without a NAND access and
-    inflates IOPS.*
-  - Writes: **~3.7 GiB/s** (the device write-bandwidth ceiling) for ≥8 KiB values;
-    4 KiB values **858k ops/s / 3.2 GiB/s**; small (100 B) values **>4M ops/s**.
-- ✅ **Write-path optimizations** that took writes from 16.7k → 858k ops/s @4 KiB:
-  present a **4 KiB logical block** over 512 B namespaces (a value was 8 QD1
-  writes); **multi-block coalescing**; **pipelined async writes** (QD>1, drained
-  at `sync`); a **DMA buffer pool**; and **hardware CRC-32C** (SSE4.2, scalar
-  Castagnoli fallback) — the CRC was the final write-path wall.
-- ✅ **Thread-per-core sharding**: `SpdkController::attach` once (vfio attaches a
-  controller once) + `open_shard` hands each core its own qpair over a disjoint
-  LBA region. Engine reads scale 360k(1 core) → **~1.0M IOPS (16 cores) = the
-  device ceiling**. (Must reset thread affinity after `spdk_env_init` — DPDK pins
-  the caller to one lcore, which would confine every shard to one core.)
-- ✅ **Multi-drive JBOD** (`bench mdwrite`/`mdread`): attach K controllers, spread
-  partitions across them. Near-linear: **8 drives → ~8.0M read IOPS, ~29 GiB/s
-  write** (~8× the single-drive ceilings).
-- ✅ **Distributed path on SPDK** validated (`bench distspdk`): 3 nodes × 2 drives
-  (one engine per drive = JBOD shard), RF=3, over loopback TCP. Quorum
-  writes/reads, replication, node-down availability, and hinted handoff all
-  correct on real drives (0 mismatches).
-- ✅ **Clustered throughput scaling** (`bench distmdmc`, 8× PM9A3 as 4 nodes ×
-  2 drives × P partitions, **64 server cores**, RF=3): spreading the drives over
-  many server cores lifts the cluster off the old coordination bottleneck — writes
-  **~4.0M**, strong reads **~2.0M** (**~2.85M** with `ReadFanout::Quorum`), get-any
-  **~3.8M** ops/s, 0-error. Large-value writes hit **~21 GiB/s = 70 %** of the
-  29.9 GiB/s raw JBOD ceiling and get-any reads **~83 %** of the 6.6M-IOPS raw read
-  ceiling — the drives are essentially **saturated**. The staircase that got here
-  (coordinator write pipelining → connection multiplexing → unified server read loop
-  → server-core count → read fan-out) is in [`ARCHITECTURE.md`](../ARCHITECTURE.md)
-  §Status. *(These strong-read figures predate `ReadFanout::Digest`, now the default:
-  one value read + version-only digests (a hedged R-quorum) ≈ 1 device read per strong
-  read, vs R/RF. Hardware re-measured on this box — digest beats All and Quorum at every
-  config, e.g. 64-core RF=3: 100 B reads 1.56M @16 coord / 3.85M @48 coord vs Quorum
-  1.48M / 3.08M, the gap widening as the drives saturate. See ARCHITECTURE.md §Status.)*
-- ✅ **Current real-NIC strong-read path** (2026-08-14, lab-1/2/3, one 9100 PRO
-  and four shards/node, RF=2/R=2, latency profile): batched winner-directory
-  prefetch and token reuse sustain a repeated **4.96M 100-byte strong reads/s** at
-  width 256, versus 4.07M/s matched baseline (**1.22×**), with zero
-  errors/misses/mismatches, one checked value read/key, zero run probes, and improved
-  p50/p99. See
-  [`bench/lab-read-breakthrough-20260814-0204/FINDINGS.md`](../bench/lab-read-breakthrough-20260814-0204/FINDINGS.md).
-  A fresh post-optimization profile reproduced 4.95–5.00M/s and found all twelve
-  single-threaded serving shards saturated; mixed-batch result construction/copying
-  is the first actionable CPU/memory cost. A corrected populated-LBA sweep over the
-  actual four 256 GiB production regions reaches 1.493–1.500M 4 KiB reads/s at
-  QD128–256, establishing the depth knee but not a command-for-command live ceiling;
-  do not name NVMe as the next wall until after the CPU A/B. Client fanout and the
-  10 GbE link were excluded by controls. See
-  [`bench/lab-read-ceiling-20260816-0205/FINDINGS.md`](../bench/lab-read-ceiling-20260816-0205/FINDINGS.md).
-- **Read-path experiment conclusions (2026-08):** per-value allocation/DMA-retention
-  and winner-directory scratch/SIMD spikes were neutral and retired (0206/0210/0211).
-  Batched SPDK value reads (0207) did not clear the measured benefit gate; compact
-  mixed-read encoding (0209) reduced network traffic but regressed throughput and
-  latency. Neither candidate shipped. See the
-  [0207 findings](../bench/lab-read-batch-20260819-0207/FINDINGS.md) and
-  [0209 findings](../bench/lab-compact-wire-20260818-0209/FINDINGS.md).
-  Current work belongs in the [backlog](../backlog.md), not this historical summary.
+`crates/vals-spdk/src/spdk.rs` wraps a small C shim
+(`crates/vals-spdk/csrc/spdk_shim.c`) around the SPDK NVMe driver: attach a
+controller and namespace, one I/O qpair per core, synchronous `read`/`write`,
+batched `read_batch`, asynchronous `read_at_async`/`write_at_async`
+(non-blocking submit plus a completion-to-waker bridge), and `poll`. `build.rs`
+compiles the shim and links SPDK only when `VALS_SPDK_LINK=1`.
 
-## Serving and maintenance qpair ownership
+The things that matter for performance:
 
-A node has one maintenance pool for all of its serving shards. The pool has exactly
-one flush worker and `N = VALS_MAINT_COMPACT_LANES` compaction workers (default 2,
-capped at 4). Jobs carry a stable shard-owner number; the flush worker and the
-compaction workers each take jobs from one queue that schedules queued owners
-round-robin, and every completion plus wakeup goes only to that owner's shard. An
-engine never has more than one merge in flight, so compaction lanes run merges of
-different engines in parallel. A failed or stopped owner drops only its own
-completion. Node shutdown first stops and joins all serving shards, which closes every
+- The backend presents a **4 KiB logical block** over 512-byte namespaces,
+  coalesces multi-block writes, pipelines asynchronous writes (drained at
+  `sync`), uses a DMA buffer pool, and computes CRC-32C in hardware (SSE4.2,
+  with a scalar fallback).
+- **One controller attach, one qpair per shard.** `SpdkController::attach`
+  runs once per process (vfio attaches a controller once) and `open_shard`
+  gives each serving core its own qpair over a disjoint LBA region. Thread
+  affinity is reset after `spdk_env_init`, because DPDK pins the calling
+  thread to one core, which would otherwise confine every shard to it.
+- **Several drives per node (JBOD):** attach K controllers and spread
+  partitions across them; one engine per drive.
+
+## Serving and maintenance qpairs
+
+A node has one maintenance pool shared by all of its serving shards. The pool
+has exactly one flush worker and `N = maint_compact_lanes` compaction workers
+(default 2, at most 4; see [`configuration.md`](configuration.md)). Jobs carry
+a stable shard-owner number. The flush worker and the compaction workers each
+take jobs from one queue that schedules queued owners round-robin, and every
+completion and wakeup goes only to that owner's shard. An engine never has more
+than one merge in flight, so the compaction lanes run merges of different
+engines in parallel. A failed or stopped owner drops only its own completion.
+Node shutdown first stops and joins all serving shards, which closes every
 submission route, and then drains and joins every maintenance worker.
 
-Serving qpairs remain dedicated to one shard/core. On each maintenance worker,
+Serving qpairs are dedicated to one shard and core. On each maintenance worker,
 `BlockDevice::maintenance_sibling` caches one SPDK qpair per controller in
-thread-local state. Zone and shard handles are range-restricted views over that qpair,
-and the cluster worker cache is keyed by `(owner, zone)`, so sharing the controller
-qpair does not merge zone bounds or engine state. The qpair's `Arc` controls lifetime;
-it does not grant concurrent access. The SPDK wrapper records the creating worker
-thread and aborts any I/O attempted from a different thread. There is no cross-thread
-qpair handoff.
+thread-local state. Zone and shard handles are range-restricted views over that
+qpair, and the worker cache is keyed by `(owner, zone)`, so sharing the
+controller qpair does not merge zone bounds or engine state. The qpair's `Arc`
+controls lifetime; it does not grant concurrent access. The wrapper records the
+creating thread and aborts any I/O attempted from a different thread. There is
+no cross-thread qpair handoff.
 
-The steady one-controller budget is therefore `S + 1 + N`: `S` dedicated serving
-qpairs plus one flush qpair and one qpair per compaction lane. Eight serving shards
-with the default two compaction lanes use 11 live qpairs on the Samsung 9100 PRO,
-below its observed limit of 15 (the lane cap of 4 keeps eight shards at 13). Sibling allocation failure is
-returned only to the affected job and is retried by a later plan; it does not poison
-another owner's completion route. Zone range checks, normal engine recovery, RAM
-admission, and serving-device error handling are unchanged.
+The steady per-controller budget is therefore `S + 1 + N`: `S` serving qpairs
+plus one flush qpair and one per compaction lane. Eight serving shards with the
+default two compaction lanes use 11 qpairs on a Samsung 9100 PRO, below its
+observed limit of 15 (with the maximum four lanes, eight shards use 13). A
+sibling allocation failure is returned only to the affected job and retried by
+a later plan; it does not poison another owner's completion route.
 
-Allocation and release logs include `role=serving|maintenance`, controller id, live
-count, and (for maintenance) owner thread. Successful off-core flush and run-merge
-commit events include the stable maintenance owner and zone id. `SpdkController::qpair_counts()` exposes
-live/serving/maintenance counts to in-process gates. For an eight-shard gate require
-8 serving, no more than `1 + N` maintenance, no qpair-allocation errors, and observed flush
-and merge/compaction progress on every shard.
+Allocation and release logs include `role=serving|maintenance`, the controller
+id, the live count and, for maintenance, the owner thread. Off-core flush and
+run-merge commit events name the maintenance owner and zone id.
 
-The 2026-08-17 mature RF=2 Samsung 9100 PRO gate met those requirements on every
-node: exactly 8 serving + 2 maintenance qpairs, every owner flushed and merged, clean
-device/maintenance/client correctness, and a 17.6% median read-throughput gain over
-four shards. The companion run-free gate also made every owner incrementally compact
-at 20.0–20.4% reclaimable space under continuous reads, freeing
-14,848–15,872 segments/node with zero flushes, merges, runs, or gated errors; because
-that legacy path is serving-thread-owned it used 8+0 qpairs. Eight shards/node is
-therefore the maximum-read-throughput guidance for
-that controller with `profile=latency`; use four when CPU/RAM efficiency matters
-more (eight used about twice both). Treat `S + 1 + N <= controller limit` as a deployment
-precondition on other controllers rather than assuming the Samsung limit. Re-run the
-destructive gate after controller, firmware, SPDK, profile, or maintenance-lane
-changes, and monitor qpair allocations, every-owner progress, RAM headroom, and error
-counters. Evidence and accounting limitations:
-[`bench/lab-maint-qpair-gate-20260817-0208/FINDINGS.md`](../bench/lab-maint-qpair-gate-20260817-0208/FINDINGS.md).
+Guidance from the eight-shard runs on that controller: eight shards per node
+gives the highest read throughput with `profile = latency` (about 18% more
+than four shards at the median), and uses about twice the CPU and RAM of four;
+use four when efficiency matters more. On any other controller, treat
+`S + 1 + N <= controller qpair limit` as a deployment precondition rather than
+assuming the Samsung limit, and re-check after controller, firmware, SPDK,
+profile or lane changes while watching qpair allocations, per-owner flush and
+merge progress, RAM headroom and error counters.
 
 ## Building SPDK (no NVMe required to build)
 
-**Pinned known-good tag: `v24.09`.** The shim + engine are validated against SPDK
-**v24.09** (verified on the `oldbox` box, 2026-06-18). Newer SPDK may work but
-is unpinned; v24.09 is what the shim's ABI assumptions are tested against — in
-particular the `opts.opts_size` fix in `csrc/spdk_shim.c` (harmless on older SPDK)
-that v24.09's ABI-versioned `spdk_env_opts` requires. Prefer this tag until a newer
-one is re-validated on hardware.
+**Pinned known-good tag: `v24.09`.** The shim and engine are validated against
+SPDK v24.09. Newer SPDK may work but is unpinned; v24.09 is what the shim's ABI
+assumptions are tested against, in particular the `opts.opts_size` field in
+`csrc/spdk_shim.c` (harmless on older SPDK) that v24.09's ABI-versioned
+`spdk_env_opts` requires. Prefer this tag until a newer one is validated on
+hardware.
 
-**Build prerequisites `scripts/pkgdep.sh` does NOT install** (install these first):
+Build prerequisites that SPDK's `scripts/pkgdep.sh` does **not** install
+(install these first):
 
-- **meson** and **ninja** — the vendored DPDK (`third_party/spdk/dpdk`) builds with
-  Meson/Ninja; `pkgdep.sh` does not pull them on all distros.
-- **python3 pyelftools** — required by the DPDK build.
-- **python3 jinja2** and **tabulate** — SPDK's `genrpc.py` codegen.
-- **nasm** (2.14+) is *optional*: without it, `configure` auto-disables ISA-L/crypto.
+- **meson** and **ninja**: the vendored DPDK (`third_party/spdk/dpdk`) builds
+  with Meson/Ninja, and `pkgdep.sh` does not pull them on all distros.
+- **python3 pyelftools**: required by the DPDK build.
+- **python3 jinja2** and **tabulate**: SPDK's `genrpc.py` code generation.
+- **nasm** (2.14+) is optional: without it, `configure` disables ISA-L/crypto.
 
 ```sh
 # Distro packages (Debian/Ubuntu example) — plus SPDK's own scripts/pkgdep.sh:
@@ -169,68 +109,145 @@ git submodule update --init          # dpdk (+ others) — required to build
 make -j"$(nproc)"
 ```
 
-(If you already have a clone, `git -C third_party/spdk fetch --tags && git -C
+If you already have a clone, `git -C third_party/spdk fetch --tags && git -C
 third_party/spdk checkout v24.09 && git -C third_party/spdk submodule update --init`
-gets you to the pinned tag.)
+gets you to the pinned tag. `scripts/build-spdk.sh` automates these steps and
+the vals build.
 
-## Running on a box with a dedicated scratch NVMe
+## Running on a machine with a dedicated scratch NVMe
 
 > ⚠️ Never bind the boot disk. Use a spare NVMe with no mounted partitions.
 
-The NVMe path is implemented in `crates/vals-spdk/src/spdk.rs` over a hand-written
-C shim (`crates/vals-spdk/csrc/spdk_shim.c`) that wraps the SPDK NVMe driver
-(probe → namespace → per-core qpair → `spdk_nvme_ns_cmd_read/write` + poll, plus
-the async `vals_spdk_aio_read` / `vals_spdk_poll`). `build.rs` compiles the shim
-and links SPDK when `VALS_SPDK_LINK=1`. To run on a fresh box:
-
-1. **TRIM the scratch device first.** A wiped-but-untrimmed SSD GC-thrashes (QD1
-   randread can drop to ~480 IOPS). Always `blkdiscard /dev/nvmeXn1` before
-   benchmarking.
-2. Reserve hugepages and bind the scratch device to the userspace driver (per
-   boot):
+1. **TRIM the scratch device first.** A wiped but untrimmed SSD thrashes its
+   garbage collector (QD1 random reads can drop to ~480 IOPS). Run
+   `blkdiscard /dev/nvmeXn1` before measuring anything.
+2. Reserve hugepages and bind the scratch device to the userspace driver (once
+   per boot):
    ```sh
    sudo PCI_ALLOWED=<pci-addr> HUGEMEM=4096 third_party/spdk/scripts/setup.sh
    # lists NVMe devices + PCIe addresses; note the scratch one
    ```
-   On an IOMMU box, **run the SPDK process as root** — the simplest path (non-root
-   vfio fails "Cannot use IOVA as PA"). If you do want non-root: a one-time
-   `/etc/security/limits.d/spdk.conf` (memlock unlimited for the user) and
-   `chown <user> /dev/vfio/<iommu-group>`.
-3. Build/run with linking enabled, pointing at the DPDK libs:
+   On a machine with an IOMMU, **run the SPDK process as root**; that is the
+   simplest path (non-root vfio fails with "Cannot use IOVA as PA"). For
+   non-root, add a one-time `/etc/security/limits.d/spdk.conf` (memlock
+   unlimited for the user) and `chown <user> /dev/vfio/<iommu-group>`.
+3. Build and run with linking enabled, pointing at the DPDK libraries:
    ```sh
    VALS_SPDK_LINK=1 cargo build --features spdk --release
    LD_LIBRARY_PATH=third_party/spdk/dpdk/build/lib cargo run --features spdk ...
    ```
-4. Validate: correctness (round-trip, crash recovery) and IOPS/latency vs an
-   `fio` raw-device baseline on the same NVMe.
+4. Validate: correctness (round-trip, crash recovery) and IOPS/latency against
+   an `fio` raw-device baseline on the same NVMe. Benchmark reads must hit
+   populated LBAs: reading unmapped or TRIMmed blocks returns zeros without a
+   NAND access and inflates IOPS.
 
-For **multi-drive** (JBOD) or a **multi-node cluster on one box**, bind several
-drives at once and reserve more hugepages, e.g.
-`PCI_ALLOWED="<a> <b> ...> HUGEMEM=32768 third_party/spdk/scripts/setup.sh`. Run
-`bench mdwrite`/`mdread` (comma-separated PCIe list) for JBOD, or `bench distspdk`
-/`distspdkmc` for the distributed path (≥6 PCIe addrs = 3 nodes × 2 drives).
+For **several drives** (JBOD) or a **multi-node cluster on one machine**, bind
+several drives at once and reserve more hugepages, for example
+`PCI_ALLOWED="<a> <b> ..." HUGEMEM=32768 third_party/spdk/scripts/setup.sh`.
+`vals-bench mdwrite`/`mdread` (comma-separated PCIe list) drive a JBOD, and
+`vals-bench distspdk`/`distspdkmc` drive the distributed path (at least six
+PCIe addresses: 3 nodes × 2 drives).
+
+Provisioning a node's drives for `valsd` (`valsd provision`) and the SPDK keys
+of the node config are in [`deploy.md`](deploy.md#offline-spdk-provisioning).
+
+## Measured throughput
+
+These are results from specific benchmark runs, not guarantees. This section
+gives the setup behind each headline number in the [README](../README.md#performance);
+the history of how they were reached is in the Status section of
+[`ARCHITECTURE.md`](../ARCHITECTURE.md#status). For the default file backend
+on ordinary machines, see [`benchmarks.md`](benchmarks.md). Unless stated
+otherwise, the machine is one 256-core EPYC server with 8× Samsung PM9A3
+(3.84 TB) datacenter NVMe, and the driver is `vals-bench` with its default
+100-byte values.
+
+**Single-node engine on the drives directly** (no network, no replication):
+
+- **One drive, one core, at the device's raw ceilings.** Random reads scale
+  with queue depth to about **1.0M IOPS / 4 GiB/s** (QD128 and above); QD1 is
+  about 56 µs, which is NAND latency. Writes reach about **3.7 GiB/s** (the
+  device's write-bandwidth ceiling) for values of 8 KiB and larger; 4 KiB
+  values reach **858k ops/s / 3.2 GiB/s**, and 100-byte values **over 4M
+  ops/s**. (Before the 4 KiB logical block, write coalescing, pipelined
+  asynchronous writes and hardware CRC described above, 4 KiB writes ran at
+  16.7k ops/s.)
+- **One drive, many cores.** Engine reads scale from 360k IOPS on one core to
+  about 1.0M IOPS on 16 cores, the device ceiling.
+- **Eight drives as a JBOD** (`vals-bench mdwrite`/`mdread`, one engine per
+  drive): near-linear, about **8.0M read IOPS and 29 GiB/s of writes**, roughly
+  8× the single-drive ceilings. These are the README's "~8M read IOPS,
+  ~29 GiB/s" figures.
+
+**Replicated cluster on one machine** (`vals-bench distmdmc`): the 8 drives as
+**4 node processes × 2 drives × 16 partitions = 64 serving cores**, one engine
+per partition, **RF 3**, writes with `W = 2` (quorum), strong reads with
+`R = 2` (digest fan-out, the default), get-any reads with `R = 1`, over
+**loopback TCP** with the coordinators in the same process. The servers are the
+passive in-process cluster, so the **anti-entropy sweep is off** and no
+deployment profile applies. Every run is zero-error and every read value is
+verified.
+
+- Latest run (**n = 30M** keys per phase, 100-byte values): **3.51M replicated
+  writes/s**, **4.45M strong reads/s**, **6.46M get-any reads/s**; a shorter
+  get-any run peaked at 6.58M/s, which is the raw 8-drive read-IOPS ceiling.
+  These are the README's "~3.5–4M writes, ~4.4M strong reads, ~6.5M `R = 1`
+  reads" figures.
+- Earlier runs of the same setup, before the last transport and read-path
+  changes: about 4.0M writes/s (large-value writes at ~21 GiB/s, 70% of the
+  29.9 GiB/s raw JBOD ceiling), strong 100-byte reads of 3.85M/s with 48
+  coordinator cores (1.56M with 16) under digest fan-out against 3.08M / 1.48M
+  under the older quorum fan-out, and get-any reads of about 3.8M/s.
+- `vals-bench distspdk` (3 nodes × 2 drives, RF 3, loopback) is the
+  correctness run on real drives: quorum writes and reads, replication,
+  availability with a node down and hinted handoff, zero mismatches.
+
+**Three machines on a real network** (`valsd` nodes driven by `vals-bench
+netread` from external client hosts): three 24-core servers, **one Samsung
+9100 PRO per node** split into **four shards per node** (12 serving shards in
+all), all links **10 GbE**, **RF 2, R 2**, and the node config set to
+**`profile = latency`** (not the default `capacity`). Repeated strong reads of
+100-byte values over a mature, previously written data set at batch width 256
+with 12 coordinators × 2 batches in flight sustained **4.96M strong reads/s**
+(median; 4.07M/s before batched winner probing), with zero errors, misses or
+mismatches, one checked value read per key and no run probes. This is the
+README's "~5M strong 100-byte reads/s". A profile of that run found all twelve
+serving shards CPU-saturated, with mixed-batch result construction the largest
+remaining cost; the client fan-out and the network link were ruled out as the
+limit. Several read-path variants (per-value allocation changes, batched SPDK
+value reads, a more compact mixed-read encoding) were measured against this
+baseline and did not help, so they were not kept.
 
 ## Notes
 
 - `build.rs` emits SPDK link flags only when `VALS_SPDK_LINK` is set. Without
-  SPDK libraries, use `cargo check --workspace --features spdk` to type-check
-  every feature path or `cargo build -p vals-spdk --features spdk` to build the
-  Rust library; binaries containing live NVMe calls require `VALS_SPDK_LINK=1`.
-- The synchronous `BlockDevice` trait is QD1 per call; the `read_batch` /
-  `read_at_async` / `write_at_async` paths and the value log's pipelined writes
-  saturate the device at high queue depth (see Status).
-- A SIGKILL'd SPDK process can leave a controller claimed and stale
-  `/var/run/dpdk/*` runtime dirs, so the next run fails to attach. Let processes
-  exit cleanly; if attach fails, `pkill` any stragglers and `rm -rf
-  /var/run/dpdk/*`.
-- Hugepage files: the shim always sets `unlink_hugepage` (DPDK
-  `--huge-unlink`), so each `/dev/hugepages/spdk<shm_id>map_*` file is unlinked
-  right after creation and the kernel frees the pages when the process exits on
-  any path (clean exit, SIGTERM, `_exit`, kill -9). Before 0424 a nonnegative
-  `spdk_shm_id` (valsd's default is the node id) kept every map file after exit,
-  even a clean one; `rte_eal_cleanup` does not unlink them. Binaries built before
-  0424 still need the guarded `rm -f /dev/hugepages/spdk*map_*` after the process
-  is gone. Secondary DPDK processes cannot attach to valsd's memory; none do.
-- Crash/teardown caveat: the distributed bench's detached server threads can
-  segfault during process exit (busy-poll threads racing SPDK teardown) — benign
-  (results print first), tracked in the ycc backlog (`../backlog.md`).
+  SPDK libraries, `cargo check --workspace --features spdk` type-checks every
+  feature path and `cargo build -p vals-spdk --features spdk` builds the Rust
+  library; binaries that make live NVMe calls need `VALS_SPDK_LINK=1`.
+- The synchronous `BlockDevice` calls are QD1 per call; the `read_batch`,
+  `read_at_async` and `write_at_async` paths and the value log's pipelined
+  writes are what saturate the device at high queue depth.
+- **After a crash, OOM kill or `kill -9`, a restart needs no cleanup step.**
+  Everything that ties a drive to a process is released by the kernel when the
+  process dies, however it dies: the vfio device file descriptors (SPDK resets
+  the controller on the next attach), `valsd`'s own per-drive
+  `flock` on `/run/lock/valsd-spdk-<hex pci>.lock`, SPDK's `fcntl` lock on
+  `/var/tmp/spdk_pci_lock_<pci>`, and DPDK's lock on
+  `/var/run/dpdk/spdk<shm_id>/config`. The shim also sets `unlink_hugepage`
+  (DPDK `--huge-unlink`), so each `/dev/hugepages/spdk<shm_id>map_*` file is
+  unlinked as soon as it is created and the kernel frees the pages on any exit
+  path (clean exit, SIGTERM, `_exit`, `kill -9`); this means no secondary DPDK
+  process can attach to valsd's memory, and none needs to. The files left
+  under `/var/run/dpdk/spdk<shm_id>/` and `/var/tmp/spdk_pci_lock_*` are
+  inert; the next process re-locks and rewrites them. Hardware checks: eight
+  systemd restarts of `valsd` after SIGSEGV, SIGABRT and exit 75 attached
+  without cleanup and left every hugepage free, and `kill -9` of the shim with
+  the SPDK environment initialised left no map files; a `kill -9` of `valsd`
+  with an attached controller has not been run as a separate test. If an
+  attach does fail with "exclusive ownership of SPDK device ... is
+  unavailable" or SPDK's "Cannot create lock on device", the previous process
+  is still alive: find it with `pgrep -x valsd` (or `vals-bench`) and stop it.
+  Deleting `/var/run/dpdk/*` is never required.
+- Known issue: the distributed benchmark's detached server threads can
+  segfault during process exit (busy-poll threads racing SPDK teardown). The
+  results are printed before that happens. It is not fixed yet.

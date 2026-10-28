@@ -1,7 +1,7 @@
 # Validation tiers (local-first)
 
 Hardware time on the lab fleet is the scarcest resource in the project. A full
-5B-event replay takes 5–10 h of ingest plus 1–4 h of checks, and lab's non-ECC
+5B-event replay takes 5–10 h of ingest plus 1–4 h of checks, and the lab machines' non-ECC
 RAM aborts many attempts for reasons unrelated to the change under test. This
 document sets the default: **establish each acceptance criterion at the cheapest
 tier that can really establish it, and use hardware to confirm, in the smallest

@@ -1,270 +1,130 @@
 # Getting started
 
-`vals` is consumed two ways: as a deployable daemon — **`valsd`**, configured
-with a file and administered over a socket (see [`deploy.md`](deploy.md)) —
-or as a Rust library, where your application embeds `vals-cluster` on the
-server side (a `Node` serving a storage engine). The client side is the same
-either way: a `Coordinator` over a TCP transport. A **client-only application**
-depends on the slim **`vals-client`** crate — the coordinator, the transport,
-and the wire types, with none of the server/PD/storage-engine code — rather than
-`vals-cluster` (which re-exports it, so `vals_cluster::…` paths also work). This
-guide walks the library path from an in-process toy cluster to a real multi-node
-deployment; if you just want to run servers, start with `deploy.md` and skip to
-[Clients](#clients).
+Start by running **`valsd`** as a database service, then connect your
+application. This guide covers that path and the distributed data model used
+by both daemon deployments and embedded nodes.
 
-For the design behind everything here, see [`../ARCHITECTURE.md`](../ARCHITECTURE.md);
-for byte-level formats and agreement algorithms, see [`formats.md`](formats.md)
-and [`algorithms.md`](algorithms.md).
+| What you want | Start here |
+|---|---|
+| Run a database service | [Local daemon deployment](#run-the-daemon), then [`deploy.md`](deploy.md) |
+| Connect an application to that service | [`vals-client` over TCP](#clients), or the [Tokio bridge](#tokio-applications) |
+| Store data inside your own Rust process | [Embedding guide](embedding.md): local engine or distributed node |
 
-## The model in one minute
+Using a Rust client library is **not** embedding the database: `valsd` owns
+the storage and server lifecycle, and your application only sends requests.
+The separate [embedding guide](embedding.md) covers `vals-store` and hosting
+`vals-cluster` in your own service. You do not need their constructors to run
+or use the daemon.
 
-- **Placement.** Keys are placed on a consistent-hash **ring**: the replicas of
-  a key are the next `RF` distinct nodes clockwise from its hash. There is no
-  leader — any coordinator can write any key.
-- **Writes.** Each write is stamped with one **version** (hybrid logical clock +
-  writer id) and fanned out to all `RF` replicas; it succeeds when `W` of them
-  ack, where `W` is the **write concern** you chose (`Unacknowledged`=0, `One`=1,
-  `Majority`, `All`=RF). An acknowledgement means the replica installed the write
-  in memory unless you ask for device durability (see
-  [Write options](#reading-and-writing)). Replicas apply store-if-newer
-  (last-writer-wins), so replicas converge in any delivery order.
-- **Reads.** A read asks `R` replicas and returns the newest version. Pick
-  `R` so that `W + R > RF` and a read always overlaps the latest committed
-  write ("strong" read); `R = 1` (`read_any`) is fastest and eventually
-  consistent.
-- **Healing.** Read-repair, hinted handoff, and a periodic Merkle anti-entropy
-  sweep converge replicas in the background; you don't manage any of it.
-- **Zones.** Namespaces with their own replication factor, placement scope,
-  and key ordering. Zone 0 (`default`) always exists, is unordered (hash
-  index), and is what the un-suffixed API methods use. **Sorted** zones
-  support globally-ordered range scans.
-- **Control plane.** A raft-replicated **PD** (placement driver) owns
-  membership, the zone catalog, and sorted-zone range maps, and pushes them to
-  every data node (retried until confirmed, re-pushed after node restarts).
-  Nothing on the data path waits for consensus.
+## Run the daemon
 
-## Ten minutes, in-process
+Use the [README quick start](../README.md#run-it-a-local-three-node-cluster)
+to build `valsd` and the `kv` example, start three local file-backed data nodes
+and one PD, and send traffic. No SPDK or dedicated drives are needed. The
+PD (placement driver) manages membership and namespaces; the data nodes hold
+your records. File-backed records can survive restarts, but write
+acknowledgements are buffered unless the client requests
+[device durability](#reading-and-writing).
 
-The fastest way to touch the API is `LocalCluster` — the in-process `Transport`
-implementation backed by in-memory block devices. No threads, no sockets. This
-exact example is the crate-level doctest of `vals-cluster` (it runs under
-`cargo test --doc`):
+This one-host setup is for evaluation, not high availability. A production
+HA layout uses three voting PDs on independent hosts or failure domains, usually
+alongside the data nodes. Growing the demo's single PD into a three-voter
+group in place is unsupported. To run a small deployment and grow it later,
+follow [growing a small deployment](growing.md): a minimal one-node setup,
+zone sizing, adding data nodes, and the backup/restore migration to three PDs.
 
-```rust
-use vals_cluster::{Coordinator, LocalCluster, Ring, VersionedStore, WriteConcern};
-use vals_spdk::MemBlockDevice;
-use vals_store::{Config, Engine};
+For configuration, persistence and sizing, profiles, systemd, monitoring,
+backups and failure recovery, use the [operator guide](deploy.md). Keep data
+ports inside an enforced trusted network boundary: the cluster secret does
+not authenticate data reads or writes ([security model](../SECURITY.md)).
 
-// Three replica stores, as a real cluster would hold — one per node.
-let mut cluster = LocalCluster::new();
-for node in 1..=3u32 {
-    let engine = Engine::create(MemBlockDevice::new(4096, 4096), Config::default()).unwrap();
-    cluster.insert(node, VersionedStore::new(engine, node).unwrap());
-}
+## Clients
 
-// The placement ring: RF = 3, all three nodes, equal weight.
-let mut ring = Ring::new(3);
-ring.set_members_weighted([(1, 1), (2, 1), (3, 1)]);
+A remote client uses `vals-client` for quorum coordination, transport and wire
+types, plus `vals-rt` to drive it. It needs no storage-engine or server crate.
+Clients of an embedded networked node use this same API. The crates are not
+on crates.io; use git dependencies:
 
-// A coordinator using routing/client label 100, strong reads at R = 2.
-// Its LWW writer-incarnation identity is generated independently.
-let coord = Coordinator::new(100, ring, 2, cluster);
-
-// The coordinator API is async; drive it with the bundled executor.
-vals_rt::block_on(
-    async {
-        // Write acknowledged by a majority (W = 2), read it strongly back (R = 2):
-        // W + R = 4 > RF = 3, so the read must see the write.
-        let v = coord
-            .write_with(b"hello", b"world", WriteConcern::Majority)
-            .await
-            .unwrap();
-        let got = coord.read(b"hello").await.unwrap().expect("present");
-        assert_eq!(got.value.as_deref(), Some(&b"world"[..]));
-        assert_eq!(got.version, v);
-
-        // Deletes are versioned tombstones — an older write can't resurrect.
-        coord.delete(b"hello", WriteConcern::Majority).await.unwrap();
-        assert_eq!(coord.read(b"hello").await.unwrap(), None);
-    },
-    || {}, // poll_io hook: nothing to poll in-process
-);
+```toml
+[dependencies]
+vals-client = { git = "https://github.com/whyrusleeping/valstore" }
+vals-rt     = { git = "https://github.com/whyrusleeping/valstore" }
 ```
 
-Notes on what you just used:
+For storage in the application process instead, see the [embedding guide](embedding.md).
 
-- `Engine` is the node-local log-structured store; `MemBlockDevice` is the
-  RAM-backed `BlockDevice`. Swap in `FileBlockDevice` for a file, or
-  `SpdkBlockDevice` (the `spdk` feature) for raw NVMe — every layer above is
-  identical.
-- `VersionedStore::new(engine, node_id)` wraps the engine with versioned
-  last-writer-wins semantics. It does not build a resident key→version map:
-  `VersionIndex` caches logical Merkle leaf groups plus dirty-bucket metadata and
-  a journal, and seeds run-backed leaves cooperatively when anti-entropy needs
-  them. Current versions resolve through the engine (`profile = capacity`) or the
-  winner directory (`profile = latency`), always by argmax(`Version`).
-- `vals_rt::block_on(future, poll_io)` is the executor entry point. The second
-  argument is the I/O poll hook; for real networking pass
-  `vals_cluster::reactor::poll_io` (below).
+**Try it from the command line.** `vals-client` ships a small runnable
+client, the `kv` example. With the local cluster from the
+[README quick start](../README.md#run-it-a-local-three-node-cluster) (or
+[`deploy.md`](deploy.md#a-three-node-cluster-in-five-minutes)) listening on
+127.0.0.1:7001-7003, run it from the repository root:
 
-## A real cluster over TCP
-
-A deployment has three roles, usually three groups of processes: **data
-nodes**, the **PD**, and **clients**. One process can host several roles
-(the PD and a data node co-locate fine).
-
-A `valsd` data node also selects `profile = capacity|latency`. `capacity` is the
-default: resolving unconditional writes and the lower-RAM out-of-core point
-index. `latency` couples blind unconditional writes with the compact winner
-directory: accepted candidates optimistically reply `Won`, and startup performs
-an O(dataset) synchronous directory rebuild before serving. The retained mature
-corpus measured **62.9 additional RSS bytes per physical key**, so budget RAM and
-restart time explicitly. Formats are compatible and profiles may be mixed for a
-rolling rollout, but replica-level clients must count both `Won` and `Lost` as
-unconditional-write acknowledgements. See [the deployment profile
-reference](deploy.md#data-node-deployment-profiles) before selecting latency or
-rolling back.
-
-### Data nodes
-
-Each node serves a `VersionedStore` over TCP and runs its own healing loops:
-
-```rust
-use std::time::Duration;
-use vals_cluster::{Node, Ring, VersionedStore};
-
-vals_cluster::observe::init_stderr_logger();          // logs, level via VALS_LOG
-vals_cluster::init_cluster_secret(b"...shared...");   // gate control ops (see Operating)
-
-// The boot ring only needs to be roughly right — the PD pushes the
-// authoritative (epoch'd) ring config to every node shortly after start.
-let mut ring = Ring::new(3);
-ring.set_members_weighted([(1, 1), (2, 1), (3, 1)]);
-
-let (listener, addr) = Node::bind()?; // or bind a specific SocketAddr yourself
-let handle = Node::serve(
-    1,                         // this node's id
-    listener,
-    store,                     // VersionedStore over your BlockDevice
-    ring,
-    vec![(2, addr2), (3, addr3)], // boot peers (the PD grows this set later)
-    Duration::from_secs(5),    // anti-entropy sweep cadence
-);
-
-// ... on SIGTERM:
-handle.shutdown(); // drain reads, flush conns, sync engines, persist watermark
+```sh
+cargo run -p vals-client --example kv -- put hello world
+cargo run -p vals-client --example kv -- get hello
+cargo run -p vals-client --example kv -- delete hello
+cargo run -p vals-client --example kv -- --zone events put 2026-06-11/42 click
+cargo run -p vals-client --example kv -- --zone events scan 2026-06-01/ 2026-07-01/
 ```
 
-`Node::serve` is the single-zone baseline. The variants compose the same way
-and all return a `NodeHandle`:
-
-- `Node::serve_zoned(...)` — multi-zone node: takes a `ZoneStore` provider
-  (`MemZoneStore` / `FileZoneStore` / `SpdkZoneStore`) + a boot `Catalog`;
-  zone engines materialize lazily when the PD creates zones.
-- `Node::serve_sharded(...)` — thread-per-core: N independent shards
-  (listener + store each); the client transport routes keys to shards.
-- `Node::serve_multidrive(...)` — JBOD: spreads P partitions across the
-  node's drives, weights the ring by capacity (see
-  [`multi-drive.md`](multi-drive.md)).
-- `Node::serve_with_liveness(...)` — adds the wipe-before-rejoin lease so a
-  node that was down longer than the tombstone-GC grace re-syncs instead of
-  resurrecting deletes. Use this whenever you enable tombstone GC
-  (`with_gc_grace_ms` on the store).
-
-### The PD (control plane)
-
-One PD daemon — or three for fault tolerance — owns membership and the
-catalog. Production PDs should use the **durable** constructors (raft state
-survives restarts):
-
-```rust
-use std::time::Duration;
-use vals_cluster::pd::{PdDaemon, RingConfig};
-
-// Single-PD (durable): fine to start with; raft-replicate later.
-let pd = PdDaemon::spawn_single_durable(
-    1,
-    pd_engine,                          // its own small Engine (any backend)
-    RingConfig { vnodes: 128, rf: 3 },  // the authoritative ring shape
-    vec![(1, vec![addr1]), (2, vec![addr2]), (3, vec![addr3])],
-    "/var/lib/vals/pd",                 // raft state directory
-)?;
-
-// Bootstrap an empty RF=3 deployment atomically; adding the first member alone
-// would violate RF. This boot intent is retried through leader election.
-pd.bootstrap_members(vec![
-    (1, 1, vec![addr1]),
-    (2, 1, vec![addr2]),
-    (3, 1, vec![addr3]),
-]);
-while pd.members() != [1, 2, 3] {
-    std::thread::sleep(Duration::from_millis(10));
-}
-
-// Administrative mutations are leader-only and return validation/proposal errors.
-// Success means proposed, not committed; poll the committed view when ordering
-// subsequent external actions depends on the change.
-pd.add_node_addressed(4, 1, vec![addr4])?;
-while !pd.members().contains(&4) {
-    std::thread::sleep(Duration::from_millis(10));
-}
-pd.remove_node(2)?;
-while pd.members().contains(&2) {
-    std::thread::sleep(Duration::from_millis(10));
-}
-let zone_name = zone_config.name.clone();
-pd.create_zone(zone_config)?;
-while pd.catalog().by_name(&zone_name).is_none() {
-    std::thread::sleep(Duration::from_millis(10));
-}
-pd.shutdown(); // on exit
+```text
+$ cargo run -q -p vals-client --example kv -- put hello world
+ok, version 1793141744239.0 writer 50e809714d38d9a1
+$ cargo run -q -p vals-client --example kv -- get hello
+world
+version 1793141744239.0 writer 50e809714d38d9a1
 ```
 
-A 3-replica PD group uses `PdDaemon::spawn_durable(id, listener, pd_peers,
-data_nodes, engine, ring, campaign, dir)` — same API, raft over TCP between
-the PD replicas. Send administrative mutations to the leader; a follower returns
-`PartitionError::NotLeader`, and a newly elected leader may briefly return
-`PartitionError::NotReady` while it catches up. A successful administrative call
-means Raft accepted the proposal, not that it is committed or pushed, so observe
-`members()`, `catalog()`, or `range_map()` when the distinction matters. The
-startup-only `bootstrap_members` call is different: it queues one atomic initial
-membership intent and retries it until the PD can propose it.
+The `kv` example writes and deletes with **buffered majority** acknowledgements,
+not device syncs, and reads and scans from a majority. A quorum read sees an
+acknowledged candidate's version or a greater LWW version, not necessarily the
+last request to finish. See [the shared contract](#the-model-in-one-minute).
+For another cluster, pass `--nodes ID@HOST:PORT,...`; one live seed node is
+enough to discover the membership and zone catalog, but operations still need
+their replica quorums. The client needs no secret: the cluster secret gates
+only control operations (see [Operating it](#operating-it)). `--help` lists
+the options, and [`kv.rs`](../crates/vals-client/examples/kv.rs) is a complete
+client program to copy from.
 
-Membership changes carry each node's shard addresses, so a node added with
-`add_node_addressed` becomes reachable to everyone — config push,
-anti-entropy, handoff — with no restarts anywhere.
-
-### Clients
-
-A client is a `Coordinator` over a `NetTransport`. A client-only application
-depends on **`vals-client`** (`use vals_client::…`); a server binary already has
-these re-exported through `vals-cluster` (`use vals_cluster::…`). Either import
-path works — the example uses `vals_client`:
+**In your own code**, a client is a `Coordinator` over a `NetTransport`.
+This complete program talks to the README's RF3 cluster, requests
+**device-durable majority** writes, and derives the read majority from the
+discovered default-zone RF. The initial ring is only a boot guess;
+`refresh_ring` and `refresh_catalog` adopt the current configuration.
+For seed fallback and fuller error handling, copy `kv.rs` or the
+[Tokio example](#tokio-applications) instead.
 
 ```rust
-use vals_client::{Coordinator, NetTransport, Ring};
-use vals_client::reactor;
+use vals_client::{
+    reactor, Coordinator, NetTransport, Ring, WriteConcern, WriteOptions, DEFAULT_ZONE,
+};
 
-// Installs the finite production deadline and write-admission defaults.
-let transport = NetTransport::connect(&[(1, addr1), (2, addr2), (3, addr3)]);
+fn main() {
+    let nodes = [
+        (1, "127.0.0.1:7001".parse().unwrap()),
+        (2, "127.0.0.1:7002".parse().unwrap()),
+        (3, "127.0.0.1:7003".parse().unwrap()),
+    ];
+    let transport = NetTransport::connect(&nodes);
+    let mut ring = Ring::new(3);
+    ring.set_members_weighted([(1, 1), (2, 1), (3, 1)]);
+    let coord = Coordinator::new(100, ring, 2, transport);
 
-let mut ring = Ring::new(3);
-ring.set_members_weighted([(1, 1), (2, 1), (3, 1)]); // boot guess
-let coord = Coordinator::new(100, ring, 2, transport);
-
-vals_rt::block_on(
-    async {
-        // Adopt the PD's authoritative ring + zone catalog from any live node.
-        coord.refresh_ring(1).await?;
-        coord.refresh_catalog(1).await?;
-
-        let v = coord.write(b"k", b"v").await?;
-        let got = coord.read(b"k").await?;
-        // ...
-        Ok::<_, vals_client::CoordError>(())
-    },
-    reactor::poll_io, // the epoll-backed network poll hook
-)?;
+    vals_rt::block_on(
+        async {
+            coord.refresh_ring(1).await?;
+            coord.refresh_catalog(1).await?;
+            let majority = coord.ring().rf() / 2 + 1;
+            let options = WriteOptions::device_durable(WriteConcern::Majority);
+            let version = coord.write_in(DEFAULT_ZONE, b"hello", b"world", options).await?;
+            let got = coord.read_quorum(b"hello", majority).await?.expect("present");
+            assert_eq!(got.value.as_deref(), Some(&b"world"[..]));
+            assert_eq!(got.version, version);
+            Ok::<_, vals_client::CoordError>(())
+        },
+        reactor::poll_io,
+    ).unwrap();
+}
 ```
 
 Things to know:
@@ -291,13 +151,106 @@ Things to know:
   current config (and learn new members' addresses). Calling them once up front
   means the first ops route correctly instead of paying a refusal + retry, and
   it is how a coordinator built from a boot-guess ring converges before
-  traffic. (Automatic *periodic* refresh is on the backlog.)
+  traffic. For periodic refresh, host the coordinator in a
+  `CoordinatorService` built `with_proactive_refresh(period)`; the refresh
+  runs while you drive operations through `CoordinatorService::run`.
 - Coordinator methods take `&self` and pipeline: issue many writes
   concurrently (`vals_rt::join_all`) from one coordinator, or run several
   coordinators (one per core) against the same cluster — they are independent
   by design.
 - Use multiple coordinators for scale-out; a single one is eventually
   CPU-bound around ~100–200k ops/s.
+
+### Tokio applications
+
+The network coordinator is thread-local (`!Send` and `!Sync`), and its sockets
+need the vals reactor to make progress. Do not put a coordinator in shared
+Tokio application state or call `vals_rt::block_on` on a Tokio worker thread.
+Instead, create and drive it on a dedicated OS thread, and share a channel
+handle with your application tasks.
+
+[`examples/tokio_bridge.rs`](../crates/vals-client/examples/tokio_bridge.rs)
+is a complete example of that boundary. With the local cluster above running:
+
+```sh
+cargo run -p vals-client --example tokio_bridge
+# Or seed discovery from another cluster:
+cargo run -p vals-client --example tokio_bridge -- --nodes 1@127.0.0.1:7001,2@127.0.0.1:7002,3@127.0.0.1:7003
+```
+
+The example discovers membership and the zone catalog, then demonstrates
+put/get/delete from Tokio tasks using a cloneable, `Send` handle. It uses the
+default zone, derives the read majority from its replication factor, and
+requests device-durable majority acknowledgements for writes and deletes.
+Reads select the greatest LWW version, not the last request to finish; neither
+the bridge nor device durability makes CAS or a group of operations atomic.
+Tokio is an example-only development dependency, not a production dependency
+of `vals-client`.
+
+The bridge is an integration pattern to copy, not a new supported client API
+or a throughput benchmark:
+
+- A bounded request channel applies backpressure before the worker accepts
+  more work. It bounds the number of queued requests, not their total bytes
+  or the number of application tasks waiting to send; bound payload sizes and
+  application concurrency too.
+- One worker executes one operation at a time. A private current-thread
+  Tokio runtime parks its idle inbox; the vals reactor drives each operation
+  on that same dedicated thread. Slow replicas do not block an application
+  Tokio worker, but they delay every request queued behind the current one.
+  Queueing, connect/hello, RPC and any stale-ring refresh/retry all contribute
+  to operation time; an application deadline must cover the whole wait.
+- Dropping a caller skips its request if the worker has not started it yet,
+  but cannot retract an operation already started. A timeout, write error or
+  lost worker reply is not proof that a put or delete failed to take effect;
+  automatic application retries must respect the LWW/idempotency contract.
+- A long-idle connection may have been closed by the server (120 seconds by
+  default). The first write after that can fail even when the cluster is
+  healthy. The transport retries an idempotent read once on a fresh connection,
+  but never automatically resends a write. Handle that failure explicitly.
+- The coordinator's automatic stale-ring refresh/retry remains enabled. The
+  example's numeric read majority is computed at startup, however; re-create
+  the bridge if the default zone's replication factor changes.
+- Shut down the bridge explicitly and await its worker join before ending the
+  application. Stop request producers first. Startup, operation and worker
+  failures are returned to the application rather than hidden in a detached
+  background task.
+
+For a web service, construct the bridge once at startup, put clones of its
+channel handle in request-handler state, and keep its worker owner for
+application shutdown. To scale beyond this serial example, use the
+coordinator's pipelining/batch APIs on the vals thread or multiple independent
+workers; do not move a live coordinator between threads.
+
+## The model in one minute
+
+This is the distributed contract, whether replicas run in `valsd` or inside
+an application. The [local engine](embedding.md) alone does not provide
+replication or quorum semantics.
+
+- **Placement.** Keys are placed on a consistent-hash **ring**: the replicas of
+  a key are the next `RF` distinct nodes clockwise from its hash. There is no
+  data leader — any coordinator can write any key.
+- **Writes.** Each write is stamped with a **version** (hybrid logical clock +
+  writer id) and sent to all `RF` replicas. It succeeds when `W` acknowledge,
+  according to the chosen write concern. Unless you request device durability,
+  an acknowledgement means the candidate is installed in memory. The greatest
+  LWW version wins, not necessarily the last request to complete.
+- **Reads.** A read asks `R` replicas and chooses the greatest version. With
+  strict home-replica writes, `W + R > RF` makes the read overlap an
+  acknowledged write and observe its version or a greater one. This is not
+  linearizability or an atomic read-modify-write guarantee. `R = 1` reads are
+  eventually consistent when they do not meet that overlap condition.
+- **Healing.** Read-repair, hinted handoff and periodic Merkle anti-entropy
+  help replicas converge in the background. Operators still need to monitor
+  repair progress and failures.
+- **Zones.** Namespaces with their own replication factor, placement scope
+  and key ordering. Zone 0 (`default`) always exists and is unordered. Sorted
+  zones support globally ordered range scans.
+- **Control plane.** A Raft-replicated **PD** owns membership, zone catalogs
+  and sorted-zone range maps, and pushes them to data nodes. It is not on the
+  steady-state data path; see [PD availability and recovery](deploy.md#pd-availability-and-recovery)
+  for what stops working during a control-plane outage.
 
 ## Reading and writing
 
@@ -346,26 +299,6 @@ coord
     .await?; // majority, each ack after device sync
 ```
 
-**Migrating from `Durability` (task 0242).** Behaviour is unchanged except for
-the rejected options above; only names moved:
-
-| Before | After |
-|---|---|
-| `Durability` | `WriteConcern` |
-| `NoSync` / `OneNode` / `Replicated` | `Unacknowledged` / `One` / `All` |
-| `Majority`, `Quorum(n)` | unchanged, but `Quorum(n)` with `n` = 0 or above the replica count is now an error instead of `min(n, RF)` |
-| `write_tier(k, v, t)` / `write_tier_in(z, k, v, t)` / `try_write_tier` | `write_with(k, v, t)` / `write_in(z, k, v, t)` / `try_write` |
-| `write_tier[_in]_with_persistence`, `delete[_in]_with_persistence`, `write_batch[_in]_with_persistence`, `delete_range_in_with_persistence` with `(.., t, Persistence::Device)` | `write_with`/`write_in`, `delete`/`delete_in`, `write_batch`/`write_batch_in`, `delete_range_in` with `WriteOptions::device_durable(t)` |
-| `*_with_persistence(.., t, p)` with a variable `p` | `WriteOptions { concern: t, persistence: p }` |
-
-The Go client (`valsgo`, in `vals-examples`) and its callers bootes and
-real-client are unchanged by this rename and keep their current contract: `W`
-comes from `Config.W` (0 selects a majority of the zone's RF; a `W` above the
-replica count fails rather than being reduced). `Put`/`Delete` acknowledge from
-replica memory (buffered); `PutBatch`, the path bootes and real-client write
-through, always requests device-synced acknowledgements (`BatchApply sync=1`). A
-Go caller that needs a durable single write uses a one-entry `PutBatch`.
-
 **Reads**, weakest to strongest:
 
 - `read_any(key)` — one replica, fastest, eventually consistent.
@@ -408,39 +341,36 @@ than any applicable limit and `try_write` under current exhaustion return
 
 ## Zones and range scans
 
+Create namespaces through the PD's admin socket, not by constructing a PD
+inside your client. The quick start already creates the RF3 sorted `events`
+zone. For example, to create another sorted zone named `archive`, run on the
+current PD leader's host:
+
+```sh
+valsd admin -s /path/to/pd.sock create-zone archive 3 sorted
+valsd admin -s /path/to/pd.sock zones
+```
+
+For `create-zone`, an `ok committed` reply confirms the catalog mutation
+committed; delivery to data nodes follows. Other commands can report only
+queued intent, so check the reply rather than treating every successful exit
+as a commit. After creating a zone, refresh the client's catalog from a live
+seed until it appears, retrying with backoff if the push is still pending.
+See [`pd-admin.md`](pd-admin.md) for leader discovery and ambiguous outcomes.
+
+Within the async client block above, the existing `events` zone can be used
+like this. The RF3 majority is 2; choose R per zone if RFs differ. The result
+limit bounds live rows, not a cross-key snapshot:
+
 ```rust
-use vals_cluster::{Ordering, ZoneConfig};
-
-// Admin side: validate and propose through the PD. Success is not yet a commit.
-pd.create_zone(ZoneConfig {
-    name: "events".into(),
-    rf: 3,
-    ordering: Ordering::Sorted,
-    scope: None, // place on all members
-})?;
-
-// First observe the zone in the PD's committed catalog.
-let zone = loop {
-    if let Some(zone) = pd.catalog().by_name("events") {
-        break zone;
-    }
-    std::thread::sleep(std::time::Duration::from_millis(10));
-};
-
-// Delivery to data nodes follows commit. Retry the refresh until this node
-// serves the new catalog before using the zone through the client.
-loop {
-    coord.refresh_catalog(1).await?;
-    if coord.catalog().by_name("events") == Some(zone) {
-        break;
-    }
-    std::thread::sleep(std::time::Duration::from_millis(10));
-}
-
-coord.write_in(zone, b"2026-06-11/42", b"...", WriteConcern::Majority).await?;
-
-// Sorted zones scan: globally ordered, strong when r pairs with W (W+R>RF),
-// `limit` caps live results.
+coord.refresh_catalog(1).await?;
+let zone = coord.catalog().by_name("events").expect("events catalog is ready");
+coord.write_in(
+    zone,
+    b"2026-06-11/42",
+    b"click",
+    WriteOptions::device_durable(WriteConcern::Majority),
+).await?;
 let rows = coord
     .scan_in(zone, Some(b"2026-06-01/"), Some(b"2026-07-01/"), 2, Some(1000))
     .await?;
@@ -448,11 +378,22 @@ let rows = coord
 
 A sorted zone's keyspace is divided into contiguous **ranges**, each placed on
 the ring by its lower-bound token, so keys in a range co-locate (cheap scans)
-while different ranges spread across nodes and drives. Ranges start as one and
-grow by explicit splits: `pd.split_zone(zone, b"2026-06-15/".to_vec())?`. Scans
-of any size work — replica replies are paged under a server byte budget and the
-coordinator reassembles them (a `limit` also caps what is pulled, not just what
-is returned). See [`zones.md`](zones.md) for the full design.
+while different ranges spread across nodes and drives. The PD can auto-split
+ranges as they grow; for a manual split, run on its leader's host:
+
+```sh
+valsd admin -s /path/to/pd.sock split-zone events 2026-06-15/
+valsd admin -s /path/to/pd.sock ranges events
+```
+
+`split-zone` replies with queued intent, not a committed split. Confirm the
+expected boundary in `ranges` on the authoritative leader before depending
+on it, polling with a deadline if it is not present yet.
+
+Scans of any size work — replica replies are paged under a server byte budget
+and the coordinator reassembles them (a `limit` also caps what is pulled, not
+just what is returned). See [`zones.md`](zones.md) for placement and rehoming;
+a split alone does not necessarily move data to different owners.
 
 **Range deletes** (sorted zones only) remove every key in `[lo, hi)` with one
 versioned range tombstone per range instead of one tombstone per key:
@@ -479,11 +420,9 @@ let v = coord
   safe. `WriteOptions::device_durable(concern)` waits for the device sync, as for
   writes.
 - Every replica must run a build with range deletes (hello feature bit 3);
-  otherwise the call fails with `Unsupported` before anything is written. Clients
-  without bit 3 (the Go client before 0468) get an error from a scan whose window
-  meets a range tombstone. The Go client issues range deletes with
-  `DeleteRange(zone, lo, hi, durable)`, with the same rules and `W` from
-  `Config.W`.
+  otherwise the call fails with `Unsupported` before anything is written. A
+  client that does not advertise bit 3 gets an error from a scan whose window
+  meets a range tombstone.
 - **Prefer cumulative deletes.** Deleting `[base, cursor)` with a rising cursor
   keeps a single fragment per zone engine. Deleting many disjoint spans keeps one
   fragment each, kept until `gc_grace` collects them (forever at the default
@@ -494,18 +433,18 @@ Design: [`range-deletes.md`](range-deletes.md).
 
 ## Operating it
 
-- **Auth.** Call `vals_cluster::init_cluster_secret(secret)` once at startup
-  in **every** process (nodes, PDs, clients that issue control ops). It gates
-  the mutating control ops (`SetMembers`/`SetZones`/`SetRangeMaps`) and the PD
-  raft port. Unset = open, for tests. The token is cleartext on the wire —
-  it stops stray/unprivileged senders, not an on-path attacker; run on a
-  private network or an overlay such as Tailscale/WireGuard; vals does not
-  encrypt its transport. Data ops are not authenticated.
-- **Logging & metrics.** `observe::init_stderr_logger()` (level via
-  `VALS_LOG=info|debug|...`), or install any `log`-facade logger you like.
-  `observe::snapshot()` returns the process-wide counters (writes/reads,
-  read-repairs, hints, wipes, denials, compactions, PD pushes...) — export
-  them however you export metrics.
+The full lifecycle instructions are in [the operator guide](deploy.md).
+For application-owned servers, use the [embedding guide](embedding.md) instead.
+
+- **Auth.** Set the same `secret_file` on every node and PD. It gates
+  mutating control operations and the PD Raft port; unset means open. The
+  token is cleartext, and data reads/writes and client discovery are never
+  authenticated. Enforce network isolation or use a trusted overlay such as
+  WireGuard/Tailscale; see [`SECURITY.md`](../SECURITY.md).
+- **Logging & metrics.** Daemons log to stderr; set `log_level` in the config.
+  Set `metrics = <private-address>:<port>` to export Prometheus counters.
+  The endpoint has no authentication. Use [config validation](deploy.md#configuration-basics)
+  before restarting a service.
 - **Deadline, retry, and partial-write semantics.** Connect/hello and RPC
   deadlines are on by default. A timeout is a failed replica response, so a
   quorum operation can still succeed from enough other replicas; otherwise it
@@ -520,52 +459,56 @@ Design: [`range-deletes.md`](range-deletes.md).
   with `Coordinator::with_failure_detector` to route around repeatedly failing
   nodes.
 - **Benchmark opt-out.** `NetTransport::connect_unbounded` and
-  `connect_sharded_unbounded` explicitly restore the old no-deadline,
-  no-coordinator-budget behavior for controlled benchmarks. In-tree
-  `vals-bench` call sites use these names so their historical load shape is not
-  silently changed. External Rust consumers should either adopt the finite
-  defaults or pass a reviewed `ClientConfig`; this does not alter independent
-  Go-client behavior.
-- **Tombstone GC + liveness.** Deletes leave versioned tombstones. To reclaim
-  them, set a grace (`with_gc_grace_ms`) — and then serve with the liveness
-  lease (`serve_with_liveness`), which wipes-and-resyncs a node that rejoins
-  after being unreachable longer than the grace (otherwise it could resurrect
-  GC'd deletes). The lease's grace is stamped onto every engine by
-  construction; the serve parameter is the single source of truth.
-- **Shutdown.** `NodeHandle::shutdown()` and `PdDaemon::shutdown()` drain and
-  sync; a rolling restart is then distinguishable from a crash (the PD's
-  restart beacon re-pushes config to a restarted node within ~1s either way;
-  it compares both the ring and the zone-catalog epoch, so a membership push
-  that reaches the node first does not hide the restart).
+  `connect_sharded_unbounded` turn off the deadlines and the coordinator write
+  budgets, for controlled benchmarks only; the in-tree `vals-bench` harnesses
+  use them. Other clients should keep the finite defaults or pass a reviewed
+  `ClientConfig`.
+- **Tombstone GC + liveness.** Deletes leave versioned tombstones forever
+  at the default `gc_grace = 0s`. A nonzero value on every data node enables
+  collection and the wipe-before-rejoin lease: a sufficiently stale node
+  wipes and re-syncs instead of bringing back collected deletes. Use the same
+  setting everywhere and account for its resync cost. Read the [node config
+  notes](deploy.md#node-config-reference) and the [known backup/repair exposure](backup-restore.md#consistency-contract)
+  before enabling it; a grace period alone is not a deletion guarantee.
+- **Shutdown and recovery.** Send SIGTERM/SIGINT and wait for daemon exit;
+  shutdown drains and syncs engines and persists PD state. A durable
+  acknowledgement is distinct from a buffered write rescued by a clean stop.
+  See [systemd](deploy.md#systemd), [PD recovery](deploy.md#pd-availability-and-recovery)
+  and [backup/restore](backup-restore.md) before relying on restarts or replication
+  as your recovery plan.
 - **Version-gated formats.** Every data connection negotiates the version/features
   from its `PROTO_VERSION` hello. On-disk containers carry `[magic][u16 version]`
   envelopes and unknown versions fail loud. [`formats.md`](formats.md) is the
   current-contract snapshot; versioning makes compatibility decisions explicit,
-  but is not an unlimited backward-compatibility promise. Check release notes and
-  use rolling mixed-version deployment only where that combination is supported.
+  but is not an unlimited backward-compatibility promise. Run mixed versions
+  during a rolling upgrade only when the docs for that change say it is safe.
 
 ## Storage backends
 
-| Backend | Construct | Use for |
+| Daemon setting | Backend | What to expect |
 |---|---|---|
-| `MemBlockDevice` | `MemBlockDevice::new(block_size, num_blocks)` | tests, toys |
-| `FileBlockDevice` | file-backed | durable single-box dev |
-| `SpdkBlockDevice` | `spdk` feature, see [`SPDK.md`](SPDK.md) | raw NVMe, the real target |
+| `backend = file` (default) | File-backed block device | Persistent local evaluation without dedicated hardware; size each zone with `region_mib`. |
+| `backend = mem` | In-memory block device | Tests and throwaway deployments; data is lost on exit, even if device durability is requested. |
+| `backend = spdk` | Raw NVMe through SPDK | Dedicated drives, explicit offline provisioning, hugepages and an SPDK-linked build; see [`SPDK.md`](SPDK.md). |
 
-The whole distributed layer is generic over `BlockDevice`, so everything in
-this guide behaves identically on all three — develop against mem/file, deploy
-on SPDK.
+The distributed algorithms share the same `BlockDevice` abstraction, but
+performance, provisioning and device durability depend on the backend. The
+file-backed demo is not evidence of SPDK performance or hardware recovery.
+For block-device constructors and engine ownership in your own process, see
+the [embedding guide](embedding.md).
 
 ## What's deliberately not here
 
-- **Multi-key transactions / cross-key ordering** — given up in the leaderless
-  pivot (see [`../ARCHITECTURE.md`](../ARCHITECTURE.md)). An opt-in linearizable-zone design is
-  parked in [`future-linearizable-zones.md`](future-linearizable-zones.md).
+- **Multi-key transactions / cross-key ordering**, given up for the leaderless
+  design (see [`../ARCHITECTURE.md`](../ARCHITECTURE.md)). An opt-in
+  linearizable-zone design is parked in
+  [`future-linearizable-zones.md`](future-linearizable-zones.md).
 - **Linearizable CAS** — `cas` is best-effort (above).
-- **Auto-eviction** — the failure detector only routes around a down node;
-  removing it from the ring is an explicit `pd.remove_node` (auto-eviction is
-  a backlog item).
-- **Non-Rust clients** — the wire contract is version-negotiated, but no unlimited
-  backward-compatibility promise or packaged non-Rust client is provided. Client
-  packaging is tracked in the ycc backlog ([`../backlog.md`](../backlog.md)). A
-  server binary exists: `valsd`, see [`deploy.md`](deploy.md).
+- **Auto-eviction** is not yet supported. The failure detector only routes
+  around a down node; removing it from the ring is an explicit
+  `valsd admin -s pd.sock remove-node ID` (see
+  [`deploy.md`](deploy.md)).
+- **Non-Rust clients.** There is no packaged non-Rust client. The wire
+  protocol is version-negotiated and documented in [`formats.md`](formats.md),
+  but there is no unlimited backward-compatibility promise. A server binary
+  exists: `valsd`, see [`deploy.md`](deploy.md).

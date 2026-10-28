@@ -7,7 +7,7 @@
 > - [`docs/`](docs/README.md) — reference (wire/on-disk formats, agreement algorithms)
 >   and subsystem deep-dives (zones, multi-drive, SPDK, out-of-core index, …).
 > - [`README.md`](README.md) — user-facing overview, build/test, doc map.
-> - Open work is tracked in the **ycc backlog** (`backlog.md` index / `backlog/`
+> - Open work is tracked in the **backlog** (`backlog.md` index / `backlog/`
 >   task files); the record of shipped work lives in git history and the
 >   `ARCHITECTURE.md` status map.
 >
@@ -51,6 +51,18 @@ the read-path candidates 0207 and 0209 were measured and rejected, not left awai
 implementation. Historical performance results do not imply that outstanding
 release or integrity gates have passed.
 
+## User entry points
+
+The [README](README.md) and [getting-started guide](docs/getting-started.md)
+lead with running `valsd`, sending CLI traffic and connecting an application.
+The [embedding guide](docs/embedding.md) is a first-class alternative for a
+local `vals-store` engine or a distributed `vals-cluster` node. A remote
+`vals-client` application is not an embedded database. Distributed semantics
+stay in the common user guide; daemon lifecycle mechanics live in
+[deploy.md](docs/deploy.md), and application-owned lifecycle mechanics live in
+the embedding guide. This presentation is not an API freeze or a new recovery
+qualification.
+
 ## Cleanup survey
 
 The owner-reviewed inventory and final dispositions are in
@@ -86,9 +98,10 @@ The owner-reviewed inventory and final dispositions are in
   scaling bug worth fixing (examples: tasks 0469, 0502, 0503).
 - **Kill-the-fix testing**: regressions are pinned by tests that fail with the fix
   reverted.
-- Verification workflow: `cargo build --workspace && cargo test --workspace`,
-  `cargo clippy --workspace`, `cargo fmt --check`; SPDK build via
-  `VALS_SPDK_LINK=1 cargo build --release -p vals-bench --features spdk`.
+- Verification workflow: `scripts/ci.sh` (locked build, tests, clippy, Python tests;
+  see `docs/ci.md`). The tree is not rustfmt-clean, so never run `cargo fmt`. SPDK
+  build via `VALS_SPDK_LINK=1 cargo build --release -p vals-bench --features spdk`.
+  Contributor-facing conventions are in `CONTRIBUTING.md`.
 
 ## Open questions (need owner input)
 
@@ -108,6 +121,6 @@ The owner-reviewed inventory and final dispositions are in
 
 ## Backlog conventions
 
-Open work lives in the ycc backlog (`backlog.md` index, canonical task files under
+Open work lives in the backlog (`backlog.md` index, canonical task files under
 `backlog/`). Priorities: P1 = current focus, P2 = next up / correctness-adjacent,
 P3 = valuable but unscheduled, P4–5 = deferred/parked.

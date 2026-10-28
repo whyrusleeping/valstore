@@ -57,7 +57,9 @@ This starts three data nodes and one PD on one machine with file-backed
 storage, the same shape the end-to-end test deploys. It is a development and
 test setup only: a single PD is not highly available, and changing the
 addresses to spread the data nodes over machines does not change that. Real
-deployments run three PDs ([PD config reference](#pd-config-reference)).
+deployments run three PDs ([PD config reference](#pd-config-reference)). For
+a minimal single-node deployment and how to grow it, see
+[`growing.md`](growing.md).
 
 ```sh
 cargo build --release -p vals-server
@@ -168,7 +170,8 @@ log_level = info               # optional: error|warn|info|debug|trace|off (relo
 block_size = 4096              # default 4096; spdk requires 4096
 seg_blocks = 256               # blocks per segment, default 256
 region_mib = 1024              # default 1024: per-zone region cap (file/mem),
-                               #   partition region (spdk multi-drive)
+                               #   partition region (spdk multi-drive); a file-backed
+                               #   zone keeps the size it was created with
 
 # spdk (backend = spdk; needs the --features spdk build)
 pci    = 0000:a1:00.0          # required for spdk; repeatable: one per drive
@@ -474,7 +477,9 @@ leader and rerun the same command.
 Not supported (there is no tool; do not improvise one):
 
 - **Changing the number of voters**, including growing a single PD into a
-  group. A single PD refuses these commands.
+  group. A single PD refuses these commands. To move from one PD to three,
+  restore a backup into a new three-voter cluster
+  ([`growing.md`](growing.md#moving-to-three-pds-new-hosts-or-larger-regions)).
 - **Changing a live voter's address in place.** Keep the address when moving
   intact state, or replace the voter with a new id at the new address.
 - **Reusing a removed or lost id**, or restarting a lost voter on an empty
@@ -921,7 +926,7 @@ access control; mutations still go through Raft.
 | `zones` | committed catalog: `id name rf ordering` per line |
 | `ranges <zone>` | committed range boundaries of a zone, one `hex=<bytes>` key per line |
 | `add-node <id> <weight> [<addr>,...] [--force]` | grow the cluster (the addresses make the node reachable cluster-wide, with no restarts anywhere) |
-| `remove-node <id> [--force]` | shrink the ring (data re-replicates through anti-entropy) |
+| `remove-node <id> [--force]` | shrink the ring (data re-replicates through anti-entropy from the remaining replicas; at RF 1 there are none, so the removed node's keys become unreachable, see [`growing.md`](growing.md#adding-data-nodes)) |
 | `create-zone <name> <rf> <sorted\|unsorted> [presplit=K \| presplit=key,key,...]` | create a zone and push it to all nodes; a sorted zone can be presplit into K first-byte ranges or at explicit canonical key boundaries |
 | `drop-zone <id\|name>` | tear a zone down everywhere |
 | `split-zone <id\|name> <key> [canonical]` | split a sorted zone's range at `key`; `canonical` spreads an empty range only (populated ranges need a rehome) |

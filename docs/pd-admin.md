@@ -2,9 +2,13 @@
 
 Each PD replica has a **host-local** admin Unix socket (`admin_socket` in its PD
 config). `valsd admin -s <socket> <command>` connects to only that replica;
-there is no redirect or automatic multi-replica retry. Query `status` on the
-available hosts and locate the current `role=leader`, noting its `pd` id and
-`term`. A follower's `leader` is its last known leader, not a lease: if a
+there is no redirect or automatic multi-replica retry. The command list is in
+[`deploy.md`](deploy.md#administering-a-running-cluster); this page explains
+how to read the replies and what to do when a mutation's outcome is unclear.
+
+Mutations are accepted only by the current, caught-up leader. Query `status`
+on the available hosts and locate the current `role=leader`, noting its `pd`
+id and `term`. A follower's `leader` is its last known leader, not a lease: if a
 mutation says `not leader` or `not ready`, check status again and direct the
 command to the current leader's socket. Do not assume a disconnected socket
 means the replica or its proposals are gone.
@@ -39,9 +43,9 @@ Mutation replies start with one of:
   request without a reply (including `unknown: no reply from PD drive loop`),
   treat the outcome as ambiguous too.
 
-`members` and `zones` preserve their existing body rows. `ranges <zone>`
-emits committed boundary keys as `hex=<bytes>` (an empty body means one range).
-Their first line is either `ok authoritative pd=... term=...
+`members` lists the committed membership and `zones` the committed catalog.
+`ranges <zone>` lists committed boundary keys as `hex=<bytes>` (an empty body
+means one range). The first line of each is either `ok authoritative pd=... term=...
 index=...` (leader ReadIndex quorum confirmation, applied through that index)
 or `ok non-authoritative ... (may lag; not confirmation)`. A follower is
 always non-authoritative, even if it appears caught up. A partitioned former
@@ -79,6 +83,7 @@ caught-up learner instead, and `pd-remove-learner` refuses the learner the
 replacement chose until then. A finished
 replacement replies `ok pd <old> replaced by pd <new> (already done)`.
 
-This workflow concerns **PD Raft state only**. Cross-group fencing of data nodes
-is the cluster incarnation id; see [`deploy.md`](deploy.md) §PD availability and
-recovery for what it fences and what still needs external fencing.
+This workflow concerns **PD Raft state only**. Data nodes are fenced from a
+stale PD group by the cluster incarnation id; see
+[`deploy.md`](deploy.md#pd-availability-and-recovery) for what it fences and
+what still needs external fencing.

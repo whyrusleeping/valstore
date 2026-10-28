@@ -17,15 +17,21 @@ in-memory or file-backed storage.
 ## Status
 
 vals is young. The version is 0.0.1, it is not on crates.io, and its APIs may
-still change. It runs on Linux only. A shared secret protects control
-operations, but data traffic is neither authenticated nor encrypted, so run
-it on a private network. Its main real-world test is replaying about 5
-billion Bluesky firehose events on a three-machine SPDK cluster.
+still change. It runs on Linux only. A shared secret can protect control
+operations, but it is off unless you set `secret_file`, and without it
+control operations are open too. Data traffic is never authenticated or
+encrypted, so run vals on a private network; [`SECURITY.md`](SECURITY.md)
+has the details. Its main real-world test is replaying about 5
+billion Bluesky firehose events on a three-machine SPDK cluster. Which
+revision to evaluate, what it was tested on and its known limits are in
+[`docs/evaluation.md`](docs/evaluation.md).
 
 What to expect if you're used to a SQL database or etcd:
 
-- Choose `W + R > RF` for reads that see the latest write. `R = 1` reads are
-  only eventually consistent.
+- Choose `W + R > RF` for a read that sees an acknowledged write's version
+  or a greater LWW version. "Latest" means version order, not request completion
+  order; this is not linearizability. `R = 1` alone does not generally give
+  that overlap.
 - There are no multi-key transactions. Concurrent writes to one key resolve
   by last writer wins, and `cas` is best-effort, not linearizable.
 - By default, an acknowledged write is held in replica memory, not on disk.
@@ -39,15 +45,19 @@ verified values, and zero errors:
 - **One machine with 8 PM9A3 drives**, running four node processes (two
   drives each) over loopback TCP, with the background anti-entropy sweep
   off: about **3.5–4M replicated writes/s**, **~4.4M strong reads/s**, and
-  **~6.5M `R = 1` reads/s**. The last figure is essentially the raw read IOPS
-  of the 8 drives. The single-node engine on
-  its own reaches the drives' limits (~8M read IOPS, ~29 GiB/s writes).
-- **Three machines on a real network** (one drive per node, RF 2): **~5M
-  strong 100-byte reads/s**.
+  **~6.5M `R = 1` reads/s**. The single-node engine on its own reaches the
+  drives' limits (~8M read IOPS, ~29 GiB/s writes).
+- **Three machines on a real network** (one drive and four shards per node,
+  RF 2, with the non-default `profile = latency`): **~5M strong 100-byte
+  reads/s**.
 
-These are benchmark results from specific runs, not guarantees. Methodology
-and the full history are in [`docs/SPDK.md`](docs/SPDK.md) and the Status
-section of [`ARCHITECTURE.md`](ARCHITECTURE.md).
+These are benchmark results from specific runs, not guarantees. The
+hardware and setup behind each number are in [`docs/SPDK.md`](docs/SPDK.md),
+and the [Status section of `ARCHITECTURE.md`](ARCHITECTURE.md#status)
+summarizes what has been validated. For what to expect from the default
+file-backed `valsd` on ordinary machines (about 78k buffered overwrites/s and
+100–125k reads/s on 24-core hosts with a consumer NVMe drive), with a recipe
+to measure your own, see [`docs/benchmarks.md`](docs/benchmarks.md).
 
 ## Quick start
 
@@ -60,49 +70,9 @@ git clone https://github.com/whyrusleeping/valstore
 cd valstore
 ```
 
-### Embed it: a cluster in one process
-
-This is the smallest working program. It runs three in-memory replicas
-inside a single process and talks to them through a coordinator, with no
-threads or sockets. A fuller version of the same program runs as a doctest
-of `vals-cluster`.
-
-```rust
-use vals_cluster::{Coordinator, LocalCluster, Ring, VersionedStore, WriteConcern};
-use vals_spdk::MemBlockDevice;
-use vals_store::{Config, Engine};
-
-fn main() {
-    // Three replicas, each a storage engine on an in-memory block device.
-    let mut cluster = LocalCluster::new();
-    for node in 1..=3u32 {
-        let engine = Engine::create(MemBlockDevice::new(4096, 4096), Config::default()).unwrap();
-        cluster.insert(node, VersionedStore::new(engine, node).unwrap());
-    }
-
-    // A consistent-hash ring with replication factor 3 over those nodes.
-    let mut ring = Ring::new(3);
-    ring.set_members_weighted([(1, 1), (2, 1), (3, 1)]);
-
-    // A client-side coordinator (id 100) whose reads ask R = 2 replicas.
-    let coord = Coordinator::new(100, ring, 2, cluster);
-
-    vals_rt::block_on(
-        async {
-            // W = 2 (majority) + R = 2 > RF = 3, so the read must see the write.
-            coord.write_with(b"hello", b"world", WriteConcern::Majority).await.unwrap();
-            let got = coord.read(b"hello").await.unwrap().expect("present");
-            assert_eq!(got.value.as_deref(), Some(&b"world"[..]));
-        },
-        || {}, // I/O poll hook; nothing to poll in-process
-    );
-}
-```
-
-The crates are not on crates.io, so depend on them from git, e.g.
-`vals-cluster = { git = "https://github.com/whyrusleeping/valstore" }`.
-Use the smaller `vals-client` crate instead if your application is only a
-client.
+Start with `valsd` below to run vals as a database service. Rust applications
+can also embed the [local engine or distributed node](docs/embedding.md);
+embedding is a separate path, not a prerequisite for using the daemon.
 
 ### Run it: a local three-node cluster
 
@@ -112,7 +82,9 @@ available; real deployments run three.
 
 ```sh
 cargo build --release -p vals-server
+cargo build --release -p vals-client --example kv
 VALSD=$PWD/target/release/valsd
+KV=$PWD/target/release/examples/kv
 
 mkdir -p /tmp/vals && cd /tmp/vals
 echo "demo-secret" > secret
@@ -147,12 +119,55 @@ $VALSD admin -s pd.sock members     # the three data nodes
 $VALSD admin -s pd.sock zones       # the sorted `events` zone
 ```
 
-Each daemon logs to its `*.log` file. Stop them with `pkill -x valsd`,
-which sends SIGTERM, and they shut down cleanly. There is no command-line
-get/put tool yet; to send traffic, use a `Coordinator` over TCP as shown in
-[`docs/getting-started.md`](docs/getting-started.md#clients). The operator
-guide, with every config option, the three-PD setup, systemd units, and
-backups, is [`docs/deploy.md`](docs/deploy.md).
+To send traffic, use `kv`, a small example client from `vals-client`. It
+connects to 127.0.0.1:7001-7003 by default, and `$KV --help` lists its
+options:
+
+```sh
+$KV put hello world
+$KV get hello                       # prints `world` and its version
+$KV delete hello
+$KV --zone events put 2026-06-11/42 click
+$KV --zone events scan              # key<TAB>value lines in key order, then a count
+```
+
+Each daemon logs to its `*.log` file. Stop the demo with `pkill -x valsd`
+(only on a machine with no other valsd deployments), which sends SIGTERM for
+a clean shutdown. These examples use buffered majority writes: an
+acknowledgement is not a device sync. The client guide explains how to request
+[device-durable writes](docs/getting-started.md#reading-and-writing).
+
+### Connect your application
+
+A Rust application talking to `valsd` uses `vals-client` and `vals-rt`; it
+**does not embed the database**. See the [client walkthrough](docs/getting-started.md#clients)
+for dependencies and a TCP example, or the [Tokio bridge](docs/getting-started.md#tokio-applications)
+for an existing async application. There is no packaged non-Rust client yet.
+
+Next, read the [consistency and durability contract](docs/getting-started.md#the-model-in-one-minute)
+and the [operator guide](docs/deploy.md), which covers configuration,
+three-PD availability, systemd, sizing, backup and restore. The local demo
+is not highly available: growing its single PD into a three-voter group in
+place is not supported. Choose three PDs from the outset for HA, or follow
+[growing a small deployment](docs/growing.md), which covers a minimal
+one-node setup, zone sizing, adding nodes and the backup/restore migration
+to three PDs.
+
+### Embed it in Rust
+
+Embedding is also a first-class way to use vals:
+
+- **Local storage inside your process:** `vals-store` provides the persistent
+  engine, without networking, replication or a PD.
+- **A distributed node inside your service:** `vals-cluster` adds versioning,
+  replica serving and healing; your application owns its runtime and lifecycle.
+
+The [embedding guide](docs/embedding.md) covers dependencies, file-backed
+create/reopen/sync, an in-process replicated demo, and hosting networked nodes
+and a durable PD. It also explains which maintenance, security and shutdown
+responsibilities your application takes on instead of `valsd`. An embedded
+`vals-cluster` node and `valsd` share the same [quorum and LWW contract](docs/getting-started.md#the-model-in-one-minute);
+the local engine alone has no replication or quorum semantics.
 
 ## Building and testing
 
@@ -178,9 +193,9 @@ VALS_SPDK_LINK=1 cargo build --release -p vals-server --features spdk
 
 | Crate | What it is |
 |---|---|
-| [`vals-client`](crates/vals-client) | The client: the `Coordinator` (quorum reads/writes, durability options, CAS, batches, scans), the TCP transport, and the wire types. It does not depend on any server code. |
-| [`vals-cluster`](crates/vals-cluster) | The distributed layer: versioning, the ring, replicas, healing, zones, and the PD. It re-exports `vals-client`, so a server only needs this crate. |
-| [`vals-server`](crates/vals-server) | `valsd`, the daemon: the `node`, `pd`, `admin`, `backup`, and `dump` subcommands. |
+| [`vals-client`](crates/vals-client) | The client: the `Coordinator` (quorum reads/writes, durability options, CAS, batches, scans), the TCP transport, and the wire types. It does not depend on any server code. Clients also need `vals-rt` to drive it. |
+| [`vals-cluster`](crates/vals-cluster) | The distributed layer: versioning, the ring, replicas, healing, zones, and the PD. It re-exports `vals-client`; a server that embeds it also uses `vals-store`, `vals-spdk` and `vals-rt` directly. |
+| [`vals-server`](crates/vals-server) | `valsd`, the daemon: the `node`, `pd`, `admin`, `backup`, `dump`, `keyscan`, `provision`, and `reenrol` subcommands. |
 | [`vals-store`](crates/vals-store) | The single-node storage engine. It is log-structured and has an out-of-core index, crash recovery, and compaction. |
 | [`vals-spdk`](crates/vals-spdk) | The `BlockDevice` trait and its backends: in-memory, file, and SPDK NVMe (with the `spdk` feature). |
 | [`vals-rt`](crates/vals-rt) | A small thread-per-core async executor, shared by the storage and network event loops. |
@@ -197,17 +212,32 @@ write-ups that are not part of this repository.
 
 ## Documentation
 
-- [`docs/getting-started.md`](docs/getting-started.md): **start here** to use
-  vals. It covers the data model, the client API, zones and scans,
-  durability options, CAS, batches, and operations.
-- [`docs/deploy.md`](docs/deploy.md): how to run `valsd` in production
+- [`docs/getting-started.md`](docs/getting-started.md): **start here** to run
+  vals and connect an application. It covers the client API, the data model,
+  durability options, CAS, batches, zones and scans.
+- [`docs/evaluation.md`](docs/evaluation.md): the revision to evaluate, the
+  evidence behind it, upgrade expectations and known limitations.
+- [`docs/deploy.md`](docs/deploy.md): the `valsd` operator guide
   (configuration, the PD, admin, systemd, backup and restore).
+- [`docs/growing.md`](docs/growing.md): from one machine to a highly
+  available cluster, and what each step needs.
+- [`docs/embedding.md`](docs/embedding.md): use the local engine or host a
+  distributed node in Rust, including persistence, runtime ownership,
+  maintenance and shutdown.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md): the design, with a map of what is
   built, and a hub that links the deep-dive docs.
-- [`docs/README.md`](docs/README.md): an index of the reference docs (wire
-  and on-disk formats, the algorithms every node must agree on) and of the
-  subsystem docs (zones, multiple drives, batch writes, backpressure, SPDK).
+- [`docs/README.md`](docs/README.md): an index of every doc. That includes
+  the guides, the reference docs (wire and on-disk formats, the algorithms
+  every node must agree on), and the design notes (zones, multiple drives,
+  batch writes, backpressure, SPDK).
 - API docs: `cargo doc --workspace --no-deps --open`.
+
+## Contributing and security
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) before sending a change; the code
+conventions are unusual. Report vulnerabilities privately as described in
+[`SECURITY.md`](SECURITY.md), which also spells out what vals does and
+doesn't protect against.
 
 ## License
 

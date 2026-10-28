@@ -305,8 +305,8 @@ the RT (one sweep pass of the lagging node). v1 adds no scan-time RT repair.
 **Old clients.** A `Scan` request on a connection without feature bit 3 whose
 window intersects F is answered `Err("range tombstones present: client lacks
 RANGE_TOMBSTONES")`. An old client cannot hide covered keys itself, so an answer
-would be wrong. Windows with no fragment are served unchanged, so `valsgo` and
-`bootes` builds from before 0468 keep working on zones that never use range
+would be wrong. Windows with no fragment are served unchanged, so older out-of-tree
+clients keep working on zones that never use range
 deletes.
 
 ## 3. Point reads, digests, read-repair, writes
@@ -819,7 +819,7 @@ Slice 1 is this note (0443).
 6. **Validation and docs** (0449). Head-of-queue and hot-path A/Bs (local, then
    box), updates to `formats.md`, `algorithms.md`, `zones.md`,
    `backup-restore.md`, `deploy.md` (downgrade) and `getting-started.md`, plus
-   the Go client follow-up task (`valsgo`).
+   a follow-up task for the out-of-tree Go client.
 
 ## Rejected alternatives
 

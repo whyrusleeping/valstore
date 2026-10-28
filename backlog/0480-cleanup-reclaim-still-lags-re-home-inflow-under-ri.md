@@ -1,10 +1,10 @@
 ---
 id: "0480"
 title: 'Cleanup reclaim still lags re-home inflow under ring load: target moved spans instead of the store-wide lap'
-status: proposed
+status: done
 priority: 3
 created: "2026-10-16"
-updated: "2026-10-16"
+updated: "2026-10-20"
 depends_on: []
 spec_refs: []
 ---
@@ -22,3 +22,5 @@ Target the moved spans: when a shard's placement changes (CleanupPlacement alrea
 ## Acceptance criteria
 
 ## Work log
+
+- 2026-10-20: closed without implementation (owner accepted). 0485 made the inflow go away: on its R15 default-config 2 h ring arm there were zero debt re-homes, `vals_live_keys` stayed flat at 64.04M and RSS and disk stayed flat (bench/0485-rehome-decisions/FINDINGS.md). Reopen as a new task only if a workload that re-homes a lot shows stray former-owner copies building up again.

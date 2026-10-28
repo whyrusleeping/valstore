@@ -355,10 +355,25 @@ resolve it before resetting devices; see [SPDK ownership](../docs/SPDK.md).
   `core_pattern`. Restore both, plus hugepages and vfio, before relaunching
   ([soak-resume-runbook.md](soak-resume-runbook.md) automates the sysctls).
 - **Routing.** The devbox→lab-2 route is runtime-only. Run
-  `ip route get 10.0.0.18` before benches.
+  `ip route get 10.0.0.18` before benches. devbox reaches lab-1 and lab-3 via
+  `eno1np0` and lab-2 via `eno1np1`, so client link use must sum both. The Rust client
+  sends every write to all RF replicas (no server forwarding): RF 3 costs 3× payload egress,
+  and about 1M msgs/s of 512 B saturates `eno1np0`.
+- **9100 PRO features** (fw 0B2QNXH7, `nvme id-ctrl` on lab-3, 2026-10-13): ONCS 0x5d =
+  Compare, DSM/deallocate, Write Zeroes (DEAC ok, deallocated blocks read 0) and Timestamp. No
+  Copy, Verify, fused ops, directives/streams, FDP, ZNS, PI/metadata (512 B LBA format only) or
+  SGL. VWC enabled, AWUPF 0, MDTS 512 KiB. To query a vfio-bound drive, run `setup.sh reset`
+  with `PCI_ALLOWED`, then nvme-cli, then rerun `setup.sh` with `HUGEMEM=8192`.
+- **Harness recipes** (A/B arms, the 0471 queue cluster, the lab-2 reboot watchdog, returning
+  a drive to vfio after an XFS arm): [ab-harnesses.md](ab-harnesses.md).
 - **Profiling.** devbox has no perf (`perf_event_paranoid=4`, no sudo). Profile
   shard CPU on lab-1 as in `bench/0390-shard-cpu/FINDINGS.md`. Use the `cpu_core`
-  PMU and read leaf symbols. Prometheus histogram `_sum` values are seconds.
+  PMU and read leaf symbols. Prometheus histogram `_sum` values are seconds. perf data
+  recorded from a root valsd needs `perf report -f`.
+- **After a reopen,** gate aediag on `vals_ae_seed_active` = 0 on all nodes. Before that,
+  its Busy message is misleading (0433).
+- **run_full1 resumes:** the real binary of a resumed attempt is in `server-install.json`, not
+  `final.json`'s `server_sha256`.
 - **Credentials.** `JETSTREAM_API_KEY` is in `~/code/bootes/soak/jetstream.env`.
 
 ## Open items

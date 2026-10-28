@@ -1,3 +1,19 @@
+//! `vals-spdk`: the block-device layer that every vals storage engine runs on.
+//!
+//! [`BlockDevice`] is the trait the engine is written against, and
+//! [`AsyncRead`] adds asynchronous reads for the serving path. There are
+//! three implementations:
+//!
+//! - [`MemBlockDevice`]: RAM-backed, for tests and examples.
+//! - [`FileBlockDevice`]: backed by a regular file, for development and
+//!   single-box use.
+//! - `SpdkBlockDevice` (the `spdk` module, behind the `spdk` feature): raw NVMe
+//!   through SPDK's userspace driver, with one I/O queue pair per core.
+//!
+//! Everything above this crate is generic over the trait, so the whole system
+//! runs and is tested without NVMe hardware. Building the SPDK backend is
+//! described in `docs/SPDK.md`.
+
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};

@@ -228,6 +228,10 @@ target nodes bind to the new incarnation on the first push and refuse
 everything the old PD sends them. Restoring an older backup works the same
 way.
 
+The same procedure moves a cluster to three PD voters, to new addresses, or
+to larger file-backed zone regions; [`growing.md`](growing.md) walks through
+that migration for a small deployment.
+
 ### Runbook
 
 1. **Check the backup:** `valsd backup verify <dir>`.

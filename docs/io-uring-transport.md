@@ -141,10 +141,8 @@ throughput, *provided the core (not loopback/NIC) is the wall*.
 `ssh user@oldbox` — 48-core AMD EPYC 9454P (96 threads), single socket /
 single NUMA, **kernel 6.8.0-124-generic** (io_uring multishot + pbuf rings OK),
 passwordless sudo, `perf` present (paranoid=4, use sudo), **no `strace`** (use
-`perf trace -s`). Repos at `~/vals` + `~/vals-examples` (rsync'd copies,
-NOT git on the box). Toolchain at `~/.cargo/bin` (need `bash -lc` for PATH on
-non-interactive ssh). valsmix cluster recipe: `~/vals-examples/`
-`spdk-cluster.sh` + `run-valsmix-spdk.sh` + `perf-measure.sh` +
+`perf trace -s`). The load generator and cluster scripts came from a private
+examples repository: `spdk-cluster.sh` + `run-valsmix-spdk.sh` + `perf-measure.sh` +
 `RUNBOOK-valsmix.md`.
 
 **Loopback caveat:** we only have one box, so Phase 0 measures over loopback TCP.

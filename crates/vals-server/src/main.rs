@@ -1,3 +1,11 @@
+//! `valsd`: the vals server daemon.
+//!
+//! One binary runs a data node (`valsd node`), a placement driver
+//! (`valsd pd`), or an administrative command (`valsd admin`, `backup`,
+//! `dump`, `provision`, and others). Each daemon reads a `key = value` config
+//! file and shuts down cleanly on SIGTERM or SIGINT. The operator guide is
+//! `docs/deploy.md`.
+
 
 mod admin;
 mod backup;

@@ -1,3 +1,15 @@
+//! `vals-raft`: Raft for the vals control plane.
+//!
+//! [`Partition`] wraps `raft-rs`. [`PdStorage`] persists Raft's hard state,
+//! log, and snapshots in checksummed files in a directory, and the replicated
+//! state machine is a key/value map kept in a `vals-store` engine. The log is
+//! compacted behind snapshots. The caller steps in messages, calls `drive`,
+//! and sends what `take_outgoing` returns.
+//!
+//! Only the PD (placement driver) uses Raft, to replicate cluster membership,
+//! the zone catalog, and range maps. Reads and writes of user data never go
+//! through consensus.
+
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;

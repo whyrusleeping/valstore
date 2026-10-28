@@ -50,8 +50,8 @@ minima, and regime changes were near-identical to the persistent arm.
 
 These replay findings are documented in:
 
-- [`bench/replay-lab/run-20260810T063959Z-tier-one/FINDINGS.md`](../bench/replay-lab/run-20260810T063959Z-tier-one/FINDINGS.md)
-- [`bench/replay-lab/run-20260810T083025Z-tier-nosync/FINDINGS.md`](../bench/replay-lab/run-20260810T083025Z-tier-nosync/FINDINGS.md)
+- `bench/replay-lab/run-20260810T063959Z-tier-one/FINDINGS.md`
+- `bench/replay-lab/run-20260810T083025Z-tier-nosync/FINDINGS.md`
 
 ### What the replay did not measure
 
@@ -69,7 +69,7 @@ remaining limit was per-core decode/merge/planning CPU rather than value
 placement. Clustering can still be valuable for device IOPS and mixed-workload
 serving budget, but the observed wall-time return is too small to justify a
 large write/recovery redesign without a workload-specific A/B. See
-[`bench/cocompact-box-notes.md`](../bench/cocompact-box-notes.md) and
+`bench/cocompact-box-notes.md` and
 [Ordered-scan performance](scan-performance.md).
 
 ## Mechanism 1: stable key sorting within `BatchApply`
