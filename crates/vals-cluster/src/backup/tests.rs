@@ -415,6 +415,15 @@ fn target_members() -> AddressedMembers {
     vec![(1, 1, vec!["127.0.0.1:9001".parse().unwrap()])]
 }
 
+fn restored_entries(backup: &Backup, voters: &[u64]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut entries =
+        crate::pd::restored_state(&backup.pd_state.entries, &target_members(), 42, lineage_of(&backup.manifest))
+            .unwrap();
+    entries.push(crate::pd::seed_voters_entry(voters));
+    entries.sort();
+    entries
+}
+
 #[test]
 fn restore_pd_seeds_a_pd_that_boots_with_a_new_incarnation_and_lineage() {
     let bk = small_backup("restore-pd");
@@ -454,6 +463,9 @@ fn restore_pd_seeds_a_pd_that_boots_with_a_new_incarnation_and_lineage() {
     let mut moved = target("other-address");
     moved.members[0].2 = vec!["127.0.0.1:9002".parse().unwrap()];
     assert_ne!(restore_pd(&bk.out, &moved, 42).unwrap().digest, restored.digest);
+    let mut grouped = target("other-voters");
+    grouped.voters = vec![1, 2, 3];
+    assert_ne!(restore_pd(&bk.out, &grouped, 42).unwrap().digest, restored.digest, "the voter set is part of the seed");
 
     let pd = PdDaemon::spawn_single_durable_bounded(1, 1 << 20, RingConfig { vnodes: 64, rf: 1 }, Vec::new(), &t.raft_dir)
         .unwrap();
@@ -466,7 +478,45 @@ fn restore_pd_seeds_a_pd_that_boots_with_a_new_incarnation_and_lineage() {
     assert_eq!(view.zones, bk.capture.view().zones);
     let backup = open_backup(&bk.out).unwrap();
     check_restored(&backup, &view).unwrap();
+    assert!(matches!(check_seed(&booted.entries), Ok(SeedStatus::Confirmed)), "a single-voter seed needs no confirmation");
     assert!(check_restored(&backup, &bk.capture.view()).unwrap_err().contains("lineage"));
+    let _ = std::fs::remove_dir_all(&bk.root);
+}
+
+#[test]
+fn load_and_compare_need_every_voter_to_confirm_the_same_restore_seed() {
+    let bk = small_backup("seed");
+    let backup = open_backup(&bk.out).unwrap();
+    let three = restored_entries(&backup, &[1, 2, 3]);
+    let with_acks = |acks: &[(u64, u32)]| {
+        let mut entries = three.clone();
+        entries.extend(acks.iter().map(|&(voter, digest)| crate::pd::seed_ack_entry(voter, digest)));
+        entries.sort();
+        entries
+    };
+    assert!(matches!(check_seed(&restored_entries(&backup, &[1])), Ok(SeedStatus::Confirmed)), "one voter cannot diverge");
+    match check_seed(&with_acks(&[(1, 7), (3, 7)])) {
+        Ok(SeedStatus::Waiting(why)) => assert!(why.contains("[2]"), "{why}"),
+        _ => panic!("a voter that has not confirmed keeps load waiting"),
+    }
+    assert!(matches!(check_seed(&with_acks(&[(1, 7), (2, 7), (3, 7)])), Ok(SeedStatus::Confirmed)));
+    let Err(diverged) = check_seed(&with_acks(&[(1, 7), (2, 8)])) else { panic!("differing seeds are refused") };
+    assert!(diverged.contains("voter 1 00000007") && diverged.contains("voter 2 00000008"), "{diverged}");
+    let unseeded = crate::pd::restored_state(&backup.pd_state.entries, &target_members(), 42, lineage_of(&backup.manifest))
+        .unwrap();
+    assert!(check_seed(&unseeded).unwrap_err().contains("no restore seed record"));
+
+    let restored = |entries: Vec<(Vec<u8>, Vec<u8>)>| PdStateCapture { applied: 50, term: 2, captured_unix_ms: 0, entries };
+    let compare = |capture: PdStateCapture| {
+        let mut cluster = FakeCluster { captures: VecDeque::from([capture.clone(), capture]), data: bk.data.clone(), rts: BTreeMap::new() };
+        compare_backup(&bk.out, &mut cluster, &mut |_| {})
+    };
+    assert!(compare(restored(with_acks(&[(1, 7), (2, 7), (3, 7)]))).is_ok());
+    assert!(compare(restored(with_acks(&[(1, 7), (2, 7)]))).unwrap_err().contains("have not confirmed"));
+    assert!(compare(restored(with_acks(&[(1, 7), (2, 7), (3, 9)]))).unwrap_err().contains("seeded differently"));
+    let mut captures = VecDeque::from([restored(with_acks(&[(1, 7), (2, 9), (3, 7)]))]);
+    let refused = load_backup(&bk.out, &mut || captures.pop_front().ok_or_else(|| "no capture".to_string()), &mut |_| {});
+    assert!(refused.unwrap_err().contains("seeded differently"), "load refuses before it writes anything");
     let _ = std::fs::remove_dir_all(&bk.root);
 }
 
@@ -474,9 +524,7 @@ fn restore_pd_seeds_a_pd_that_boots_with_a_new_incarnation_and_lineage() {
 fn compare_matches_exact_copies_tolerates_collected_tombstones_and_counts_differences() {
     let bk = small_backup("compare");
     let backup = open_backup(&bk.out).unwrap();
-    let entries =
-        crate::pd::restored_state(&backup.pd_state.entries, &target_members(), 42, lineage_of(&backup.manifest))
-            .unwrap();
+    let entries = restored_entries(&backup, &[1]);
     let restored = PdStateCapture { applied: 50, term: 2, captured_unix_ms: 0, entries };
     let compare = |data: BTreeMap<ZoneId, Vec<ReplicaPage>>| {
         let mut cluster = FakeCluster { captures: VecDeque::from([restored.clone(), restored.clone()]), data, rts: BTreeMap::new() };
@@ -652,9 +700,7 @@ fn backups_merge_every_replicas_range_tombstones_omit_covered_records_and_compar
     assert_eq!(held, vec![rt(Some("b"), Some("e"), v(5, 1)), rt(Some("w"), Some("y"), v(6, 1))]);
 
     let backup = open_backup(&out).unwrap();
-    let entries =
-        crate::pd::restored_state(&backup.pd_state.entries, &target_members(), 42, lineage_of(&backup.manifest))
-            .unwrap();
+    let entries = restored_entries(&backup, &[1]);
     let restored = PdStateCapture { applied: 50, term: 2, captured_unix_ms: 0, entries };
     let compare = |rts: BTreeMap<ZoneId, Vec<Vec<RtFragment>>>| {
         let mut cluster =

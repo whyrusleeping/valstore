@@ -103,6 +103,13 @@ pub fn run_pd(cfg: &PdConfig) -> Result<(PdDaemon, mpsc::Receiver<AdminReq>), Er
         }
     };
 
+    if let Some(digest) = crate::backup::read_restore_seed(&cfg.data_dir)? {
+        log::info!(
+            "pd {}: restored by restore-pd with state digest {digest:08x}; confirming it to the PD group",
+            cfg.pd_id
+        );
+        pd.confirm_restore_seed(digest);
+    }
     seed_boot_state(&pd, cfg);
     let admin_rx = admin::spawn_listener(&cfg.admin_socket)?;
     log::info!(

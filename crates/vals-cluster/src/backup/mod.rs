@@ -23,8 +23,8 @@ pub use export::{
     ReplicaPage, ReplicaSource, StaleCopies, ZonePlacement,
 };
 pub use restore::{
-    check_restored, compare_backup, lineage_of, load_backup, restore_pd, CompareReport, LoadReport,
-    RestoreTarget, RestoredPd, ZoneComparison,
+    check_restored, check_seed, compare_backup, lineage_of, load_backup, restore_pd, CompareReport, LoadReport,
+    RestoreTarget, RestoredPd, SeedStatus, ZoneComparison,
 };
 
 pub const FORMAT_VERSION: u32 = 1;

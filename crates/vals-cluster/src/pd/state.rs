@@ -44,6 +44,7 @@ pub(crate) enum PdCmd {
     EnableOpaque(BalanceMapUpgrade),
     AbortRehome(ZoneId, Vec<u8>),
     CommitRehome(ZoneId, Vec<u8>),
+    RestoreSeed(u32),
     Shutdown,
 }
 

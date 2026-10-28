@@ -597,3 +597,137 @@ fn a_former_owner_copy_whose_delete_aged_out_is_neither_backed_up_nor_restored()
     assert_eq!(run(coord.read_in(sessions, &fresh)).unwrap().and_then(|s| s.value), Some(b"fresh".to_vec()));
     drop(target);
 }
+
+struct PdGroup {
+    dir: PathBuf,
+    nodes: Vec<Child>,
+    pds: Vec<Child>,
+}
+
+impl PdGroup {
+    fn write_configs(dir: &Path, data_addrs: &[SocketAddr], raft_addrs: &[SocketAddr]) {
+        write_configs(dir, data_addrs);
+        let data_nodes: String =
+            (1..=3usize).map(|id| format!("data_node = {id} @ {}\n", data_addrs[id - 1])).collect();
+        let peers: String = (1..=3usize).map(|p| format!("pd_peer = {p} @ {}\n", raft_addrs[p - 1])).collect();
+        for id in 1..=3usize {
+            std::fs::write(
+                dir.join(format!("pd{id}.conf")),
+                format!(
+                    "pd_id = {id}\ndata_dir = pd{id}\nlisten = {}\n{peers}{data_nodes}rf = 3\nvnodes = 64\n\
+                     zone = events 2 sorted\nadmin_socket = pd{id}.sock\nsecret_file = secret\n",
+                    raft_addrs[id - 1]
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    fn seed(dir: &Path, bk: &str, incarnations: [&str; 3]) {
+        for (id, incarnation) in (1..=3).zip(incarnations) {
+            let conf = dir.join(format!("pd{id}.conf"));
+            let seeded = ok(
+                &valsd(&["backup", "restore-pd", "-c", conf.to_str().unwrap(), "--incarnation", incarnation, bk]),
+                "restore-pd",
+            );
+            assert!(seeded.contains("state digest"), "{seeded}");
+            assert!(dir.join(format!("pd{id}/restore-seed")).exists(), "restore-pd records the seed it wrote");
+        }
+    }
+
+    fn launch(dir: &Path, data_addrs: &[SocketAddr]) -> PdGroup {
+        let nodes = (1..=3).map(|id| spawn("node", &dir.join(format!("node{id}.conf")))).collect();
+        let pds = (1..=3).map(|id| spawn("pd", &dir.join(format!("pd{id}.conf")))).collect();
+        for &addr in data_addrs {
+            wait_listening(addr);
+        }
+        PdGroup { dir: dir.to_path_buf(), nodes, pds }
+    }
+
+    fn leader_sock(&self) -> String {
+        eventually("a PD leader", || {
+            (1..=3).map(|id| self.dir.join(format!("pd{id}.sock"))).find(|sock| {
+                UnixStream::connect(sock).is_ok() && admin(sock, "status").contains("role=leader")
+            })
+        })
+        .to_str()
+        .unwrap()
+        .to_string()
+    }
+
+    fn stop_all(&mut self) {
+        for child in self.nodes.drain(..).chain(self.pds.drain(..)) {
+            stop(child);
+        }
+    }
+}
+
+impl Drop for PdGroup {
+    fn drop(&mut self) {
+        self.stop_all();
+    }
+}
+
+#[test]
+fn a_three_pd_restore_refuses_voters_seeded_differently_and_loads_identical_seeds() {
+    let mut source = Cluster::start("restore3-source");
+    let Populated { events, .. } = populate(&source);
+    let bk = source.dir.join("bk");
+    let bk_arg = bk.to_str().unwrap().to_string();
+    ok(&valsd(&["backup", "create", "-s", source.admin_sock.to_str().unwrap(), "--out", &bk_arg]), "backup create");
+    let expected = read_backup(&bk);
+    source.stop_all();
+
+    let dir = std::env::temp_dir().join(format!("valsd-restore3-target-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let data_addrs: Vec<SocketAddr> = (0..3).map(|_| free_addr()).collect();
+    let raft_addrs: Vec<SocketAddr> = (0..3).map(|_| free_addr()).collect();
+    PdGroup::write_configs(&dir, &data_addrs, &raft_addrs);
+    let unseeded = valsd(&["backup", "restore-pd", "-c", dir.join("pd1.conf").to_str().unwrap(), &bk_arg]);
+    assert!(String::from_utf8_lossy(&unseeded.stdout).contains("--incarnation"), "a voter group needs one incarnation");
+    let a = "0123456789abcdef0123456789abcdef";
+    let b = "fedcba9876543210fedcba9876543210";
+    PdGroup::seed(&dir, &bk_arg, [a, a, b]);
+    let mut group = PdGroup::launch(&dir, &data_addrs);
+    let leader = group.leader_sock();
+    for what in ["load", "compare"] {
+        let refused = eventually("the divergent voter's confirmation", || {
+            let out = valsd(&["backup", what, "-s", &leader, &bk_arg]);
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            stdout.contains("seeded differently").then_some((out.status.code(), stdout))
+        });
+        assert_eq!(refused.0, Some(1), "{what}: {}", refused.1);
+        assert!(refused.1.contains("--incarnation"), "{what} says how to reseed: {}", refused.1);
+    }
+    eventually("the PD group reports the divergence itself", || {
+        let logs: String =
+            (1..=3).map(|id| std::fs::read_to_string(dir.join(format!("pd{id}.log"))).unwrap_or_default()).collect();
+        logs.contains("hold divergent PD state").then_some(())
+    });
+
+    group.stop_all();
+    for name in ["pd1", "pd2", "pd3", "node1", "node2", "node3"] {
+        std::fs::remove_dir_all(dir.join(name)).unwrap();
+    }
+    PdGroup::seed(&dir, &bk_arg, [a, a, a]);
+    group = PdGroup::launch(&dir, &data_addrs);
+    let leader = group.leader_sock();
+    assert!(admin(Path::new(&leader), "status").contains(&format!("incarnation={a}")));
+    ok(&valsd(&["backup", "load", "-s", &leader, &bk_arg]), "backup load");
+    let compared = ok(&valsd(&["backup", "compare", "-s", &leader, &bk_arg]), "backup compare");
+    assert!(compared.contains("target matches"), "{compared}");
+    let peers: Vec<(u32, SocketAddr)> = (1..=3u32).map(|id| (id, data_addrs[id as usize - 1])).collect();
+    let mut ring = Ring::new(3);
+    ring.set_members_weighted([(1, 1), (2, 1), (3, 1)]);
+    let coord = Coordinator::new(100, ring, 2, NetTransport::connect(&peers).with_rpc_deadline(Duration::from_secs(2)));
+    eventually("restored catalog", || {
+        run(coord.refresh_catalog(1)).ok()?;
+        (coord.catalog().by_name("events") == Some(events)).then_some(())
+    });
+    for (key, (_, value)) in &expected[&events] {
+        let got = run(coord.read_in(events, key)).unwrap().and_then(|stored| stored.value);
+        assert_eq!(&got, value, "key {}", String::from_utf8_lossy(key));
+    }
+    drop(group);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -42,6 +42,78 @@ fn decode_lineage(value: &[u8]) -> Option<Lineage> {
     })
 }
 
+const SEED_VALUE_VERSION: u8 = 1;
+
+fn seed_voters_key() -> Vec<u8> {
+    vec![b'W']
+}
+
+pub(super) fn seed_ack_key(id: u64) -> Vec<u8> {
+    let mut key = vec![b'A'];
+    key.extend_from_slice(&id.to_le_bytes());
+    key
+}
+
+fn seed_ack_id_of_key(key: &[u8]) -> Option<u64> {
+    if key.len() == 9 && key[0] == b'A' {
+        Some(u64::from_le_bytes(key[1..].try_into().ok()?))
+    } else {
+        None
+    }
+}
+
+pub fn seed_voters_entry(voters: &[u64]) -> (Vec<u8>, Vec<u8>) {
+    let mut value = Vec::with_capacity(5 + 8 * voters.len());
+    value.push(SEED_VALUE_VERSION);
+    value.extend_from_slice(&(voters.len() as u32).to_le_bytes());
+    for id in voters {
+        value.extend_from_slice(&id.to_le_bytes());
+    }
+    (seed_voters_key(), value)
+}
+
+fn decode_seed_voters(value: &[u8]) -> Option<Vec<u64>> {
+    let (&version, rest) = value.split_first()?;
+    let count = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+    let ids = &rest[4..];
+    if version != SEED_VALUE_VERSION || ids.len() != count.checked_mul(8)? {
+        return None;
+    }
+    Some(ids.chunks_exact(8).map(|id| u64::from_le_bytes(id.try_into().expect("8 bytes"))).collect())
+}
+
+pub(crate) fn seed_ack_entry(id: u64, digest: u32) -> (Vec<u8>, Vec<u8>) {
+    let mut value = vec![SEED_VALUE_VERSION];
+    value.extend_from_slice(&digest.to_le_bytes());
+    (seed_ack_key(id), value)
+}
+
+pub(super) fn decode_seed_ack(value: &[u8]) -> Option<u32> {
+    match value {
+        [SEED_VALUE_VERSION, digest @ ..] => Some(u32::from_le_bytes(digest.try_into().ok()?)),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RestoreSeed {
+    pub voters: Vec<u64>,
+    pub acks: BTreeMap<u64, Option<u32>>,
+}
+
+pub fn restore_seed_of(entries: &[(Vec<u8>, Vec<u8>)]) -> Option<RestoreSeed> {
+    let mut seed = None;
+    let mut acks = BTreeMap::new();
+    for (key, value) in entries {
+        if *key == seed_voters_key() {
+            seed = Some(decode_seed_voters(value).unwrap_or_default());
+        } else if let Some(id) = seed_ack_id_of_key(key) {
+            acks.insert(id, decode_seed_ack(value));
+        }
+    }
+    seed.map(|voters| RestoreSeed { voters, acks })
+}
+
 pub fn view_state(entries: &[(Vec<u8>, Vec<u8>)]) -> PdStateView {
     let map: BTreeMap<&[u8], &[u8]> =
         entries.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
@@ -93,10 +165,10 @@ pub fn restored_state(
     if let Some((node, _, _)) = members.iter().find(|(_, _, addrs)| addrs.is_empty()) {
         return Err(format!("target data node {node} has no data address"));
     }
-    let skip = [balance_lock_key(), incarnation_key(), lineage_key()];
+    let skip = [balance_lock_key(), incarnation_key(), lineage_key(), seed_voters_key()];
     let mut out = BTreeMap::new();
     for (key, value) in entries {
-        if skip.contains(key) || pd_peer_id_of_key(key).is_some() {
+        if skip.contains(key) || pd_peer_id_of_key(key).is_some() || seed_ack_id_of_key(key).is_some() {
             continue;
         }
         let value = if let Ok(id) = <[u8; 4]>::try_from(key.as_slice()) {

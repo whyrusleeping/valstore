@@ -521,6 +521,15 @@ impl<D: BlockDevice> PlacementDriver<D> {
         })
     }
 
+    pub(super) fn restore_seed_ack(&self, id: u64) -> Option<u32> {
+        self.state_value(&super::snapshot::seed_ack_key(id)).and_then(|value| super::snapshot::decode_seed_ack(&value))
+    }
+
+    pub(super) fn propose_restore_seed_ack(&mut self, digest: u32) -> Result<(), PartitionError> {
+        let (key, value) = super::snapshot::seed_ack_entry(self.id(), digest);
+        self.partition.propose(&Command::Put(key, value))
+    }
+
     pub(super) fn state_capacity(&self) -> Option<(usize, usize, usize)> {
         self.partition.state_capacity().map(|capacity| {
             (capacity, self.partition.state_usage(), self.partition.state_reserved())

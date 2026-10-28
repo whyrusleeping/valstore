@@ -233,6 +233,7 @@ fn restore_pd(config: &str, incarnation: Option<u128>, dir: &Path) -> Result<Str
         opaque_range_maps: placement.opaque_range_maps,
     };
     let restored = backup::restore_pd(dir, &target, incarnation)?;
+    write_restore_seed(&cfg.data_dir, &restored)?;
     Ok(format!(
         "restored pd {} into {} from backup {:032x}: incarnation {:032x} (predecessor {:032x}), index {} term {}, \
          {} entries, state digest {:08x}",
@@ -246,6 +247,43 @@ fn restore_pd(config: &str, incarnation: Option<u128>, dir: &Path) -> Result<Str
         restored.entries,
         restored.digest,
     ))
+}
+
+pub const RESTORE_SEED_FILE: &str = "restore-seed";
+const RESTORE_SEED_HEADER: &str = "vals-restore-seed 1";
+
+fn write_restore_seed(data_dir: &Path, restored: &backup::RestoredPd) -> Result<(), String> {
+    use std::io::Write;
+    let text = format!(
+        "{RESTORE_SEED_HEADER}\ndigest {:08x}\nbackup_id {:032x}\nincarnation {:032x}\nindex {}\n",
+        restored.digest, restored.backup_id, restored.incarnation, restored.index
+    );
+    let path = data_dir.join(RESTORE_SEED_FILE);
+    let staging = data_dir.join(format!(".{RESTORE_SEED_FILE}.tmp"));
+    let mut file = std::fs::File::create(&staging).map_err(|e| format!("create {}: {e}", staging.display()))?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("write {}: {e}", staging.display()))?;
+    std::fs::rename(&staging, &path).map_err(|e| format!("rename {}: {e}", path.display()))?;
+    std::fs::File::open(data_dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| format!("sync {}: {e}", data_dir.display()))
+}
+
+pub fn read_restore_seed(data_dir: &Path) -> Result<Option<u32>, String> {
+    let path = data_dir.join(RESTORE_SEED_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let mut lines = text.lines();
+    let digest = (lines.next() == Some(RESTORE_SEED_HEADER))
+        .then(|| lines.find_map(|line| line.strip_prefix("digest ")))
+        .flatten()
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        .ok_or_else(|| format!("{} is not a restore seed record written by restore-pd", path.display()))?;
+    Ok(Some(digest))
 }
 
 fn load(socket: &str, dir: &Path) -> Result<String, String> {

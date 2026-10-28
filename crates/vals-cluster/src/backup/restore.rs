@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use crate::partition::RangeMap;
 use crate::pd::{
-    placement_equivalent, restored_state, without_pending, AddressedMembers, Lineage, PdStateView,
+    placement_equivalent, restore_seed_of, restored_state, seed_voters_entry, without_pending, AddressedMembers,
+    Lineage, PdStateView,
 };
 use vals_store::range_tombstone::FragmentSet;
 
@@ -102,7 +103,13 @@ pub fn restore_pd(dir: &Path, target: &RestoreTarget, incarnation: u128) -> Resu
         );
     }
     let lineage = lineage_of(manifest);
-    let entries = restored_state(&backup.pd_state.entries, &target.members, incarnation, lineage)?;
+    let mut entries = restored_state(&backup.pd_state.entries, &target.members, incarnation, lineage)?;
+    let mut voters = target.voters.clone();
+    voters.sort_unstable();
+    voters.dedup();
+    let seed = seed_voters_entry(&voters);
+    let at = entries.partition_point(|(key, _)| *key < seed.0);
+    entries.insert(at, seed);
     let index = backup.pd_state.applied.max(1);
     let term = backup.pd_state.term.max(1);
     let encoded = PdStateCapture { applied: index, term, captured_unix_ms: 0, entries: entries.clone() }.encode();
@@ -160,6 +167,50 @@ pub fn check_restored(backup: &Backup, target: &PdStateView) -> Result<(), Strin
         }
     }
     Ok(())
+}
+
+#[derive(Debug)]
+pub enum SeedStatus {
+    Confirmed,
+    Waiting(String),
+}
+
+pub fn check_seed(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<SeedStatus, String> {
+    let Some(seed) = restore_seed_of(entries) else {
+        return Err("the target PD state holds no restore seed record (`W`); it was seeded by a build that \
+                    predates seed confirmation: stop every PD voter, empty each PD data_dir and rerun restore-pd \
+                    with this build"
+            .into());
+    };
+    if seed.voters.len() <= 1 {
+        return Ok(SeedStatus::Confirmed);
+    }
+    let digests: BTreeSet<Option<u32>> = seed.acks.values().copied().collect();
+    if digests.len() > 1 || digests.contains(&None) {
+        let acks: Vec<String> = seed
+            .acks
+            .iter()
+            .map(|(voter, digest)| match digest {
+                Some(digest) => format!("voter {voter} {digest:08x}"),
+                None => format!("voter {voter} undecodable"),
+            })
+            .collect();
+        return Err(format!(
+            "the target PD voters were seeded differently by restore-pd (state digests: {}), so they hold \
+             divergent PD state: stop every voter, empty each PD data_dir and rerun restore-pd on every voter \
+             with the same backup, --incarnation and data_node lines",
+            acks.join(", ")
+        ));
+    }
+    let missing: Vec<u64> = seed.voters.iter().copied().filter(|voter| !seed.acks.contains_key(voter)).collect();
+    if missing.is_empty() {
+        return Ok(SeedStatus::Confirmed);
+    }
+    Ok(SeedStatus::Waiting(format!(
+        "PD voter(s) {missing:?} of {:?} have not confirmed their restore seed (each voter confirms once it \
+         runs with the `restore-seed` file restore-pd wrote into its data_dir and the group has a leader)",
+        seed.voters
+    )))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -419,9 +470,19 @@ pub fn load_backup(
 ) -> Result<LoadReport, String> {
     let backup = open_backup(dir)?;
     let manifest = &backup.manifest;
-    let first = capture()?;
+    let mut first = capture()?;
+    check_restored(&backup, &first.view())?;
+    let deadline = Instant::now() + ADOPT_WAIT;
+    while let SeedStatus::Waiting(waiting) = check_seed(&first.entries)? {
+        if Instant::now() >= deadline {
+            return Err(format!("{waiting}; waited {ADOPT_WAIT:?}"));
+        }
+        log::debug!("backup load: {waiting}");
+        std::thread::sleep(Duration::from_millis(500));
+        first = capture()?;
+        check_restored(&backup, &first.view())?;
+    }
     let view = first.view();
-    check_restored(&backup, &view)?;
     let ring = (manifest.ring_vnodes, manifest.ring_rf);
     let transport =
         NetTransport::connect_sharded(view.members.iter().map(|(node, _, addrs)| (*node, addrs.clone())));
@@ -639,6 +700,9 @@ pub fn compare_backup(
     let first = cluster.capture()?;
     let view = first.view();
     check_restored(&backup, &view)?;
+    if let SeedStatus::Waiting(waiting) = check_seed(&first.entries)? {
+        return Err(waiting);
+    }
     let ring = cluster.ring(&view.members)?;
     if ring != (manifest.ring_vnodes, manifest.ring_rf) {
         return Err(format!(

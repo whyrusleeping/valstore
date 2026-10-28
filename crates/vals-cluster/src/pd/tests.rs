@@ -6360,7 +6360,10 @@
         entries.push((range_map_key(zone + 1), legacy.encode()));
         entries.push((pd_peer_key(4), encode_pd_peer(&PdPeerRecord::Member(old))));
         entries.push((pd_peer_key(3), encode_pd_peer(&PdPeerRecord::Retired { replaced_by: 4 })));
+        entries.push(seed_voters_entry(&[1, 2, 3]));
+        entries.push(seed_ack_entry(2, 7));
         entries.sort();
+        assert!(restore_seed_of(&entries).is_some());
         let source = view_state(&entries);
         assert_eq!(source.range_maps[&zone].active_rehomes(), 1);
         assert_eq!(source.range_maps[&(zone + 1)].active_rehomes(), 1);
@@ -6381,6 +6384,7 @@
         assert!(!restored.iter().any(|(key, _)| *key == balance_lock_key()));
         assert!(!restored.iter().any(|(key, _)| pd_peer_id_of_key(key).is_some()),
             "the source PD group's replica records do not describe the restored group");
+        assert_eq!(restore_seed_of(&restored), None, "the source group's restore seed records are dropped");
         assert!(restored.windows(2).all(|pair| pair[0].0 < pair[1].0));
 
         let wrong_weight = restored_state(&entries, &vec![(1, 1, vec![new])], 9, lineage).unwrap_err();

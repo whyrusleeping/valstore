@@ -847,6 +847,14 @@ restore lineage under PD raft key `L` (one byte, never a 4-byte member key):
 A restore of a restored cluster replaces it. Nothing reads it but `valsd backup
 load|compare`, which refuse a target whose lineage does not name the backup.
 
+A restored PD also holds the restore seed. Key `W` is
+`[u8 version=1][u32 n][n × u64 PD id]`, the voter set restore-pd seeded
+(sorted). Key `A` + u64 LE PD id (9 bytes) is `[u8 version=1][u32 digest]`.
+Each voter writes its own `A` key through Raft while it runs with a
+`restore-seed` file (§3.7). `valsd backup load|compare` need an `A` key from
+every voter in `W` (unless `W` lists only one voter), and all of them must
+carry the same digest. A restore drops the `W` and `A` keys of its source.
+
 ### 3.7 Backup directory (`valsd backup`, `vals-cluster/src/backup`)
 
 A backup is a directory (contract: [`backup-restore.md`](backup-restore.md)).
@@ -919,8 +927,13 @@ the raft storage files under `<data_dir>/raft` hold one snapshot at index
 and an empty log. Its data is the `pd-state` key/values, except that member
 values carry the target `data_node` addresses (ids and weights unchanged), the
 balance lock `B` and every PD replica record `V…` are dropped, every pending
-re-home target is cleared, `I` holds a new incarnation and `L` the lineage
-(§3.6).
+re-home target is cleared, `I` holds a new incarnation, `L` the lineage and
+`W` the seeded voter set (§3.6). The printed state digest is the CRC-32C of
+the snapshot data encoded as a `pd-state` file, without its trailing CRC. It
+is also written to `<data_dir>/restore-seed`, a UTF-8 text file:
+`vals-restore-seed 1`, then the lines `digest <8 hex>`, `backup_id <32 hex>`,
+`incarnation <32 hex>` and `index <u64>`. A PD that finds this file at start
+confirms the digest to its group (key `A`, §3.6).
 
 ---
 

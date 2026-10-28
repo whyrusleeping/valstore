@@ -32,6 +32,7 @@ mod netqueue;
 use netqueue::*;
 mod rtdiag;
 mod graph;
+mod backupdrill;
 
 fn node_settings() -> &'static vals_cluster::node_settings::NodeSettings {
     static SETTINGS: std::sync::OnceLock<vals_cluster::node_settings::NodeSettings> = std::sync::OnceLock::new();
@@ -394,6 +395,9 @@ fn main() {
         }
         "rtdiag" => {
             rtdiag::workload_rtdiag(&args)
+        }
+        "backupdrill" => {
+            backupdrill::workload_backupdrill(&args)
         }
         "pipewrite" => {
             workload_pipewrite(n, vsize, batch)

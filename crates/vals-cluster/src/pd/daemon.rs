@@ -96,6 +96,53 @@ fn incarnation_warn_due() -> bool {
     true
 }
 
+pub(super) struct SeedConfirmation {
+    digest: u32,
+    next_check: std::time::Instant,
+    confirmed: bool,
+    reported: BTreeSet<u64>,
+}
+
+impl SeedConfirmation {
+    pub(super) fn new(digest: u32) -> SeedConfirmation {
+        SeedConfirmation { digest, next_check: std::time::Instant::now(), confirmed: false, reported: BTreeSet::new() }
+    }
+}
+
+pub(super) fn confirm_restore_seed<D: BlockDevice>(pd: &mut PlacementDriver<D>, seed: &mut Option<SeedConfirmation>) {
+    let Some(seed) = seed.as_mut() else { return };
+    let now = std::time::Instant::now();
+    if now < seed.next_check {
+        return;
+    }
+    seed.next_check = now + Duration::from_secs(1);
+    if pd.restore_seed_ack(pd.id()) != Some(seed.digest) {
+        if pd.partition.leader_id().is_some() {
+            if let Err(e) = pd.propose_restore_seed_ack(seed.digest) {
+                log::debug!("pd: restore seed confirmation proposal failed (retried): {e}");
+            }
+        }
+        return;
+    }
+    if !seed.confirmed {
+        seed.confirmed = true;
+        log::info!("pd {}: confirmed restore seed digest {:08x} to the PD group", pd.id(), seed.digest);
+    }
+    for voter in pd.pd_voters().0 {
+        match pd.restore_seed_ack(voter) {
+            Some(digest) if digest != seed.digest && seed.reported.insert(voter) => log::error!(
+                "pd {}: PD voter {voter} was seeded by restore-pd with state digest {digest:08x}, this one with \
+                 {:08x}; the voters hold divergent PD state, and backup load and compare refuse this PD group: \
+                 stop every voter, empty each PD data_dir and rerun restore-pd on every voter with the same \
+                 backup, --incarnation and data_node lines",
+                pd.id(),
+                seed.digest
+            ),
+            _ => {}
+        }
+    }
+}
+
 fn publish_incarnation(
     state: &Mutex<PushState>,
     incarnation: Option<u128>,
@@ -1179,6 +1226,7 @@ impl PdDaemon {
                         Ok(PdCmd::CommitRehome(id, at)) => {
                             pending_range_ops.push((id, at, RangeOpKind::CommitRehome))
                         }
+                        Ok(PdCmd::RestoreSeed(_)) => {}
                         Err(TryRecvError::Empty) => break,
                         Err(TryRecvError::Disconnected) => break 'drive,
                     }
@@ -1681,6 +1729,7 @@ impl PdDaemon {
             let mut head_op_stall_key: Option<(ZoneId, Vec<u8>)> = None;
             let mut incarnation_minted_through: u64 = 0;
             let mut last_incarnation: Option<u128> = None;
+            let mut seed_confirmation: Option<SeedConfirmation> = None;
             let mut last_tick = std::time::Instant::now();
             'drive: loop {
                 loop {
@@ -1761,6 +1810,9 @@ impl PdDaemon {
                         Ok(PdCmd::CommitRehome(id, at)) => {
                             pending_range_ops.push((id, at, RangeOpKind::CommitRehome))
                         }
+                        Ok(PdCmd::RestoreSeed(digest)) => {
+                            seed_confirmation = Some(SeedConfirmation::new(digest));
+                        }
                         Err(TryRecvError::Empty) => break,
                         Err(TryRecvError::Disconnected) => break 'drive,
                     }
@@ -1774,6 +1826,7 @@ impl PdDaemon {
                 drive_step(&mut pd, &mut last_tick);
                 settle_admin(&mut pd, &mut admin_waits, &mut reads, &mut pending_range_ops);
                 ensure_incarnation(&mut pd, &mut incarnation_minted_through);
+                confirm_restore_seed(&mut pd, &mut seed_confirmation);
                 if peer_conf_version != Some(pd.partition.conf_version()) {
                     peer_conf_version = Some(pd.partition.conf_version());
                     peer_addr = resolve_pd_peers(&pd, &config_peers);
@@ -2287,6 +2340,10 @@ impl PdDaemon {
         let (tx, rx) = mpsc::channel();
         self.cmd.send(PdCmd::Status(tx)).ok()?;
         rx.recv_timeout(Duration::from_secs(1)).ok()
+    }
+
+    pub fn confirm_restore_seed(&self, digest: u32) {
+        let _ = self.cmd.send(PdCmd::RestoreSeed(digest));
     }
 
     pub fn inspect(&self) -> Option<PdInspection> {

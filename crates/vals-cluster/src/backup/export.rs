@@ -21,6 +21,7 @@ const MAX_RESPONSE_FRAME: usize = 64 << 20;
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_RETRY_FOR: Duration = Duration::from_secs(120);
+const ERROR_RETRIES: u32 = 3;
 
 pub type ReplicaPage = Vec<(Vec<u8>, Stored)>;
 
@@ -422,9 +423,18 @@ impl NetReplicaSource {
     fn request(&mut self, req: &Request) -> Result<Response, String> {
         let deadline = Instant::now() + self.retry_for;
         let mut backoff = Duration::from_millis(20);
+        let mut errors = 0;
         loop {
             let failure = match self.try_request(req) {
                 Ok(Response::Busy) => "busy".to_string(),
+                Ok(Response::Err(e)) if errors < ERROR_RETRIES && Instant::now() < deadline => {
+                    errors += 1;
+                    log::warn!(
+                        "backup: {}: the replica failed a read: {e}; retrying ({errors} of {ERROR_RETRIES})",
+                        self.label()
+                    );
+                    e
+                }
                 Ok(Response::Err(e)) => return Err(format!("{}: {e}", self.label())),
                 Ok(response) => return Ok(response),
                 Err(e) => {

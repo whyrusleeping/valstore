@@ -38,9 +38,12 @@ pub use cleanup_gate::{check_membership_change, MembershipChange};
 pub use driver::{AddressedMembers, PlacementDriver, RingConfig};
 pub use settings::{PdPlacementOverrides, PdPlacementSettings};
 pub use snapshot::{
-    placement_equivalent, restored_state, view_state, without_pending, Lineage, PdStateView,
+    placement_equivalent, restore_seed_of, restored_state, seed_voters_entry, view_state, without_pending,
+    Lineage, PdStateView, RestoreSeed,
 };
 pub use state::{AdminMutation, AdminOutcome, PdDaemon, PdInspection, PdStatus, SplitMode};
+#[cfg(test)]
+pub(crate) use snapshot::seed_ack_entry;
 pub(crate) use balance::{BalanceMapUpgrade, BalancePollAuthority, BalanceProposal};
 #[cfg(test)]
 pub(crate) use range_policy::range_stats_poll;

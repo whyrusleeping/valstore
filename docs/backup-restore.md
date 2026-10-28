@@ -194,14 +194,19 @@ Not captured:
 
 ## Limits and evidence
 
-- Validated by local tests only (file backend, loopback, small data). There
-  has been no SPDK or hardware run, and backup throughput is unmeasured.
+- Qualified once on hardware together with the restore (task 0511, see
+  [Hardware qualification](#hardware-qualification)): 4.85 million records,
+  2.27 GB, in 310 s. Everything else is covered by local tests (file backend,
+  loopback, small data).
 - The tool pulls replicas one request at a time from a single thread, with
   two round trips per page per replica shard, and reads every replica (RF×
   read amplification). It has no rate limit of its own. The node-side digest
   serving is bounded (an overloaded node answers `Busy`, which the tool retries
   for up to 120 s per request), but a large backup adds read load for its
-  whole duration.
+  whole duration. A replica that fails a read (for example, it detects a
+  checksum mismatch and refuses to serve the page) is asked again up to 3
+  times, each logged as a warning, before `create` or `compare` fails. The
+  retry never accepts unverified data.
 - Memory: for each replica shard the tool holds one digest page of keys (at
   most 8 MiB) plus the values of at most 256 keys.
 - Every member must answer. There is no partial backup with a node down. When
@@ -250,9 +255,19 @@ way.
    prints the new incarnation and a state digest. For a three-PD target, run
    it on every voter with the same `--incarnation <32 hex digits>` (restore-pd
    refuses a multi-voter config without one and suggests a fresh value) and
-   identical `data_node` lines, check that every voter printed the same digest,
-   and only then start any voter: voters seeded differently would diverge
-   silently. Start the PD(s), then the data nodes.
+   identical `data_node` lines, and check that every voter printed the same
+   digest before you start any voter. Start the PD(s), then the data nodes.
+
+   Voters seeded differently would hold divergent PD state, so the restored
+   group checks this itself. restore-pd also writes the digest to
+   `<data_dir>/restore-seed`, and records the voter set in the seeded state.
+   Each running voter confirms its own digest to the group through Raft.
+   `load` waits up to 120 s until every voter has confirmed. It refuses a group
+   whose voters confirmed different digests, and so does `compare`. Each voter
+   also logs an error naming the voter whose digest differs. To recover, stop
+   every voter, empty each PD `data_dir` and seed them all again. A voter
+   started without its `restore-seed` file, or seeded by an older build, never
+   confirms, so `load` refuses that group too.
 5. **Load the data:**
 
    ```
@@ -309,13 +324,27 @@ error.
 
 ### Limits and evidence
 
-- Validated by local tests only (file backend, loopback, one PD, three
-  nodes, small data), including a drill test that backs up a cluster, stops
-  it, restores it into empty nodes on new addresses, loads, compares, reads
-  every key through a client, restarts the old PD with its push targets
-  pointed at the target nodes and checks that they refuse it. There has been
-  no SPDK, three-PD or hardware drill, and load and compare throughput are
-  unmeasured.
+- One hardware drill qualifies the whole procedure: three voting PDs and three
+  SPDK data nodes, with `gc_grace = 0s` (see
+  [Hardware qualification](#hardware-qualification)). Local tests cover the
+  rest: the file backend, loopback, small data. One test backs up a cluster,
+  stops it, restores it into empty nodes on new addresses, loads, compares and
+  reads every key through a client. It then restarts the old PD with its push
+  targets pointed at the target nodes and checks that they refuse it. Another
+  test seeds three PD voters, two of them with one incarnation and the third
+  with another, and checks that `load` and `compare` refuse that group. A
+  third test reseeds all three voters identically and checks that the restore
+  then succeeds.
+- **Tombstone GC on the target (`gc_grace > 0`) is not qualified.** Such a
+  node refuses a put older than its own newest data minus `gc_grace`, even
+  from `load`. A backup whose data spans more than `gc_grace` may therefore
+  fail to load. The error then blames clock skew, which is misleading. This is
+  open as backlog task 0517, together with the same limit on anti-entropy fill
+  and re-home copies.
+- **Former-owner copies.** A put held only by a node that no longer owns the
+  key is fenced as described in the
+  [Consistency contract](#consistency-contract). That protection rests on the
+  assumptions listed there, and they apply to the restored cluster as well.
 - `load` runs one batch at a time from a single thread with no rate limit,
   and writes RF× the backup's records. `compare` costs the same as `create`.
 - Every target node must be reachable and must stay so for the whole load.
@@ -327,8 +356,85 @@ error.
   until compare passes.
 - Hint backlogs, node-local files and configs are not restored (they are not
   in the backup).
+- **Capacity.** The backup host needs free space for the backup, about the
+  logical size of the newest version of every key (2.27 GB for 4.85 million
+  records of 64 to 1,024 bytes in the drill). Each target node needs at least
+  the capacity of the source node it replaces; a freshly loaded target uses
+  less space than the source did, because it holds no overwritten versions.
+  `create` and `compare` each used about 270 MB of RAM, and `load` about 15 MB.
 - **Format compatibility.** Backups are written as zone-file version 2 (which
   carries range tombstones) whether or not a zone holds any. Builds that
   predate version 2 refuse such files in `verify`, `load` and `compare`, so
   restore a backup with a build at least as new as the one that wrote it.
   Current builds still load version 1 files.
+
+## Hardware qualification
+
+Task 0511 qualified backup and restore once on lab hardware (2026-10-28). The
+`valsd` binary was built from the source of the commit that added this
+section. That source differed from the commit only in documentation and in
+the benchmark client. The run measured backup and restore only. It is not the
+`valsd` ingest soak and says nothing about ingest throughput.
+
+**Setup.** Three hosts (lab-1, lab-2, lab-3), each running one voting PD and
+one SPDK data node: one NVMe drive, 8 shards, 10 GbE. The ring used RF 3 with
+128 vnodes, opaque-token range maps and `gc_grace = 0s`. The drill used the
+same drives for the source and the target in sequence. It took the backup and
+checked it, kept the backup on every host and the source PD data aside, then
+reprovisioned the drives empty.
+
+**Data.** Four zones: the default zone (RF 3, unsorted), `bd_unsorted` (RF 2),
+`bd_sorted` (RF 3, sorted, 16 ranges) and a probe zone (RF 3, sorted). Each of
+the first three zones held 1.5 million keys with values of 64 to 1,024 bytes.
+A third of the keys were overwritten and a seventh point-deleted. The sorted
+zone also took 150 range deletes, and some keys under them were written again
+afterwards. In total the backup held 4,852,957 records (640,716 of them
+tombstones), 150 range tombstones and 2.27 GB.
+
+| Step | Result |
+|---|---|
+| `create` on the PD leader, under a probe load | 310 s, about 15,600 records/s (7.3 MB/s), 263 MiB peak RSS |
+| `verify` | 1.3 s, on each of the three hosts |
+| `restore-pd` on 3 voters, same `--incarnation` | identical digest on all three; the group confirmed it |
+| `load` | killed with SIGKILL after the first zone, then run again: 94.6 s, about 51,000 records/s written to every replica, 14 MiB RSS |
+| `compare` | 203.5 s, every record and range tombstone equal |
+| Client check | each of the 4.5 million model keys read back, deleted keys absent; the sorted zone scanned in full |
+| Old source PD group started against the target nodes | all three nodes refused its pushes; a zone it created never reached them |
+| Full restart of the restored cluster | up in 8.4 s; the client check and `compare` passed again |
+
+**Recovery time.** From the first `restore-pd` to a passing `compare` took 341
+s, including the interrupted load. That excludes reprovisioning the drives (13
+s) and copying the backup to the other two hosts (17 s).
+
+**Serving impact.** A probe ran 200 writes and 200 reads per second against
+the source throughout the backup. The table gives the median of the
+per-second percentiles, compared with the 90 s before the backup. No probe
+request failed. Node RSS rose by about 0.14 GiB during the backup.
+
+| | before the backup | during the backup |
+|---|---|---|
+| write p50 / p99 | 157 / 280 µs | 161 / 318 µs |
+| read p50 / p99 | 2.53 / 4.2 ms | 2.55 / 6.5 ms |
+
+**Observed RPO.** Probe writes were sent in key order to the zone the backup
+read last. The restored copy held every probe write acknowledged up to 3.6 s
+before `create` finished, and none acknowledged later. The recovery point is
+therefore the moment each key's replica streams were read. The contract
+promises only writes acknowledged before `create` started.
+
+**Read errors on one host.** Every failure seen in the drill came from the
+data node on lab-2, the host with a history of memory corruption. Across
+seven backup attempts it refused a digest page seven times in all: it found a
+checksum mismatch in a run block and did not serve the page. Asking again
+always succeeded, and three backups of the same data in a row had no
+refusal. Three early attempts failed on a refusal, before `create` and
+`compare` retried such reads; the qualifying run retried four times. The
+other two nodes, and every read of the restored cluster, had no errors. The
+node logs nothing for such a refusal and counts it only in the generic
+`vals_server_errors`.
+
+Before the hardware drill, local runs checked the failure paths. Load and
+compare with one target node stopped fail after their 120 s retry window and
+name the node. A load interrupted with SIGKILL is rerun to completion. Voters
+seeded with different incarnations are refused. The drill harness is not
+published.
