@@ -1293,6 +1293,132 @@ fn majority_write_is_seen_by_a_majority_read_at_even_rf() {
 }
 
 #[test]
+fn read_concern_resolves_and_clamps_per_replica_count() {
+    for rf in 1..=9usize {
+        let majority_w = WriteOptions::buffered(WriteConcern::Majority).required_acks(rf).unwrap();
+        let majority_r = ReadConcern::Majority.required_replies(rf);
+        assert_eq!(majority_r, rf / 2 + 1, "Majority R at rf={rf}");
+        assert!(majority_w + majority_r > rf, "majority W and R must overlap at rf={rf}");
+        assert_eq!(ReadConcern::One.required_replies(rf), 1);
+        assert_eq!(ReadConcern::All.required_replies(rf), rf);
+        assert_eq!(ReadConcern::Quorum(0).required_replies(rf), 1, "0 reads one replica");
+        assert_eq!(ReadConcern::Quorum(rf + 3).required_replies(rf), rf, "capped at RF");
+        assert_eq!(ReadConcern::from(2), ReadConcern::Quorum(2));
+    }
+    for concern in [ReadConcern::One, ReadConcern::Majority, ReadConcern::All, ReadConcern::Quorum(2)] {
+        assert_eq!(concern.required_replies(0), 0);
+    }
+}
+
+#[test]
+fn a_zero_read_count_reads_one_replica_instead_of_reporting_absent() {
+    let c = cluster(3, 3, 0);
+    run(c.write_with(b"k", b"v", WriteConcern::All)).unwrap();
+    assert_eq!(run(c.read(b"k")).unwrap().unwrap().value.as_deref(), Some(&b"v"[..]));
+    assert_eq!(
+        run(c.read_quorum(b"k", 0)).unwrap().unwrap().value.as_deref(),
+        Some(&b"v"[..])
+    );
+    assert_eq!(run(c.read_many(&[b"k".to_vec()])).unwrap()[0].as_ref().unwrap().as_ref().unwrap().value.as_deref(), Some(&b"v"[..]));
+}
+
+const MIXED_RF_ZONES: [(ZoneId, usize, bool); 4] = [(11, 1, false), (13, 3, false), (15, 5, false), (25, 5, true)];
+
+fn mixed_rf_cluster(read: impl Into<ReadConcern>) -> Coordinator<LocalCluster<MemBlockDevice>> {
+    let mut lc = LocalCluster::new();
+    for (zone, rf, sorted) in MIXED_RF_ZONES {
+        lc.define_zone(
+            zone,
+            ZoneConfig {
+                name: format!("z{zone}"),
+                rf,
+                ordering: if sorted { ZOrdering::Sorted } else { ZOrdering::Unsorted },
+                scope: None,
+            },
+        );
+    }
+    let mut ring = Ring::with_vnodes(3, 64);
+    for node in 1..=5u32 {
+        lc.insert(node, replica(node));
+        for (zone, _, sorted) in MIXED_RF_ZONES {
+            lc.insert_zone(node, zone, if sorted { sorted_replica(node) } else { replica(node) });
+        }
+        ring.add_node(node);
+    }
+    let c = Coordinator::new(0, ring, read, lc);
+    run(c.refresh_catalog(1)).unwrap();
+    c
+}
+
+fn set_down(c: &Coordinator<LocalCluster<MemBlockDevice>>, nodes: &[NodeId], down: bool) {
+    for &node in nodes {
+        c.transport.set_down(node, down);
+    }
+}
+
+fn majority_write_on_last_replicas(
+    c: &Coordinator<LocalCluster<MemBlockDevice>>,
+    zone: ZoneId,
+    key: &[u8],
+) -> (Vec<NodeId>, usize, Version) {
+    let reps = c.replicas_for(zone, key).unwrap();
+    let w = reps.len() / 2 + 1;
+    let skipped = &reps[..reps.len() - w];
+    set_down(c, skipped, true);
+    let v = run(c.write_in(zone, key, b"v", WriteOptions::device_durable(WriteConcern::Majority)))
+        .unwrap();
+    set_down(c, skipped, false);
+    (reps, w, v)
+}
+
+#[test]
+fn majority_reads_see_majority_writes_in_zones_of_every_rf() {
+    let c = mixed_rf_cluster(ReadConcern::Majority);
+    for (zone, rf, sorted) in MIXED_RF_ZONES {
+        let key = format!("key-{zone}").into_bytes();
+        let (reps, w, v) = majority_write_on_last_replicas(&c, zone, &key);
+        assert_eq!(reps.len(), rf, "zone {zone}");
+        let holders = &reps[reps.len() - w..];
+        set_down(&c, &holders[..w - 1], true);
+
+        let got = run(c.read_in(zone, &key)).unwrap().expect("one holder answers");
+        assert_eq!(got.version, v, "zone {zone} rf {rf}");
+        let many = run(c.read_many_in(zone, &[key.clone()])).unwrap();
+        assert_eq!(many[0].as_ref().unwrap().as_ref().unwrap().version, v, "zone {zone} read_many");
+        if sorted {
+            let rows = run(c.scan_in(zone, None, None, ReadConcern::Majority, None)).unwrap();
+            assert_eq!(rows, vec![(key.clone(), b"v".to_vec())], "zone {zone} scan");
+        }
+        set_down(&c, &holders[..w - 1], false);
+    }
+}
+
+#[test]
+fn majority_reads_fail_rather_than_miss_a_write_a_fixed_count_misses() {
+    let c = mixed_rf_cluster(2);
+    for (zone, sorted) in [(15, false), (25, true)] {
+        let key = b"rf5-key".to_vec();
+        let (reps, w, _) = majority_write_on_last_replicas(&c, zone, &key);
+        let holders = &reps[reps.len() - w..];
+        set_down(&c, holders, true);
+
+        assert_eq!(run(c.read_in(zone, &key)), Ok(None), "R=2 at RF 5 misses the write");
+        assert_eq!(
+            run(c.read_quorum_in(zone, &key, ReadConcern::Majority)),
+            Err(CoordError::QuorumFailed { needed: 3, got: 2 })
+        );
+        if sorted {
+            assert_eq!(run(c.scan_in(zone, None, None, 2, None)), Ok(Vec::new()));
+            assert!(matches!(
+                run(c.scan_in(zone, None, None, ReadConcern::Majority, None)),
+                Err(CoordError::ScanQuorumFailed { needed: 3, got: 2, .. })
+            ));
+        }
+        set_down(&c, holders, false);
+    }
+}
+
+#[test]
 fn read_quorum_fails_when_too_few_respond() {
     let c = cluster(5, 3, 2);
     let reps = c.ring().replicas(b"k");

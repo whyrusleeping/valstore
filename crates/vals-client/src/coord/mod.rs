@@ -464,6 +464,56 @@ pub enum WriteConcern {
     Quorum(usize),
 }
 
+/// How many of a key's replicas (`R`) a quorum read or scan waits for.
+///
+/// `RF` is the key's replica count, as for [`WriteConcern`] (for a scan, the
+/// replica count of each range). A read concern is never refused: the
+/// resulting `R` is clamped to `1..=RF`, so `Quorum(0)` asks one replica and
+/// `Quorum(5)` in an RF 3 zone waits for all three.
+///
+/// A `usize` converts to `Quorum(n)`, so every method that takes
+/// `impl Into<ReadConcern>` also accepts a plain count, as it did before this
+/// type existed. The only behaviour change for such callers is that a count
+/// of 0 now reads one replica on point reads too (it used to return "absent"
+/// without asking any replica); scans already treated 0 as 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadConcern {
+    /// `R = 1`: one replica's answer, which can miss an acknowledged write.
+    One,
+    /// `R = RF / 2 + 1`. Paired with [`WriteConcern::Majority`], `W + R > RF`
+    /// at every replication factor, so the read sees every acknowledged
+    /// majority write in zones of any RF. Use this when zones have different
+    /// RFs.
+    Majority,
+    /// `R = RF`: sees every write acknowledged by at least one home replica,
+    /// but one unreachable replica fails the read.
+    All,
+    /// A fixed `R`, clamped to `1..=RF` per key. A fixed count only overlaps
+    /// writes at the RF it was chosen for: `Quorum(2)` overlaps majority
+    /// writes at RF 3 (`2 + 2 > 3`) but not at RF 5 (`3 + 2 = 5`).
+    Quorum(usize),
+}
+
+impl ReadConcern {
+    /// The `R` this concern needs when the key has `replicas` replicas
+    /// (0 only when `replicas` is 0).
+    pub fn required_replies(self, replicas: usize) -> usize {
+        let r = match self {
+            ReadConcern::One => 1,
+            ReadConcern::Majority => replicas / 2 + 1,
+            ReadConcern::All => replicas,
+            ReadConcern::Quorum(r) => r,
+        };
+        r.max(1).min(replicas)
+    }
+}
+
+impl From<usize> for ReadConcern {
+    fn from(r: usize) -> Self {
+        ReadConcern::Quorum(r)
+    }
+}
+
 /// What a replica's acknowledgement means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Persistence {
@@ -882,7 +932,7 @@ pub struct Coordinator<T: Transport> {
     #[doc(hidden)]
     pub transport: T,
     hlc: Hlc,
-    r: usize,
+    read: ReadConcern,
     read_fanout: ReadFanout,
     hints: RefCell<Box<dyn HintStore>>,
     #[doc(hidden)]

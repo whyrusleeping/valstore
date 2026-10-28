@@ -59,7 +59,8 @@ impl<T: Transport> Coordinator<T> {
     ///
     /// The `All` default fails the write when any replica is unreachable;
     /// most applications want [`write_with`](Self::write_with) and
-    /// [`WriteConcern::Majority`].
+    /// `WriteOptions::device_durable(WriteConcern::Majority)` (see "Choosing a
+    /// policy" in the [crate documentation](crate)).
     pub async fn write(&self, key: &[u8], value: &[u8]) -> Result<Version, CoordError> {
         self.write_in(DEFAULT_ZONE, key, value, WriteOptions::default())
             .await
@@ -262,10 +263,8 @@ impl<T: Transport> Coordinator<T> {
         value: &[u8],
         expected: Option<Version>,
     ) -> Result<CasResult, CoordError> {
-        let rf = self.resolve_replicas(zone_id, key).await?.len();
-        let r = rf / 2 + 1;
         let current = self
-            .read_winner_in(zone_id, key, r)
+            .read_winner_in(zone_id, key, ReadConcern::Majority)
             .await?
             .map(|s| s.version);
         if current != expected {

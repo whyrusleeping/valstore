@@ -97,9 +97,10 @@ impl<T: Transport> Coordinator<T> {
     /// ascending key order, with their values. `None` bounds mean the start or
     /// end of the zone; `limit` caps the number of keys returned.
     ///
-    /// Each range of the zone is read page by page from `r` of its replicas
-    /// (capped at the replica count) and the pages are merged by
-    /// last-writer-wins, dropping deleted keys. With `W + r` above the replica
+    /// Each range of the zone is read page by page from the `R` replicas that
+    /// read concern `r` asks for (see [`ReadConcern`]; a plain number is
+    /// clamped to `1..=RF`) and the pages are merged by
+    /// last-writer-wins, dropping deleted keys. With `W + R` above the replica
     /// count the scan sees every acknowledged write that finished before it
     /// started. It is not a snapshot: writes that land while the scan runs
     /// may or may not appear, and different pages can reflect different
@@ -108,16 +109,17 @@ impl<T: Transport> Coordinator<T> {
     /// byte as the next `lo`.
     ///
     /// Fails with [`CoordError::NotSorted`] on an unsorted zone and
-    /// [`CoordError::ScanQuorumFailed`] when a range cannot reach `r`
+    /// [`CoordError::ScanQuorumFailed`] when a range cannot reach `R`
     /// replicas. Scans do no read repair.
     pub async fn scan_in(
         &self,
         zone_id: ZoneId,
         lo: Option<&[u8]>,
         hi: Option<&[u8]>,
-        r: usize,
+        r: impl Into<ReadConcern>,
         limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CoordError> {
+        let r = r.into();
         self.retry_stale(|| self.scan_in_once(zone_id, lo, hi, r, limit))
             .await
     }
@@ -127,7 +129,7 @@ impl<T: Transport> Coordinator<T> {
         zone_id: ZoneId,
         lo: Option<&[u8]>,
         hi: Option<&[u8]>,
-        r: usize,
+        r: ReadConcern,
         limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CoordError> {
         self.ensure_zone(zone_id).await?;
@@ -263,7 +265,7 @@ impl<T: Transport> Coordinator<T> {
         rf: usize,
         scope: Option<&std::collections::BTreeSet<NodeId>>,
         slice: &crate::partition::RangeSlice,
-        r: usize,
+        r: ReadConcern,
         limit: Option<usize>,
     ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<Credit>), CoordError> {
         let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -274,7 +276,7 @@ impl<T: Transport> Coordinator<T> {
         if reps.is_empty() {
             return Err(CoordError::NoReplicas);
         }
-        let needed = r.min(reps.len());
+        let needed = r.required_replies(reps.len());
 
         let shi = slice.hi.as_deref();
 

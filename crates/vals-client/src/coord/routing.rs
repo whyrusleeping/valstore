@@ -6,32 +6,36 @@ impl<T: Transport> Coordinator<T> {
     /// `node` labels this coordinator (use an id that is not a data node's);
     /// versions carry a random writer id, not this label. `ring` is the boot
     /// placement, replaced by [`refresh_ring`](Self::refresh_ring) or by the
-    /// automatic refresh after a stale-ring refusal. `r` is the replica count
-    /// [`read`](Self::read), [`read_in`](Self::read_in) and
-    /// [`read_many`](Self::read_many) wait for; with RF 3 use 2 so that
-    /// majority writes and reads overlap. A coordinator over a
+    /// automatic refresh after a stale-ring refusal. `read` is the
+    /// [`ReadConcern`] that [`read`](Self::read), [`read_in`](Self::read_in)
+    /// and [`read_many`](Self::read_many) use; [`ReadConcern::Majority`]
+    /// overlaps majority writes in every zone whatever its RF. A plain count
+    /// `r` also works and means [`ReadConcern::Quorum`]`(r)` in every zone,
+    /// which only overlaps majority writes in zones where `r` is at least
+    /// half of RF, rounded up (`r + RF / 2 + 1 > RF`). A
+    /// coordinator over a
     /// [`NetTransport`](crate::NetTransport) takes its request budgets from
     /// the transport's [`ClientConfig`](crate::ClientConfig); other transports
     /// are unbounded unless you call [`with_credits`](Self::with_credits).
     ///
     /// The coordinator starts with digest reads, automatic stale-ring refresh,
     /// in-memory hints, and no failure detector.
-    pub fn new(node: NodeId, ring: Ring, r: usize, transport: T) -> Self {
-        Self::new_with_hlc(node, ring, r, transport, Hlc::new(node))
+    pub fn new(node: NodeId, ring: Ring, read: impl Into<ReadConcern>, transport: T) -> Self {
+        Self::new_with_hlc(node, ring, read.into(), transport, Hlc::new(node))
     }
 
     #[doc(hidden)]
     pub fn new_with_writer_for_test(
         node: NodeId,
         ring: Ring,
-        r: usize,
+        read: impl Into<ReadConcern>,
         transport: T,
         writer: u64,
     ) -> Self {
-        Self::new_with_hlc(node, ring, r, transport, Hlc::with_writer_for_test(writer))
+        Self::new_with_hlc(node, ring, read.into(), transport, Hlc::with_writer_for_test(writer))
     }
 
-    fn new_with_hlc(node: NodeId, ring: Ring, r: usize, transport: T, hlc: Hlc) -> Self {
+    fn new_with_hlc(node: NodeId, ring: Ring, read: ReadConcern, transport: T, hlc: Hlc) -> Self {
         let default_rf = ring.rf();
         let credits = Rc::new(RefCell::new(
             transport
@@ -45,7 +49,7 @@ impl<T: Transport> Coordinator<T> {
             epoch: Cell::new(0),
             transport,
             hlc,
-            r,
+            read,
             read_fanout: ReadFanout::Digest,
             hints: RefCell::new(Box::new(MemHintStore::default())),
             read_rotor: Cell::new(0),

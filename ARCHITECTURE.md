@@ -165,8 +165,30 @@ consensus path (the opt-in linearizable-zone mode, `docs/future-linearizable-zon
 Reads request **R** responses and pick the max `Version` (LWW). `R=1` reads any
 single replica (cheap, possibly stale — follower read); higher R compares
 replicas and **read-repairs** laggards inline. A tombstone winner reads as
-absent. With strict quorum, `W + R > RF` guarantees the read observes the latest
-acked write (see Consistency model).
+absent. With strict quorum, `W + R > RF` guarantees the read observes the
+acked write's version or a greater one (see Consistency model).
+
+A `ReadConcern` sets R from each key's replica count, the way `WriteConcern`
+sets W:
+
+| `ReadConcern` | R = replicas that must answer |
+|---|---|
+| `One` | 1 |
+| `Majority` | `floor(RF/2) + 1` |
+| `Quorum(R)` | `R`, clamped to `1..=RF` |
+| `All` | RF |
+
+Unlike a write concern, a read concern is never refused: `Quorum(0)` reads one
+replica and `Quorum(R)` above RF waits for every replica. Point reads, batched
+reads and scans all take `impl Into<ReadConcern>`, and a plain `usize` means
+`Quorum(n)`, so a fixed count is applied unchanged in every zone. That is the
+mixed-RF trap: `R = 2` overlaps majority writes at RF 3 but not at RF 5
+(`W = 3`, `3 + 2 = 5`). `ReadConcern::Majority` is computed per key (per range
+for scans), so majority writes and majority reads overlap in every zone
+whatever its RF. The client's recommended policy for data that must not be
+lost is device-durable majority writes plus majority reads; the `write()`
+default stays buffered `All` for compatibility (see the `vals-client` crate
+documentation, "Choosing a policy").
 
 ### Healing
 
@@ -719,7 +741,11 @@ consistency**. The contract:
   list, a quorum read observes the acked write's candidate or a greater LWW
   version. Here "latest" means greatest `Version`, not
   request-arrival order; an acknowledged lower-version candidate cannot displace
-  a previously stored greater version.
+  a previously stored greater version. So a write can be acknowledged and never
+  become visible: if a coordinator whose clock runs ahead wrote the same key
+  just before, a request that starts after that write finished can still carry
+  the smaller version and lose. "Strong" or "latest" reads elsewhere in these
+  docs mean exactly this greatest-version guarantee, not linearizability.
 
 - **Sloppy quorum (opt-in availability mode) is eventual-only.** When home
   replicas are down, a sloppy write is accepted on fallback nodes (with a hint to
@@ -806,6 +832,19 @@ set**, so CAS cannot be made mutually exclusive:
   catches a stale `if-version` (someone wrote since you read), which is useful for
   benign optimistic-concurrency loops. It is simply not a guarantee you can lean
   on under concurrent writers or partitions.
+
+Application patterns that are **unsafe** on it, because two acknowledged CAS
+calls can both succeed and LWW keeps only one:
+
+- counters and balances (`read n`, `cas n+1`): concurrent increments are lost;
+- locks, leases and leader election (`cas None → me`): two holders can both
+  believe they won;
+- unique-id or sequence allocation: two callers can receive the same id;
+- check-then-act invariants across keys (there is no multi-key atomicity).
+
+Use it for low-contention updates where losing a concurrent update is
+acceptable or detectable later, such as a single writer guarding against its
+own stale cache.
 
 This is the same reason Cassandra bolts on Paxos (LWT) for its CAS path. True
 linearizable CAS requires a **per-key consensus path**, which is **out of the

@@ -14,7 +14,7 @@
 //!
 //! ```no_run
 //! use std::net::SocketAddr;
-//! use vals_client::{Coordinator, NetTransport, Ring, WriteConcern};
+//! use vals_client::{Coordinator, NetTransport, ReadConcern, Ring, WriteOptions, WriteConcern};
 //!
 //! // Address each node's replica server (one shard per node here).
 //! let nodes: Vec<(u32, SocketAddr)> = vec![
@@ -28,17 +28,15 @@
 //! let mut ring = Ring::new(3);
 //! ring.set_members_weighted([(1, 1), (2, 1), (3, 1)]);
 //!
-//! // A coordinator: id 100 (distinct from data nodes), strong reads at R = 2.
-//! let coord = Coordinator::new(100, ring, 2, transport);
+//! // A coordinator: id 100 (distinct from data nodes), majority reads.
+//! let coord = Coordinator::new(100, ring, ReadConcern::Majority, transport);
 //!
 //! vals_rt::block_on(
 //!     async {
-//!         // Write acknowledged by a majority (W = 2), read it strongly back (R = 2):
-//!         // W + R = 4 > RF = 3, so the read must observe the write.
-//!         coord
-//!             .write_with(b"hello", b"world", WriteConcern::Majority)
-//!             .await
-//!             .unwrap();
+//!         // Write synced to a majority's devices (W = 2), read it back from a
+//!         // majority (R = 2): W + R = 4 > RF = 3, so the read observes the write.
+//!         let durable = WriteOptions::device_durable(WriteConcern::Majority);
+//!         coord.write_with(b"hello", b"world", durable).await.unwrap();
 //!         let got = coord.read(b"hello").await.unwrap().expect("present");
 //!         assert_eq!(got.value.as_deref(), Some(&b"world"[..]));
 //!     },
@@ -63,7 +61,7 @@
 //!   and [`CoordinatorService`] for hosting a coordinator with background
 //!   refresh.
 //! - Options and results: [`WriteConcern`], [`Persistence`], [`WriteOptions`],
-//!   [`ReadFanout`], [`Stored`], [`Version`], [`CasResult`], [`SloppyAck`],
+//!   [`ReadConcern`], [`ReadFanout`], [`Stored`], [`Version`], [`CasResult`], [`SloppyAck`],
 //!   [`BatchResult`], [`WriteOutcome`], [`ScanQuery`], [`CreditStats`], and
 //!   the errors [`CoordError`], [`ReplicaError`], [`RangeDeleteMiss`] and
 //!   [`TransportError`].
@@ -126,16 +124,54 @@
 //! picks `W`. With [`Persistence::Buffered`] (the default) a replica
 //! acknowledges once the write is in its memory, so losing power on every
 //! acknowledging replica can lose it; [`Persistence::Device`] waits for each
-//! acknowledging replica's device sync. Replicas resolve conflicts by
-//! last-writer-wins on [`Version`] (a hybrid logical clock plus a random
-//! writer id), so the greatest version wins, not the last request to finish.
-//! A read that asks `R` replicas with `W + R > RF` observes the version of
-//! any write acknowledged by `W` home replicas, or a greater one (a sloppy
-//! write acknowledged by fallback nodes does not count until its hints are
-//! delivered). This is not linearizability: there are no
-//! transactions, and [`Coordinator::cas`] is a best-effort check-then-write.
-//! Scans read each range from `R` replicas page by page; they are not a
-//! point-in-time snapshot across pages or ranges.
+//! acknowledging replica's device sync. A read waits for `R` replicas, where
+//! [`ReadConcern`] picks `R`.
+//!
+//! Replicas resolve conflicts by last-writer-wins on [`Version`] (a hybrid
+//! logical clock plus a random writer id), so the greatest version wins, not
+//! the last request to finish. A replica acknowledges a write whose version
+//! loses to one it already holds, so a write can succeed and never be
+//! visible: if another coordinator whose clock runs ahead wrote the same key
+//! moments earlier, the later request carries the smaller version and loses.
+//! "Latest" in this documentation always means "greatest version".
+//!
+//! A read with `W + R > RF` observes the version of any write acknowledged by
+//! `W` home replicas, or a greater one (a sloppy write acknowledged by
+//! fallback nodes does not count until its hints are delivered). This is not
+//! linearizability: there are no transactions, and [`Coordinator::cas`] is a
+//! best-effort check-then-write: two racing calls can both succeed, and
+//! last-writer-wins then silently keeps only one. Do not build counters,
+//! locks or leases, unique-id allocation or balances on it. Scans read each
+//! range from `R` replicas page by page; they are not a point-in-time snapshot
+//! across pages or ranges.
+//!
+//! # Choosing a policy
+//!
+//! For data you cannot afford to lose, write and delete with
+//! `WriteOptions::device_durable(WriteConcern::Majority)` and read and scan
+//! with [`ReadConcern::Majority`]:
+//!
+//! - An acknowledged write is on the devices of a majority of its replicas
+//!   (as far as each drive's flush contract goes), so it survives every node
+//!   losing power at once.
+//! - At RF 3, reads and writes each need two of three replicas, so both keep
+//!   working with one replica down or unreachable.
+//! - A majority write and a majority read overlap at every replication
+//!   factor, so the same code stays correct in zones with different RFs.
+//!
+//! The defaults are different and are kept for compatibility:
+//!
+//! - [`Coordinator::write`] uses `WriteOptions::default()`, which is
+//!   buffered [`WriteConcern::All`]: every replica must acknowledge, so one
+//!   unreachable replica fails every write. Any method given a bare
+//!   [`WriteConcern`] uses buffered persistence.
+//! - [`Coordinator::new`] uses the read concern you pass. A number such as
+//!   `2` means [`ReadConcern::Quorum`]`(2)` in every zone, which overlaps
+//!   majority writes only where `RF` is at most 4.
+//!
+//! Buffered majority writes are faster (no device sync per write) and still
+//! survive the loss of any minority of replicas; choose them when a
+//! simultaneous power loss of a key's replicas is acceptable to you.
 
 pub mod coord;
 pub mod net;
@@ -163,8 +199,8 @@ pub mod wire;
 
 pub use coord::{
     BatchResult, BatchWriteHandle, ClientBudgets, CoordError, Coordinator, CoordinatorService,
-    CreditStats, Persistence, RangeDeleteMiss, ReadFanout, ReplicaError, ScanQuery, SloppyAck,
-    Transport, TransportError, WriteConcern, WriteOptions, WriteOutcome,
+    CreditStats, Persistence, RangeDeleteMiss, ReadConcern, ReadFanout, ReplicaError, ScanQuery,
+    SloppyAck, Transport, TransportError, WriteConcern, WriteOptions, WriteOutcome,
 };
 #[doc(hidden)]
 pub use coord::{BatchAck, BatchEntry, HedgeClock, RingView};

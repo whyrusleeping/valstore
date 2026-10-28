@@ -1,7 +1,7 @@
 //! `vals-cluster`: the leaderless (Dynamo-style) distributed layer.
 //!
 //! ```
-//! use vals_cluster::{Coordinator, LocalCluster, Ring, VersionedStore, WriteConcern};
+//! use vals_cluster::{Coordinator, LocalCluster, ReadConcern, Ring, VersionedStore, WriteConcern};
 //! use vals_spdk::MemBlockDevice;
 //! use vals_store::{Config, Engine};
 //!
@@ -16,8 +16,8 @@
 //! let mut ring = Ring::new(3);
 //! ring.set_members_weighted([(1, 1), (2, 1), (3, 1)]);
 //!
-//! // A coordinator: id 100 (distinct from data nodes), strong reads at R = 2.
-//! let coord = Coordinator::new(100, ring, 2, cluster);
+//! // A coordinator: id 100 (distinct from data nodes), majority reads (R = 2).
+//! let coord = Coordinator::new(100, ring, ReadConcern::Majority, cluster);
 //!
 //! // The coordinator API is async; drive it with the bundled executor.
 //! vals_rt::block_on(
@@ -112,8 +112,8 @@ pub mod antientropy;
 pub use auth::init_cluster_secret;
 pub use coord::{
     BatchAck, BatchEntry, BatchResult, CoordError, Coordinator, CoordinatorService, CreditStats,
-    LocalCluster, Persistence, ReadFanout, RingView, SloppyAck, Transport, TransportError,
-    WriteConcern, WriteOptions, WriteOutcome,
+    LocalCluster, Persistence, ReadConcern, ReadFanout, RingView, SloppyAck, Transport,
+    TransportError, WriteConcern, WriteOptions, WriteOutcome,
 };
 pub use drive::{
     build_stores, build_stores_with, drive_caps, node_weight, plan, relocate, relocate_with,

@@ -8,14 +8,14 @@
 //! ```
 //!
 //! Only the default zone is used. Startup discovers membership and the catalog
-//! from seeds, then derives R = RF / 2 + 1. Puts/deletes request device-durable
+//! from seeds; reads use `ReadConcern::Majority`, so R = RF / 2 + 1 follows the
+//! zone's current RF. Puts/deletes request device-durable
 //! majority acknowledgements; finite transport connect/RPC deadlines stay on.
 //! Reads select the greatest LWW Version (HLC, then writer id), not the last
 //! request by wall-clock completion. An acknowledged write may lose to a
 //! greater Version, and a failed/timed-out write may still have taken effect.
 //! This is not a linearizable read-modify-write interface. The coordinator's
-//! automatic stale-ring refresh/retry stays enabled, but R is a startup
-//! snapshot; reconnect the bridge if the default zone's RF changes.
+//! automatic stale-ring refresh/retry stays enabled.
 //!
 //! At most QUEUE_CAPACITY queued operations plus one running operation are
 //! accepted. There is no byte cap: payloads and tasks waiting for admission
@@ -34,7 +34,7 @@ use std::thread;
 
 use tokio::sync::{mpsc, oneshot};
 use vals_client::{
-    reactor, Coordinator, NetTransport, NodeId, Ring, Stored, Version,
+    reactor, Coordinator, NetTransport, NodeId, ReadConcern, Ring, Stored, Version,
     WriteConcern, WriteOptions, DEFAULT_ZONE,
 };
 
@@ -246,15 +246,15 @@ fn parse_nodes(list: &str) -> Result<Nodes> {
 fn initialize(nodes: &str) -> Result<impl FnMut(Operation) -> Result<Reply>> {
     let nodes = parse_nodes(nodes)?;
     let transport = NetTransport::connect_sharded(nodes.clone());
-    let coord = Coordinator::new(100, Ring::new(3), 2, transport);
-    let majority = vals_rt::block_on(discover(&coord, &nodes), reactor::poll_io)?;
+    let coord = Coordinator::new(100, Ring::new(3), ReadConcern::Majority, transport);
+    vals_rt::block_on(discover(&coord, &nodes), reactor::poll_io)?;
     Ok(move |operation| {
         vals_rt::block_on(async {
             let durable = WriteOptions::device_durable(WriteConcern::Majority);
             match operation {
                 Operation::Put(key, value) => coord.write_in(DEFAULT_ZONE, &key, &value, durable)
                     .await.map(Reply::Version).map_err(|e| format!("put: {e}")),
-                Operation::Get(key) => coord.read_quorum_in(DEFAULT_ZONE, &key, majority)
+                Operation::Get(key) => coord.read_in(DEFAULT_ZONE, &key)
                     .await.map(Reply::Value).map_err(|e| format!("get: {e}")),
                 Operation::Delete(key) => coord.delete_in(DEFAULT_ZONE, &key, durable)
                     .await.map(Reply::Version).map_err(|e| format!("delete: {e}")),
@@ -263,10 +263,10 @@ fn initialize(nodes: &str) -> Result<impl FnMut(Operation) -> Result<Reply>> {
     })
 }
 
-async fn discover(coord: &Coordinator<NetTransport>, nodes: &Nodes) -> Result<usize> {
+async fn discover(coord: &Coordinator<NetTransport>, nodes: &Nodes) -> Result<()> {
     let mut errors = Vec::new();
     for (node, _) in nodes {
-        let result: Result<usize> = async {
+        let result: Result<()> = async {
             let members = coord.refresh_ring(*node).await.map_err(|e| e.to_string())?;
             if members.is_empty() || coord.ring_epoch() == 0 {
                 return Err("no authoritative membership yet (is the PD running?)".into());
@@ -277,10 +277,10 @@ async fn discover(coord: &Coordinator<NetTransport>, nodes: &Nodes) -> Result<us
             if rf == 0 {
                 return Err("default zone RF must be positive".into());
             }
-            Ok(rf / 2 + 1)
+            Ok(())
         }.await;
         match result {
-            Ok(majority) => return Ok(majority),
+            Ok(()) => return Ok(()),
             Err(error) => errors.push(format!("seed {node}: {error}")),
         }
     }

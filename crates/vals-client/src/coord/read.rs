@@ -1,50 +1,56 @@
 use super::*;
 
 impl<T: Transport> Coordinator<T> {
-    /// Reads `key` from the default zone at this coordinator's `R` (the `r`
-    /// given to [`Coordinator::new`]); see
+    /// Reads `key` from the default zone with this coordinator's read concern
+    /// (the one given to [`Coordinator::new`]); see
     /// [`read_quorum_in`](Self::read_quorum_in).
     pub async fn read(&self, key: &[u8]) -> Result<Option<Stored>, CoordError> {
-        self.read_quorum(key, self.r).await
+        self.read_quorum(key, self.read).await
     }
 
-    /// Reads `key` from `zone_id` at this coordinator's `R`; see
+    /// Reads `key` from `zone_id` with this coordinator's read concern; see
     /// [`read_quorum_in`](Self::read_quorum_in).
     pub async fn read_in(&self, zone_id: ZoneId, key: &[u8]) -> Result<Option<Stored>, CoordError> {
-        self.read_quorum_in(zone_id, key, self.r).await
+        self.read_quorum_in(zone_id, key, self.read).await
     }
 
-    /// Reads `key` from the default zone, waiting for `r` replicas; see
+    /// Reads `key` from the default zone with read concern `r`; see
     /// [`read_quorum_in`](Self::read_quorum_in).
-    pub async fn read_quorum(&self, key: &[u8], r: usize) -> Result<Option<Stored>, CoordError> {
+    pub async fn read_quorum(
+        &self,
+        key: &[u8],
+        r: impl Into<ReadConcern>,
+    ) -> Result<Option<Stored>, CoordError> {
         self.read_quorum_in(DEFAULT_ZONE, key, r).await
     }
 
-    /// Reads `key` from `zone_id`, waiting for `r` of its replicas, and returns
-    /// the value with the greatest version, or `None` if the key is absent or
-    /// its newest version is a delete.
+    /// Reads `key` from `zone_id`, waiting for the `R` replicas that read
+    /// concern `r` asks for, and returns the value with the greatest version,
+    /// or `None` if the key is absent or its newest version is a delete.
     ///
-    /// `r` is capped at the key's replica count. If `r` plus the write
-    /// concern's `W` exceeds the replica count, the read sees every write
-    /// acknowledged by `W` home replicas (or something newer). Before
-    /// returning, the call sends the winning version to any replica that
-    /// answered with an older version or none (read repair). Fails with
-    /// [`CoordError::QuorumFailed`] if fewer than `r` replicas answer. How the
-    /// replicas are asked depends on [`ReadFanout`].
+    /// `R` comes from the key's replica count as described on
+    /// [`ReadConcern`]; a plain number is clamped to `1..=RF`. If `R` plus
+    /// the write concern's `W` exceeds the replica count, the read sees every
+    /// write acknowledged by `W` home replicas (or something with a greater
+    /// version). Before returning, the call sends the winning version to any
+    /// replica that answered with an older version or none (read repair).
+    /// Fails with [`CoordError::QuorumFailed`] if fewer than `R` replicas
+    /// answer. How the replicas are asked depends on [`ReadFanout`].
     pub async fn read_quorum_in(
         &self,
         zone_id: ZoneId,
         key: &[u8],
-        r: usize,
+        r: impl Into<ReadConcern>,
     ) -> Result<Option<Stored>, CoordError> {
         Ok(self
-            .read_winner_in(zone_id, key, r)
+            .read_winner_in(zone_id, key, r.into())
             .await?
             .filter(|s| s.value.is_some()))
     }
 
-    /// Reads many keys from `zone_id` at this coordinator's `R`, grouping the
-    /// requests by node.
+    /// Reads many keys from `zone_id` with this coordinator's read concern,
+    /// grouping the requests by node. Each key's `R` comes from its own
+    /// replica count.
     ///
     /// Returns one result per key, in input order, each with the same meaning
     /// as [`read_quorum_in`](Self::read_quorum_in). The outer `Err` covers
@@ -66,7 +72,6 @@ impl<T: Transport> Coordinator<T> {
             }
             return Ok(first);
         }
-        let r = self.r;
         let mut reps: Vec<Vec<NodeId>> = Vec::with_capacity(keys.len());
         for k in keys {
             reps.push(self.replicas_for(zone_id, k)?);
@@ -76,7 +81,7 @@ impl<T: Transport> Coordinator<T> {
         for (i, nodes) in reps.iter().enumerate() {
             let fanout = match self.read_fanout {
                 ReadFanout::All => nodes.len(),
-                _ => r,
+                _ => self.read.required_replies(nodes.len()),
             };
             for &n in nodes.iter().take(fanout) {
                 by_node.entry(n).or_default().push(i);
@@ -120,7 +125,7 @@ impl<T: Transport> Coordinator<T> {
         }
         let mut out = Vec::with_capacity(keys.len());
         for i in 0..keys.len() {
-            let needed = r.min(reps[i].len());
+            let needed = self.read.required_replies(reps[i].len());
             if oks[i] < needed {
                 if overloaded[i] {
                     out.push(Err(CoordError::Overloaded));
@@ -358,12 +363,11 @@ impl<T: Transport> Coordinator<T> {
         zone_id: ZoneId,
         keys: &[Vec<u8>],
     ) -> Result<Vec<Result<Option<Stored>, CoordError>>, CoordError> {
-        let needed_r = self.r;
         let mut replicas = Vec::with_capacity(keys.len());
         let mut needed = Vec::with_capacity(keys.len());
         for key in keys {
             let reps = self.replicas_for(zone_id, key)?;
-            needed.push(needed_r.min(reps.len()));
+            needed.push(self.read.required_replies(reps.len()));
             replicas.push(reps);
         }
         let (responses, mut stale_epochs, mut overloaded, mut response_credits) = self
@@ -545,7 +549,7 @@ impl<T: Transport> Coordinator<T> {
         &self,
         zone_id: ZoneId,
         key: &[u8],
-        r: usize,
+        r: ReadConcern,
     ) -> Result<Option<Stored>, CoordError> {
         self.retry_stale(|| self.read_winner_once(zone_id, key, r))
             .await
@@ -555,10 +559,10 @@ impl<T: Transport> Coordinator<T> {
         &self,
         zone_id: ZoneId,
         key: &[u8],
-        r: usize,
+        r: ReadConcern,
     ) -> Result<Option<Stored>, CoordError> {
         let reps = self.resolve_replicas(zone_id, key).await?;
-        let needed = r.min(reps.len());
+        let needed = r.required_replies(reps.len());
         let winner = match self.read_fanout {
             ReadFanout::Digest => self.read_winner_digest(zone_id, key, &reps, needed).await,
             ReadFanout::All | ReadFanout::Quorum => {

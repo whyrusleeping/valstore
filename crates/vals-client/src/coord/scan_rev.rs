@@ -54,7 +54,7 @@ impl<T: Transport> Coordinator<T> {
         zone_id: ZoneId,
         lo: Option<&[u8]>,
         hi: Option<&[u8]>,
-        r: usize,
+        r: impl Into<ReadConcern>,
         limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CoordError> {
         let mut out = self.scan_many_in_rev(zone_id, &[(lo, hi, limit)], r, false).await?;
@@ -67,9 +67,10 @@ impl<T: Transport> Coordinator<T> {
         &self,
         zone_id: ZoneId,
         scans: &[ScanQuery<'_>],
-        r: usize,
+        r: impl Into<ReadConcern>,
         keys_only: bool,
     ) -> Result<Vec<Vec<(Vec<u8>, Stored)>>, CoordError> {
+        let r = r.into();
         self.retry_stale(|| self.scan_many_rev_once(zone_id, scans, r, keys_only)).await
     }
 
@@ -77,7 +78,7 @@ impl<T: Transport> Coordinator<T> {
         &self,
         zone_id: ZoneId,
         scans: &[ScanQuery<'_>],
-        r: usize,
+        r: ReadConcern,
         keys_only: bool,
     ) -> Result<Vec<Vec<(Vec<u8>, Stored)>>, CoordError> {
         self.ensure_zone(zone_id).await?;
@@ -106,7 +107,7 @@ impl<T: Transport> Coordinator<T> {
                     let Some(slice) = c.slices.get(c.slice) else { continue; };
                     let reps = self.ring.borrow().replicas_in_zone(zone_id, &slice.token, rf, scope.as_ref());
                     if reps.is_empty() { return Err(CoordError::NoReplicas); }
-                    needed[i] = r.max(1).min(reps.len());
+                    needed[i] = r.required_replies(reps.len());
                     let max = scans[i].2.map_or(0, |n| u32::try_from(n - c.out.len()).unwrap_or(u32::MAX));
                     for node in reps {
                         groups.entry(node).or_default().push((i, (slice.lo.clone(), c.hi.clone(), max)));
