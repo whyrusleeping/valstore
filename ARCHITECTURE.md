@@ -1180,6 +1180,14 @@ guarantees. 100-byte values unless stated.
   digest reads (every serving shard thread saturated, ~7.4 Gbit/s of server
   traffic) and **~2.0–2.7M quorum writes/s** (the higher figure at the
   saturation knee, p99 ~25 ms).
+- **File-backed `valsd` with default node settings** (anti-entropy on, RF 3,
+  majority writes and reads, 1 KiB values, 4M keys), on the same 24-core hosts
+  with a consumer Samsung 990 PRO each, either all three nodes on one host or
+  one node per host: **~78k buffered overwrites/s**, **~100–125k warm point
+  reads/s**, and **~1.4–5k device-durable writes/s**. Each node is limited by
+  its single serving thread, or by `fsync` for device-durable writes. Setup,
+  latencies, resource use and a recipe to repeat the runs are in
+  [`docs/benchmarks.md`](docs/benchmarks.md).
 
 ### Lessons that shaped the design
 

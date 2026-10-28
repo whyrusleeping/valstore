@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering as AtOrd};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtOrd};
 use std::sync::Mutex;
 
 use vals_cluster::{
@@ -42,6 +42,11 @@ struct NpConfig {
     client: ClientConfig,
     persistence: Persistence,
     prefix: String,
+    prefill: bool,
+    existing: bool,
+    verify_all: bool,
+    seq_base: u64,
+    busy_backoff: Duration,
 }
 
 impl NpConfig {
@@ -85,12 +90,20 @@ impl NpConfig {
             },
             persistence,
             prefix: std::env::var("VALS_NP_PREFIX").unwrap_or_else(|_| "np/".into()),
+            prefill: env_u64("VALS_NP_PREFILL", 0) != 0,
+            existing: env_u64("VALS_NP_EXISTING", 0) != 0,
+            verify_all: env_u64("VALS_NP_VERIFY_ALL", 0) != 0,
+            busy_backoff: Duration::from_millis(env_u64("VALS_NP_BUSY_BACKOFF_MS", 0)),
+            seq_base: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after 1970")
+                .as_micros() as u64,
         }
     }
 
     fn json(&self) -> String {
         format!(
-            "{{\"threads\":{},\"slots\":{},\"keys_per_slot\":{},\"secs\":{},\"read_pct\":{},\"multi_pct\":{},\"multi\":{},\"rate\":{},\"vsize\":{},\"fd\":{},\"hedge_ms\":{},\"connect_deadline_ms\":{},\"rpc_deadline_ms\":{},\"write\":\"majority\",\"read\":\"majority\",\"persistence\":\"{}\",\"prefix\":{}}}",
+            "{{\"threads\":{},\"slots\":{},\"keys_per_slot\":{},\"secs\":{},\"read_pct\":{},\"multi_pct\":{},\"multi\":{},\"rate\":{},\"vsize\":{},\"fd\":{},\"hedge_ms\":{},\"connect_deadline_ms\":{},\"rpc_deadline_ms\":{},\"write\":\"majority\",\"read\":\"majority\",\"persistence\":\"{}\",\"prefix\":{},\"prefill\":{},\"existing\":{},\"seq_base\":{},\"busy_backoff_ms\":{}}}",
             self.threads,
             self.slots,
             self.keys,
@@ -109,6 +122,10 @@ impl NpConfig {
             self.client.rpc_deadline.map_or(0, |d| d.as_millis()),
             if self.persistence == Persistence::Device { "device" } else { "buffered" },
             json_str(&self.prefix),
+            self.prefill,
+            self.existing,
+            self.seq_base,
+            self.busy_backoff.as_millis(),
         )
     }
 }
@@ -116,6 +133,7 @@ impl NpConfig {
 #[derive(Default)]
 struct OpStats {
     ok: u64,
+    busy_retries: u64,
     errs: BTreeMap<&'static str, u64>,
     lat_us: Vec<u32>,
 }
@@ -123,6 +141,7 @@ struct OpStats {
 impl OpStats {
     fn merge(&mut self, other: OpStats) {
         self.ok += other.ok;
+        self.busy_retries += other.busy_retries;
         for (kind, n) in other.errs {
             *self.errs.entry(kind).or_default() += n;
         }
@@ -140,10 +159,12 @@ impl OpStats {
         };
         let errs: Vec<String> = self.errs.iter().map(|(k, n)| format!("\"{k}\":{n}")).collect();
         format!(
-            "{{\"ok\":{},\"err\":{{{}}},\"p50_ms\":{:.2},\"p99_ms\":{:.2},\"max_ms\":{:.2}}}",
+            "{{\"ok\":{},\"busy_retries\":{},\"err\":{{{}}},\"p50_ms\":{:.2},\"p95_ms\":{:.2},\"p99_ms\":{:.2},\"max_ms\":{:.2}}}",
             self.ok,
+            self.busy_retries,
             errs.join(","),
             pct(500),
+            pct(950),
             pct(990),
             self.lat_us.last().map_or(0.0, |&v| v as f64 / 1e3)
         )
@@ -168,8 +189,9 @@ impl ThreadStats {
         std::mem::take(&mut self.ops)
     }
 
-    fn record(&mut self, op: usize, start: Instant, result: Result<(), &'static str>) {
+    fn record(&mut self, op: usize, start: Instant, retries: u64, result: Result<(), &'static str>) {
         let stats = &mut self.ops[op];
+        stats.busy_retries += retries;
         stats.lat_us.push(start.elapsed().as_micros().min(u32::MAX as u128) as u32);
         match result {
             Ok(()) => stats.ok += 1,
@@ -202,6 +224,23 @@ fn err_kind(e: &CoordError) -> &'static str {
         CoordError::SkewRejected { .. } => "skew_rejected",
         _ => "other",
     }
+}
+
+fn retryable(e: &CoordError) -> bool {
+    matches!(e, CoordError::Busy { .. } | CoordError::Overloaded)
+}
+
+/// Waits before retrying a request refused with `Busy`/`Overloaded`, doubling
+/// from `VALS_NP_BUSY_BACKOFF_MS` up to 32x; false when retries are off or the
+/// run is stopping.
+async fn busy_wait(cfg: &NpConfig, stop: &AtomicBool, attempt: &mut u64) -> bool {
+    if cfg.busy_backoff.is_zero() || stop.load(AtOrd::Relaxed) {
+        return false;
+    }
+    let delay = cfg.busy_backoff * (1u32 << (*attempt).min(5));
+    *attempt += 1;
+    reactor::Timer::every(delay).expect("timerfd").tick().await;
+    true
 }
 
 fn np_key(cfg: &NpConfig, thread: usize, slot: usize, idx: usize) -> Vec<u8> {
@@ -301,6 +340,26 @@ fn np_zone(coord: &Coordinator<NetTransport>, name: &str) -> ZoneId {
     }
 }
 
+async fn np_write(
+    cfg: &NpConfig,
+    coord: &Coordinator<NetTransport>,
+    zone: ZoneId,
+    stop: &AtomicBool,
+    (thread, slot, i): (usize, usize, usize),
+    seq: u64,
+) -> (Result<(), &'static str>, u64) {
+    let options = WriteOptions { concern: WriteConcern::Majority, persistence: cfg.persistence };
+    let (key, value) = (np_key(cfg, thread, slot, i), np_value(cfg.vsize, seq, thread, slot, i));
+    let mut retries = 0;
+    loop {
+        match coord.write_in(zone, &key, &value, options).await {
+            Ok(_) => return (Ok(()), retries),
+            Err(e) if retryable(&e) && busy_wait(cfg, stop, &mut retries).await => {}
+            Err(e) => return (Err(err_kind(&e)), retries),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn np_slot<'a>(
     cfg: &'a NpConfig,
@@ -311,15 +370,52 @@ fn np_slot<'a>(
     stats: &'a Mutex<ThreadStats>,
     busy_since: &'a RefCell<Vec<Option<Instant>>>,
     stop: &'a AtomicBool,
+    done: &'a AtomicUsize,
 ) -> SlotFuture<'a> {
     Box::pin(async move {
         let interval = (cfg.rate > 0.0)
             .then(|| Duration::from_secs_f64((cfg.threads * cfg.slots) as f64 / cfg.rate));
-        let timer = interval.map(|period| reactor::Timer::every(period).expect("timerfd"));
+        let timer = match interval {
+            Some(period) => {
+                let slots = cfg.threads * cfg.slots;
+                let offset = period.mul_f64((thread * cfg.slots + slot) as f64 / slots as f64);
+                if !offset.is_zero() {
+                    reactor::Timer::every(offset).expect("timerfd").tick().await;
+                }
+                Some(reactor::Timer::every(period).expect("timerfd"))
+            }
+            None => None,
+        };
         let mut rng = Xorshift(0x9E37_79B9_7F4A_7C15 ^ (((thread as u64) << 32) | (slot as u64 + 1)));
-        let mut keys = vec![KeyState::default(); cfg.keys];
-        let mut seq = 0u64;
-        let options = WriteOptions { concern: WriteConcern::Majority, persistence: cfg.persistence };
+        let initial = if cfg.existing {
+            KeyState { acked: 1, attempted: cfg.seq_base }
+        } else {
+            KeyState::default()
+        };
+        let mut keys = vec![initial; cfg.keys];
+        let mut seq = cfg.seq_base;
+        if cfg.prefill {
+            for i in 0..cfg.keys {
+                if stop.load(AtOrd::Relaxed) {
+                    break;
+                }
+                if let Some(timer) = &timer {
+                    timer.tick().await;
+                }
+                let start = Instant::now();
+                busy_since.borrow_mut()[slot] = Some(start);
+                seq += 1;
+                keys[i].attempted = seq;
+                let (result, retries) = np_write(cfg, coord, zone, stop, (thread, slot, i), seq).await;
+                if result.is_ok() {
+                    keys[i].acked = seq;
+                }
+                stats.lock().unwrap().record(0, start, retries, result);
+                busy_since.borrow_mut()[slot] = None;
+            }
+            done.fetch_add(1, AtOrd::Relaxed);
+            return keys;
+        }
         while !stop.load(AtOrd::Relaxed) {
             if let Some(timer) = &timer {
                 timer.tick().await;
@@ -331,7 +427,18 @@ fn np_slot<'a>(
                 let idxs: Vec<usize> =
                     (0..cfg.multi).map(|_| rng.next() as usize % cfg.keys).collect();
                 let ks: Vec<Vec<u8>> = idxs.iter().map(|&i| np_key(cfg, thread, slot, i)).collect();
-                let result = coord.read_many_in(zone, &ks).await;
+                let mut retries = 0;
+                let result = loop {
+                    let r = coord.read_many_in(zone, &ks).await;
+                    let busy = match &r {
+                        Ok(results) => results.iter().any(|r| matches!(r, Err(e) if retryable(e))),
+                        Err(e) => retryable(e),
+                    };
+                    if busy && busy_wait(cfg, stop, &mut retries).await {
+                        continue;
+                    }
+                    break r;
+                };
                 let mut st = stats.lock().unwrap();
                 match result {
                     Ok(results) => {
@@ -349,13 +456,20 @@ fn np_slot<'a>(
                                 }
                             }
                         }
-                        st.record(2, start, first_err.map_or(Ok(()), Err));
+                        st.record(2, start, retries, first_err.map_or(Ok(()), Err));
                     }
-                    Err(e) => st.record(2, start, Err(err_kind(&e))),
+                    Err(e) => st.record(2, start, retries, Err(err_kind(&e))),
                 }
             } else if roll < cfg.multi_pct + cfg.read_pct {
                 let i = rng.next() as usize % cfg.keys;
-                let result = coord.read_in(zone, &np_key(cfg, thread, slot, i)).await;
+                let mut retries = 0;
+                let result = loop {
+                    let r = coord.read_in(zone, &np_key(cfg, thread, slot, i)).await;
+                    if matches!(&r, Err(e) if retryable(e)) && busy_wait(cfg, stop, &mut retries).await {
+                        continue;
+                    }
+                    break r;
+                };
                 let mut st = stats.lock().unwrap();
                 match result {
                     Ok(got) => {
@@ -363,20 +477,19 @@ fn np_slot<'a>(
                         if let Err(what) = check_read(cfg, keys[i], got, thread, slot, i) {
                             st.bad(what);
                         }
-                        st.record(1, start, Ok(()));
+                        st.record(1, start, retries, Ok(()));
                     }
-                    Err(e) => st.record(1, start, Err(err_kind(&e))),
+                    Err(e) => st.record(1, start, retries, Err(err_kind(&e))),
                 }
             } else {
                 let i = rng.next() as usize % cfg.keys;
                 seq += 1;
                 keys[i].attempted = seq;
-                let value = np_value(cfg.vsize, seq, thread, slot, i);
-                let result = coord.write_in(zone, &np_key(cfg, thread, slot, i), &value, options).await;
+                let (result, retries) = np_write(cfg, coord, zone, stop, (thread, slot, i), seq).await;
                 if result.is_ok() {
                     keys[i].acked = seq;
                 }
-                stats.lock().unwrap().record(0, start, result.map(|_| ()).map_err(|e| err_kind(&e)));
+                stats.lock().unwrap().record(0, start, retries, result);
             }
             busy_since.borrow_mut()[slot] = None;
         }
@@ -426,6 +539,17 @@ fn rss_mb() -> f64 {
         .map_or(0.0, |pages| pages * 4096.0 / 1e6)
 }
 
+fn cpu_secs() -> f64 {
+    // SAFETY: rusage holds only integers, so all-zero is a valid value, and
+    // getrusage only writes the struct we pass it.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return 0.0;
+    }
+    let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    secs(usage.ru_utime) + secs(usage.ru_stime)
+}
+
 fn client_counters() -> BTreeMap<&'static str, u64> {
     vals_cluster::observe::snapshot_named()
         .into_iter()
@@ -443,6 +567,7 @@ fn np_thread(
     stats: &Mutex<ThreadStats>,
     started: &std::sync::Barrier,
     stop: &AtomicBool,
+    done: &AtomicUsize,
 ) -> (u64, u64, u64) {
     let svc = CoordinatorService::new(np_coordinator(cfg, nodes, 4_000_000 + thread as u32));
     let coord = svc.coordinator().clone();
@@ -450,7 +575,7 @@ fn np_thread(
     let busy_since = RefCell::new(vec![None; cfg.slots]);
     started.wait();
     let mut futs: Vec<SlotFuture<'_>> = (0..cfg.slots)
-        .map(|slot| np_slot(cfg, &coord, zone, thread, slot, stats, &busy_since, stop))
+        .map(|slot| np_slot(cfg, &coord, zone, thread, slot, stats, &busy_since, stop, done))
         .collect();
     futs.push(np_publisher(cfg, &coord, stats, &busy_since, stop));
     let mut models = svc.run(vals_rt::join_all(futs));
@@ -458,7 +583,9 @@ fn np_thread(
 
     let (mut checked, mut bad, mut errors) = (0u64, 0u64, 0u64);
     for (slot, keys) in models.iter().enumerate() {
-        let idxs: Vec<usize> = (0..keys.len()).filter(|&i| keys[i].attempted > 0).collect();
+        let idxs: Vec<usize> = (0..keys.len())
+            .filter(|&i| keys[i].attempted > cfg.seq_base || (cfg.verify_all && keys[i].attempted > 0))
+            .collect();
         for chunk in idxs.chunks(64) {
             let ks: Vec<Vec<u8>> = chunk.iter().map(|&i| np_key(cfg, thread, slot, i)).collect();
             let results = match svc.run(coord.read_many_in(zone, &ks)) {
@@ -493,7 +620,11 @@ fn np_thread(
 /// Point writes, reads and batch reads at majority concern from many
 /// production-bounded clients, sampled every `VALS_NP_SAMPLE_SECS`, then a
 /// read-back of every key against the acknowledged history. Used to watch
-/// client progress through replica faults (task 0513).
+/// client progress through replica faults (task 0513) and by
+/// `scripts/file-bench.py` (task 0510): `VALS_NP_PREFILL=1` writes every key
+/// once and stops, and `VALS_NP_EXISTING=1` runs over keys an earlier run from
+/// the same client host wrote with the same prefix, value size and keys per
+/// slot, verifying only this run's writes unless `VALS_NP_VERIFY_ALL=1`.
 pub(super) fn workload_netprogress(spec: Option<&str>, zone: Option<&str>) {
     let (Some(spec), Some(zone_name)) = (spec, zone) else {
         eprintln!("usage: vals-bench vals netprogress <id@ip:port,...|id@a1,a2;id@...> <zone|default>");
@@ -507,20 +638,25 @@ pub(super) fn workload_netprogress(spec: Option<&str>, zone: Option<&str>) {
     let stats: Vec<Mutex<ThreadStats>> = (0..cfg.threads).map(|_| Mutex::default()).collect();
     let mut totals: [OpStats; 3] = Default::default();
     let mut bad_total = 0u64;
+    let done = AtomicUsize::new(0);
+    let (mut window_secs, mut client_cpu_secs) = (0.0, 0.0);
     let (checked, bad_verify, verify_errors) = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..cfg.threads)
             .map(|thread| {
-                let (cfg, nodes, stats, started, stop) = (&cfg, &nodes, &stats[thread], &started, &stop);
-                scope.spawn(move || np_thread(cfg, nodes, zone_name, thread, stats, started, stop))
+                let (cfg, nodes, stats, started, stop, done) =
+                    (&cfg, &nodes, &stats[thread], &started, &stop, &done);
+                scope.spawn(move || np_thread(cfg, nodes, zone_name, thread, stats, started, stop, done))
             })
             .collect();
         started.wait();
         let t0 = Instant::now();
+        let cpu0 = cpu_secs();
         let mut counters0 = client_counters();
         let mut next = cfg.sample_secs;
         loop {
             let elapsed = t0.elapsed().as_secs_f64();
-            if elapsed < next {
+            let all_done = done.load(AtOrd::Relaxed) >= cfg.threads * cfg.slots;
+            if elapsed < next && !all_done {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
@@ -567,10 +703,13 @@ pub(super) fn workload_netprogress(spec: Option<&str>, zone: Option<&str>) {
             }
             bad_total = bad;
             next += cfg.sample_secs;
-            if elapsed >= cfg.secs {
+            if elapsed >= cfg.secs || all_done {
+                window_secs = elapsed;
                 break;
             }
         }
+        client_cpu_secs = cpu_secs() - cpu0;
+        println!("NP_WINDOW_END {{\"elapsed\":{window_secs:.2}}}");
         stop.store(true, AtOrd::Relaxed);
         handles
             .into_iter()
@@ -582,7 +721,11 @@ pub(super) fn workload_netprogress(spec: Option<&str>, zone: Option<&str>) {
         .zip(totals.iter_mut())
         .map(|(name, op)| format!("\"{name}\":{}", op.json()))
         .collect();
-    println!("NP_SUMMARY {{\"ops\":{{{}}},\"bad_during_run\":{bad_total}}}", per_op.join(","));
+    println!(
+        "NP_SUMMARY {{\"elapsed\":{window_secs:.2},\"ops\":{{{}}},\"bad_during_run\":{bad_total},\"client_cpu_s\":{client_cpu_secs:.2},\"client_rss_mb\":{:.1}}}",
+        per_op.join(","),
+        rss_mb()
+    );
     let ok = bad_total == 0 && bad_verify == 0 && verify_errors == 0;
     println!(
         "NP_VERIFY {{\"ok\":{ok},\"checked\":{checked},\"bad\":{bad_verify},\"errors\":{verify_errors}}}"
