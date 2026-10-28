@@ -79,9 +79,13 @@ impl<T: Transport> Coordinator<T> {
     }
 
     /// Adds a per-node circuit breaker: after `cfg.failure_threshold`
-    /// consecutive failed requests to a node, requests to it fail immediately
-    /// as unavailable, except one probe every `cfg.open_cooldown_ms`, until a
-    /// request succeeds. This saves waiting for deadlines on a dead node.
+    /// consecutive failed requests to a node (timeouts included), requests to
+    /// it fail immediately as unavailable and reads ask its peers instead,
+    /// except one probe every `cfg.open_cooldown_ms`, until a request
+    /// succeeds. A read sends a due probe in addition to the replicas it
+    /// needs, so it does not wait for the probe. This saves waiting for
+    /// deadlines on a dead node; see "Replica outages" in the
+    /// [crate documentation](crate).
     pub fn with_failure_detector(mut self, cfg: crate::failure::FdConfig) -> Self {
         self.fd = Some(RefCell::new(FailureDetector::new(cfg)));
         self
@@ -150,7 +154,9 @@ impl<T: Transport> Coordinator<T> {
 
     /// In digest reads, also asks a spare replica if the needed replies have
     /// not arrived after `delay` (zero turns hedging off, the default).
-    /// Needs a [`CoordinatorService`] to run the hedge timer.
+    /// Needs a [`CoordinatorService`] to run the hedge timer. With a failure
+    /// detector, a replica whose reply the read gave up on after a hedge
+    /// counts as a failed request.
     pub fn with_digest_hedge(mut self, delay: Duration) -> Self {
         if delay.is_zero() {
             self.digest_hedge = None;
@@ -510,7 +516,7 @@ impl<T: Transport> Coordinator<T> {
     ) -> Result<Vec<NodeId>, CoordError> {
         match self.replicas_for(zone_id, key) {
             Err(CoordError::UnknownZone(_)) => {
-                let from = self.ring.borrow().members().next();
+                let from = self.members_by_health().into_iter().next();
                 if let Some(from) = from {
                     let _ = self.refresh_catalog(from).await;
                 }
@@ -524,7 +530,7 @@ impl<T: Transport> Coordinator<T> {
         if zone_id == DEFAULT_ZONE || self.catalog.borrow().contains(zone_id) {
             return Ok(());
         }
-        let from = self.ring.borrow().members().next();
+        let from = self.members_by_health().into_iter().next();
         if let Some(from) = from {
             let _ = self.refresh_catalog(from).await;
         }
@@ -537,8 +543,7 @@ impl<T: Transport> Coordinator<T> {
 
     #[doc(hidden)]
     pub async fn adopt_from_any_member(&self) -> bool {
-        let members: Vec<NodeId> = self.ring.borrow().members().collect();
-        for from in members {
+        for from in self.members_by_health() {
             if self.refresh_ring(from).await.is_ok() {
                 let _ = self.refresh_catalog(from).await;
                 return true;

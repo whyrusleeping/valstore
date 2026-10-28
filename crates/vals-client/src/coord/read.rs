@@ -1,5 +1,7 @@
 use super::*;
 
+type PendingNodeRead<'a> = Option<(NodeId, MixedNodeFuture<'a>)>;
+
 impl<T: Transport> Coordinator<T> {
     /// Reads `key` from the default zone with this coordinator's read concern
     /// (the one given to [`Coordinator::new`]); see
@@ -79,11 +81,16 @@ impl<T: Transport> Coordinator<T> {
         let mut by_node: std::collections::HashMap<NodeId, Vec<usize>> =
             std::collections::HashMap::new();
         for (i, nodes) in reps.iter().enumerate() {
-            let fanout = match self.read_fanout {
-                ReadFanout::All => nodes.len(),
-                _ => self.read.required_replies(nodes.len()),
+            let targets = match self.read_fanout {
+                ReadFanout::All => nodes.clone(),
+                _ => {
+                    let needed = self.read.required_replies(nodes.len());
+                    let mut order = self.read_plan(nodes, needed).0;
+                    order.truncate(needed);
+                    order
+                }
             };
-            for &n in nodes.iter().take(fanout) {
+            for n in targets {
                 by_node.entry(n).or_default().push(i);
             }
         }
@@ -194,6 +201,7 @@ impl<T: Transport> Coordinator<T> {
         keys: &[Vec<u8>],
         replicas: &[Vec<NodeId>],
         needed: &[usize],
+        active: &[usize],
     ) -> (
         Vec<Vec<(NodeId, Option<Version>, Option<Stored>)>>,
         Vec<u64>,
@@ -209,7 +217,7 @@ impl<T: Transport> Coordinator<T> {
         let mut initial = HashMap::<NodeId, Vec<(usize, MixedReadRole)>>::new();
         let mut next_rank = Vec::with_capacity(keys.len());
         for i in 0..keys.len() {
-            for (rank, &node) in replicas[i].iter().take(needed[i]).enumerate() {
+            for (rank, &node) in replicas[i].iter().take(active[i]).enumerate() {
                 initial.entry(node).or_default().push((
                     i,
                     if rank == 0 {
@@ -219,14 +227,15 @@ impl<T: Transport> Coordinator<T> {
                     },
                 ));
             }
-            next_rank.push(needed[i]);
+            next_rank.push(active[i]);
         }
-        let mut pending: Vec<Option<MixedNodeFuture<'_>>> = initial
+        let mut pending: Vec<PendingNodeRead<'_>> = initial
             .into_iter()
             .map(|(node, positions)| {
-                Some(self.mixed_node_future(zone_id, keys, node, positions))
+                Some((node, self.mixed_node_future(zone_id, keys, node, positions)))
             })
             .collect();
+        let mut overtaken = Vec::new();
         let mut responses: Vec<Vec<(NodeId, Option<Version>, Option<Stored>)>> =
             (0..keys.len()).map(|_| Vec::new()).collect();
         let mut stale_epochs = vec![0u64; keys.len()];
@@ -255,7 +264,7 @@ impl<T: Transport> Coordinator<T> {
             let event = std::future::poll_fn(|cx| {
                 let mut completed = Vec::new();
                 for slot in &mut pending {
-                    if let Some(future) = slot.as_mut() {
+                    if let Some((_, future)) = slot.as_mut() {
                         if let Poll::Ready(result) = future.as_mut().poll(cx) {
                             *slot = None;
                             completed.push(result);
@@ -313,6 +322,7 @@ impl<T: Transport> Coordinator<T> {
                 }
                 Event::Hedge => {
                     hedge_wait = None;
+                    overtaken.extend(pending.iter().flatten().map(|(node, _)| *node));
                     for i in 0..keys.len() {
                         if responses[i].len() < needed[i] && next_rank[i] < replicas[i].len() {
                             activate[i] = 1;
@@ -349,12 +359,15 @@ impl<T: Transport> Coordinator<T> {
             }
             pending.retain(Option::is_some);
             pending.extend(reserve.into_iter().map(|(node, positions)| {
-                Some(self.mixed_node_future(zone_id, keys, node, positions))
+                Some((node, self.mixed_node_future(zone_id, keys, node, positions)))
             }));
             if pending.is_empty() && !has_reserve {
                 break;
             }
         }
+        self.fd_note_overtaken(
+            pending.iter().flatten().map(|(node, _)| *node).filter(|n| overtaken.contains(n)),
+        );
         (responses, stale_epochs, overloaded, response_credits)
     }
 
@@ -365,13 +378,17 @@ impl<T: Transport> Coordinator<T> {
     ) -> Result<Vec<Result<Option<Stored>, CoordError>>, CoordError> {
         let mut replicas = Vec::with_capacity(keys.len());
         let mut needed = Vec::with_capacity(keys.len());
+        let mut active = Vec::with_capacity(keys.len());
         for key in keys {
             let reps = self.replicas_for(zone_id, key)?;
-            needed.push(self.read.required_replies(reps.len()));
-            replicas.push(reps);
+            let want = self.read.required_replies(reps.len());
+            let (order, start) = self.read_plan(&reps, want);
+            needed.push(want);
+            active.push(start);
+            replicas.push(order);
         }
         let (responses, mut stale_epochs, mut overloaded, mut response_credits) = self
-            .read_many_digest_probes(zone_id, keys, &replicas, &needed)
+            .read_many_digest_probes(zone_id, keys, &replicas, &needed, &active)
             .await;
 
         let mut winners: Vec<Option<Stored>> = vec![None; keys.len()];
@@ -563,10 +580,13 @@ impl<T: Transport> Coordinator<T> {
     ) -> Result<Option<Stored>, CoordError> {
         let reps = self.resolve_replicas(zone_id, key).await?;
         let needed = r.required_replies(reps.len());
+        let (reps, active) = self.read_plan(&reps, needed);
         let winner = match self.read_fanout {
-            ReadFanout::Digest => self.read_winner_digest(zone_id, key, &reps, needed).await,
+            ReadFanout::Digest => {
+                self.read_winner_digest(zone_id, key, &reps, needed, active).await
+            }
             ReadFanout::All | ReadFanout::Quorum => {
-                self.read_winner_value(zone_id, key, &reps, needed).await
+                self.read_winner_value(zone_id, key, &reps, needed, active).await
             }
         }?;
         if let Some(ref win) = winner {
@@ -581,6 +601,7 @@ impl<T: Transport> Coordinator<T> {
         key: &[u8],
         reps: &[NodeId],
         needed: usize,
+        active: usize,
     ) -> Result<Option<Stored>, CoordError> {
         let stale_epoch = Cell::new(0u64);
         let overloaded = Cell::new(false);
@@ -613,7 +634,7 @@ impl<T: Transport> Coordinator<T> {
             }
         };
         let fanout = match self.read_fanout {
-            ReadFanout::Quorum => needed,
+            ReadFanout::Quorum => active,
             _ => reps.len(),
         };
         let primary = reps[..fanout].iter().map(|&n| read_one(n)).collect();
@@ -680,50 +701,22 @@ impl<T: Transport> Coordinator<T> {
         key: &[u8],
         reps: &[NodeId],
         needed: usize,
+        active: usize,
     ) -> Result<Option<Stored>, CoordError> {
         let stale_epoch = Cell::new(0u64);
         let overloaded = Cell::new(false);
+        let started = RefCell::new(Vec::new());
+        let answered = RefCell::new(Vec::new());
+        let overtaken = RefCell::new(Vec::new());
         let probe = |node: NodeId, want_value: bool| {
             let stale_epoch = &stale_epoch;
             let overloaded = &overloaded;
+            let (started, answered) = (&started, &answered);
             async move {
-                let note_stale = |e: &TransportError| {
-                    if let TransportError::StaleEpoch(ep) = e {
-                        stale_epoch.set(stale_epoch.get().max(*ep));
-                    } else if matches!(e, TransportError::Overloaded) {
-                        overloaded.set(true);
-                    }
-                };
-                if want_value {
-                    match self.fd_read(node, zone_id, key).await {
-                        Ok(entry) => {
-                            let bytes = entry.as_ref().map_or(0, stored_response_bytes);
-                            match self.transport.retain_response(node, bytes) {
-                                Ok(credit) => {
-                                    Ok((node, entry.as_ref().map(|s| s.version), entry, credit))
-                                }
-                                Err(e) => {
-                                    if matches!(e, TransportError::Overloaded) {
-                                        overloaded.set(true);
-                                    }
-                                    Err(e)
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            note_stale(&e);
-                            Err(e)
-                        }
-                    }
-                } else {
-                    match self.fd_digest(node, zone_id, key).await {
-                        Ok(version) => Ok((node, version, None, None)),
-                        Err(e) => {
-                            note_stale(&e);
-                            Err(e)
-                        }
-                    }
-                }
+                started.borrow_mut().push(node);
+                let result = self.digest_probe(node, zone_id, key, want_value, stale_epoch, overloaded).await;
+                answered.borrow_mut().push(node);
+                result
             }
         };
 
@@ -736,24 +729,27 @@ impl<T: Transport> Coordinator<T> {
             Some(h) if reps.len() > needed => {
                 let clock = h.clock.clone();
                 let delay_ticks = h.delay_ticks;
+                let (started, overtaken) = (&started, &overtaken);
                 let hedge = move || {
                     let clock = clock.clone();
                     async move {
                         clock.wait_ticks(delay_ticks).await;
                         crate::observe::counters().digest_hedges_fired.inc();
+                        overtaken.borrow_mut().extend(started.borrow().iter().copied());
                     }
                 };
-                vals_rt::quorum_collect_reserve_hedged(futs, needed, needed, hedge).await
+                vals_rt::quorum_collect_reserve_hedged(futs, needed, active, hedge).await
             }
-            _ => vals_rt::quorum_collect_reserve(futs, needed, needed).await,
+            _ => vals_rt::quorum_collect_reserve(futs, needed, active).await,
         };
+        let answered = answered.into_inner();
+        self.fd_note_overtaken(overtaken.into_inner().into_iter().filter(|n| !answered.contains(n)));
         let mut responses = Vec::with_capacity(retained.len());
         let mut response_credits = Vec::new();
         for (node, version, stored, credit) in retained {
             responses.push((node, version, stored));
             response_credits.extend(credit);
         }
-
         if responses.len() < needed {
             if overloaded.get() {
                 return Err(CoordError::Overloaded);
@@ -829,6 +825,37 @@ impl<T: Transport> Coordinator<T> {
         Ok(Some(winner))
     }
 
+    async fn digest_probe(
+        &self,
+        node: NodeId,
+        zone_id: ZoneId,
+        key: &[u8],
+        want_value: bool,
+        stale_epoch: &Cell<u64>,
+        overloaded: &Cell<bool>,
+    ) -> Result<(NodeId, Option<Version>, Option<Stored>, Option<Credit>), TransportError> {
+        let note = |e: &TransportError| {
+            if let TransportError::StaleEpoch(ep) = e {
+                stale_epoch.set(stale_epoch.get().max(*ep));
+            } else if matches!(e, TransportError::Overloaded) {
+                overloaded.set(true);
+            }
+        };
+        if !want_value {
+            return match self.fd_digest(node, zone_id, key).await {
+                Ok(version) => Ok((node, version, None, None)),
+                Err(e) => {
+                    note(&e);
+                    Err(e)
+                }
+            };
+        }
+        let entry = self.fd_read(node, zone_id, key).await.inspect_err(note)?;
+        let bytes = entry.as_ref().map_or(0, stored_response_bytes);
+        let credit = self.transport.retain_response(node, bytes).inspect_err(note)?;
+        Ok((node, entry.as_ref().map(|s| s.version), entry, credit))
+    }
+
     /// Reads `key` from the default zone from a single replica, trying the
     /// key's replicas one at a time (starting at a rotating position) until
     /// one answers. Fast, but eventually consistent: the answer may be stale
@@ -844,9 +871,11 @@ impl<T: Transport> Coordinator<T> {
         }
         let start = self.read_rotor.get();
         self.read_rotor.set(start.wrapping_add(1));
+        let rotated: Vec<NodeId> = (0..reps.len())
+            .map(|i| reps[start.wrapping_add(i) % reps.len()])
+            .collect();
         let mut stale_epoch = 0u64;
-        for i in 0..reps.len() {
-            let node = reps[(start.wrapping_add(i)) % reps.len()];
+        for node in self.read_plan(&rotated, 1).0 {
             match self.fd_read(node, DEFAULT_ZONE, key).await {
                 Ok(entry) => {
                     let bytes = entry.as_ref().map_or(0, stored_response_bytes);

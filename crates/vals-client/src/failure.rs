@@ -82,6 +82,17 @@ impl FailureDetector {
         }
     }
 
+    pub fn rank(&self, node: NodeId, now: u64) -> u8 {
+        match self.nodes.get(&node) {
+            None => 0,
+            Some(h) => match h.probe_after {
+                Some(t) if now < t => 3,
+                Some(_) => 2,
+                None => u8::from(h.fails > 0),
+            },
+        }
+    }
+
     pub fn is_down(&self, node: NodeId, now: u64) -> bool {
         match self.nodes.get(&node).and_then(|h| h.probe_after) {
             Some(t) => now < t,
@@ -178,6 +189,20 @@ mod tests {
             "next caller fast-fails — not stuck open-for-all"
         );
         assert!(d.admit(1, 2000), "re-probes after the bumped cooldown");
+    }
+
+    #[test]
+    fn rank_orders_healthy_suspect_probe_due_and_cooling_nodes() {
+        let mut d = fd(2, 1000);
+        d.record_failure(2, 0);
+        d.record_failure(3, 0);
+        d.record_failure(3, 0);
+        assert_eq!([1, 2, 3].map(|n| d.rank(n, 500)), [0, 1, 3]);
+        assert_eq!(d.rank(3, 1000), 2, "cooldown over: probe due");
+        assert!(d.admit(3, 1000));
+        assert_eq!(d.rank(3, 1000), 3, "the admitted probe re-arms the cooldown");
+        d.record_success(3);
+        assert_eq!(d.rank(3, 1000), 0);
     }
 
     #[test]

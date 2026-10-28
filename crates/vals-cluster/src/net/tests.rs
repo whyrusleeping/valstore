@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::antientropy::AePeer;
 use crate::coord::{
-    BatchAck, BatchEntry, CoordError, Coordinator, WriteConcern, WriteOptions, ReadFanout, Transport,
+    BatchAck, BatchEntry, CoordError, Coordinator, WriteConcern, WriteOptions, ReadConcern, ReadFanout, Transport,
     TransportError, WriteOutcome,
 };
 use crate::partition::RangeMap;
@@ -816,7 +816,98 @@ fn rpc_deadline_fails_a_black_holing_peer() {
         "the deadline must fire promptly (took {:?})",
         start.elapsed()
     );
+    let r = run(t.read(1, DEFAULT_ZONE, b"k"));
+    assert!(matches!(r, Err(TransportError::Timeout)), "got {r:?}");
+    assert_eq!(
+        t.connection_stats()[0].reconnects,
+        1,
+        "a connection silent for a whole deadline is replaced, not reused"
+    );
     drop(bg);
+}
+
+#[test]
+fn a_handshake_silent_past_the_connect_deadline_is_abandoned_even_with_no_request_waiting() {
+    use std::net::TcpListener;
+
+    let lst = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = lst.local_addr().unwrap();
+    let t = NetTransport::connect(&[(1, addr)]).with_rpc_deadline(Duration::from_millis(200));
+    {
+        let mut read = Box::pin(t.read(1, DEFAULT_ZONE, b"k"));
+        assert!(read.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    reactor::poll_io_nonblocking();
+    let r = run(t.read(1, DEFAULT_ZONE, b"k"));
+    assert!(matches!(r, Err(TransportError::Timeout)), "got {r:?}");
+    assert_eq!(
+        t.connection_stats()[0].reconnects,
+        1,
+        "the second request dialed afresh instead of joining the stale handshake"
+    );
+    drop(lst);
+}
+
+#[test]
+fn withdrawing_an_unsent_request_does_not_shorten_the_next_requests_deadline() {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    fn frame(s: &mut TcpStream) -> Vec<u8> {
+        let mut n = [0; 4];
+        s.read_exact(&mut n).unwrap();
+        let mut b = vec![0; u32::from_le_bytes(n) as usize];
+        s.read_exact(&mut b).unwrap();
+        b
+    }
+    fn reply(s: &mut TcpStream, id: &[u8]) {
+        let payload = wire::encode_response_payload(&Response::Read(None));
+        let mut out = ((8 + payload.len()) as u32).to_le_bytes().to_vec();
+        out.extend_from_slice(id);
+        out.extend_from_slice(&payload);
+        s.write_all(&out).unwrap();
+    }
+    let lst = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = lst.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = lst.accept().unwrap();
+        frame(&mut s);
+        s.write_all(&crate::proto::encode_hello()).unwrap();
+        let b = frame(&mut s);
+        reply(&mut s, &b[..8]);
+        let b = frame(&mut s);
+        std::thread::sleep(Duration::from_millis(150));
+        reply(&mut s, &b[..8]);
+    });
+    let t = NetTransport::connect(&[(1, addr)]).with_rpc_deadline(Duration::from_millis(400));
+    run(t.read(1, DEFAULT_ZONE, b"warm")).unwrap();
+    {
+        let mut cancelled = Box::pin(t.read(1, DEFAULT_ZONE, b"withdrawn"));
+        assert!(cancelled.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let r = run(t.read(1, DEFAULT_ZONE, b"healthy"));
+    assert!(r.is_ok(), "a reply 150 ms into a 400 ms deadline must arrive: {r:?}");
+    assert_eq!(t.connection_stats()[0].reconnects, 0);
+    server.join().unwrap();
+}
+
+#[test]
+fn a_connection_silent_for_a_deadline_is_replaced_and_the_next_request_succeeds() {
+    let ring = Ring::from_members(1, 64, [1]);
+    let server = ReplicaServer::spawn(replica(1)).unwrap();
+    let proxy = BlackholeProxy::spawn(server);
+    let t = NetTransport::connect(&[(1, proxy.addr)]).with_rpc_deadline(Duration::from_millis(300));
+    let coord = Coordinator::new(9, ring, 1, t);
+    run(coord.write_in(DEFAULT_ZONE, b"k", b"v", WriteConcern::All)).unwrap();
+
+    proxy.hang();
+    assert!(run(coord.read_in(DEFAULT_ZONE, b"k")).is_err());
+    proxy.forward();
+    let got = run(coord.read_in(DEFAULT_ZONE, b"k")).unwrap();
+    assert_eq!(got.and_then(|s| s.value), Some(b"v".to_vec()));
+    assert_eq!(coord.transport().connection_stats()[0].reconnects, 1);
 }
 
 #[test]
@@ -2964,6 +3055,10 @@ impl BlackholeProxy {
         self.mode.store(Self::HANG, std::sync::atomic::Ordering::SeqCst);
     }
 
+    fn forward(&self) {
+        self.mode.store(Self::FORWARD, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn reset_client_connections(&self) {
         for client in self.clients.lock().unwrap().drain(..) {
             let _ = client.shutdown(std::net::Shutdown::Both);
@@ -3055,6 +3150,68 @@ fn quorum_writes_keep_pace_while_one_replica_host_is_black_holed() {
         let want: Vec<Vec<u8>> = (round * 16 + 8..round * 16 + 16).map(key).collect();
         assert_eq!(got.into_iter().map(|(k, _)| k).collect::<Vec<_>>(), want);
     }
+    drop(nodes);
+}
+
+#[test]
+fn batched_reads_fail_over_after_one_deadline_on_a_black_holed_replica() {
+    use crate::node::Node;
+    use crate::zonestore::{MemZoneStore, ZoneGeom};
+
+    let zone_id = 7;
+    let cfg = ZoneConfig { name: "blackhole".into(), rf: 3, ordering: Ordering::Unsorted, scope: None };
+    let ring = Ring::from_members(3, 64, [1, 2, 3]);
+    let binds: Vec<_> = (0..3).map(|_| Node::bind().unwrap()).collect();
+    let proxy = BlackholeProxy::spawn(binds[2].1);
+    let peers: Vec<(NodeId, SocketAddr)> =
+        vec![(1, binds[0].1), (2, binds[1].1), (3, proxy.addr)];
+    let mut nodes = Vec::new();
+    for (i, (listener, _)) in binds.into_iter().enumerate() {
+        let node = (i + 1) as NodeId;
+        let provider = MemZoneStore::new(node, ZoneGeom {
+            block_size: 256,
+            seg_blocks: 4,
+            reserved_blocks: 0,
+            region_blocks: 16384,
+        });
+        let zone0 = provider.open(zone_id, Ordering::Unsorted).unwrap();
+        let mut catalog = Catalog::new();
+        catalog.insert(zone_id, cfg.clone());
+        nodes.push(crate::testutil::running(Node::serve_zoned(
+            node, listener, zone0, provider, catalog, ring.clone(), peers.clone(),
+            Duration::from_millis(50), None,
+        )));
+    }
+    for (_, addr) in &peers {
+        push_members_full(*addr, 1, &peers);
+    }
+    let deadline = Duration::from_secs(1);
+    let coordinator = Coordinator::new(
+        99, ring.clone(), ReadConcern::Majority,
+        NetTransport::connect(&peers).with_rpc_deadline(deadline),
+    );
+    run(coordinator.refresh_catalog(1)).unwrap();
+    let keys: Vec<Vec<u8>> = (0..32u32).map(|i| format!("k{i}").into_bytes()).collect();
+    for key in &keys {
+        run(coordinator.write_in(zone_id, key, key, WriteConcern::All)).unwrap();
+    }
+    let behind = keys
+        .iter()
+        .filter(|k| coordinator.replicas_for(zone_id, k).unwrap()[..2].contains(&3))
+        .count();
+    assert!(behind >= 8, "only {behind} keys read node 3 first");
+
+    proxy.hang();
+    let start = Instant::now();
+    let got = run(coordinator.read_many_in(zone_id, &keys)).unwrap();
+    let elapsed = start.elapsed();
+    for (key, got) in keys.iter().zip(got) {
+        assert_eq!(got.unwrap().and_then(|s| s.value), Some(key.clone()));
+    }
+    assert!(
+        elapsed < deadline * 2,
+        "a batched read waited {elapsed:?} for the black-holed replica (deadline {deadline:?})"
+    );
     drop(nodes);
 }
 

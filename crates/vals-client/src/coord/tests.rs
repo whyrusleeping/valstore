@@ -680,9 +680,40 @@ use super::*;
         vals_rt::block_on(future, || {})
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DeadMode {
+        Hang,
+        TimeOut,
+        Healed,
+    }
+
     struct BlackholedReplica {
         dead: NodeId,
+        mode: Cell<DeadMode>,
         delivered: RefCell<BTreeMap<NodeId, usize>>,
+        reads: RefCell<BTreeMap<NodeId, usize>>,
+    }
+
+    impl BlackholedReplica {
+        fn new(dead: NodeId) -> Self {
+            BlackholedReplica {
+                dead,
+                mode: Cell::new(DeadMode::Hang),
+                delivered: RefCell::default(),
+                reads: RefCell::default(),
+            }
+        }
+
+        async fn reach(&self, node: NodeId) -> Result<(), TransportError> {
+            if node != self.dead {
+                return Ok(());
+            }
+            match self.mode.get() {
+                DeadMode::Hang => std::future::pending().await,
+                DeadMode::TimeOut => Err(TransportError::Timeout),
+                DeadMode::Healed => Ok(()),
+            }
+        }
     }
 
     impl Transport for BlackholedReplica {
@@ -694,24 +725,31 @@ use super::*;
             _value: Option<&[u8]>,
             _version: Version,
         ) -> Result<Applied, TransportError> {
-            if node == self.dead {
-                std::future::pending::<()>().await;
-            }
+            self.reach(node).await?;
             *self.delivered.borrow_mut().entry(node).or_default() += 1;
             Ok(Applied::Won)
         }
 
         async fn read(
             &self,
-            _node: NodeId,
+            node: NodeId,
             _zone_id: ZoneId,
             _key: &[u8],
         ) -> Result<Option<Stored>, TransportError> {
+            *self.reads.borrow_mut().entry(node).or_default() += 1;
+            self.reach(node).await?;
             Ok(None)
         }
 
-        async fn members(&self, _node: NodeId) -> Result<RingView, TransportError> {
-            Ok(RingView::default())
+        async fn members(&self, node: NodeId) -> Result<RingView, TransportError> {
+            self.reach(node).await?;
+            Ok(RingView {
+                epoch: 1,
+                vnodes: 64,
+                rf: 3,
+                members: vec![(1, 1), (2, 1), (3, 1)],
+                addrs: Vec::new(),
+            })
         }
 
         async fn zones(&self, _node: NodeId) -> Result<Catalog, TransportError> {
@@ -740,8 +778,8 @@ use super::*;
             _version: Version,
             slices: &[crate::wire::WireSlice<'_>],
         ) -> Vec<BatchAck> {
-            if node == self.dead {
-                std::future::pending::<()>().await;
+            if self.reach(node).await.is_err() {
+                return vec![BatchAck::Unreachable; slices.len()];
             }
             *self.delivered.borrow_mut().entry(node).or_default() += slices.len();
             vec![BatchAck::Applied(Applied::Won); slices.len()]
@@ -760,7 +798,7 @@ use super::*;
     fn quorum_batches_and_range_deletes_do_not_wait_for_a_black_holed_replica() {
         let ranges = 3 * crate::wire::MAX_RANGE_DELETE_SLICES as u32 + 1;
         for dead in [1, 3] {
-            let transport = BlackholedReplica { dead, delivered: RefCell::default() };
+            let transport = BlackholedReplica::new(dead);
             let coord = Coordinator::new(9, Ring::from_members(3, 64, [1, 2, 3]), 2, transport);
             run_ready(coord.refresh_catalog(1)).unwrap();
             coord.set_range_map(7, RangeMap::from_splits((1..ranges).map(|r| r.to_be_bytes().to_vec())));
@@ -780,5 +818,187 @@ use super::*;
             for node in [1, 2, 3].into_iter().filter(|&n| n != dead) {
                 assert_eq!(delivered.get(&node), Some(&(ranges as usize)), "node {node}");
             }
+        }
+    }
+
+    fn fd_coordinator(
+        dead: NodeId,
+        fanout: ReadFanout,
+    ) -> (Coordinator<BlackholedReplica>, Rc<Cell<u64>>) {
+        let now = Rc::new(Cell::new(0u64));
+        let clock = now.clone();
+        let coord = Coordinator::new(
+            9,
+            Ring::from_members(3, 64, [1, 2, 3]),
+            ReadConcern::Majority,
+            BlackholedReplica::new(dead),
+        )
+        .with_read_fanout(fanout)
+        .with_failure_detector(crate::failure::FdConfig {
+            failure_threshold: 1,
+            open_cooldown_ms: 1000,
+        })
+        .with_clock(move || clock.get());
+        (coord, now)
+    }
+
+    fn keys_led_by(coord: &Coordinator<BlackholedReplica>, node: NodeId) -> Vec<Vec<u8>> {
+        (0..4096u32)
+            .map(|i| format!("k{i}").into_bytes())
+            .filter(|k| coord.replicas_for(DEFAULT_ZONE, k).unwrap()[0] == node)
+            .take(16)
+            .collect()
+    }
+
+    #[test]
+    fn reads_route_around_a_replica_the_failure_detector_marks_down() {
+        for fanout in [ReadFanout::Digest, ReadFanout::Quorum] {
+            for dead in [1, 2, 3] {
+                let (coord, now) = fd_coordinator(dead, fanout);
+                let keys = keys_led_by(&coord, dead);
+                assert!(
+                    poll_once(coord.read_in(DEFAULT_ZONE, &keys[0])).is_none(),
+                    "the dead node leads the key's replicas, so an unknowing read waits for it"
+                );
+
+                coord.transport().mode.set(DeadMode::TimeOut);
+                poll_once(coord.write_in(DEFAULT_ZONE, &keys[0], b"v", WriteConcern::Majority))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(coord.down_nodes(), vec![dead]);
+                coord.transport().mode.set(DeadMode::Hang);
+
+                let contacted = || coord.transport().reads.borrow().get(&dead).copied().unwrap_or(0);
+                let before = contacted();
+                for key in &keys {
+                    poll_once(coord.read_in(DEFAULT_ZONE, key))
+                        .unwrap_or_else(|| panic!("{fanout:?} dead {dead}: the read waited"))
+                        .unwrap();
+                }
+                let many = poll_once(coord.read_many_in(DEFAULT_ZONE, &keys))
+                    .unwrap_or_else(|| panic!("{fanout:?} dead {dead}: read_many waited"))
+                    .unwrap();
+                assert!(many.iter().all(Result::is_ok));
+                poll_once(coord.cas_in(DEFAULT_ZONE, &keys[1], b"c", None))
+                    .unwrap_or_else(|| panic!("{fanout:?} dead {dead}: cas waited"))
+                    .unwrap();
+                assert_eq!(contacted(), before, "a node in cooldown is not read");
+
+                now.set(1000);
+                poll_once(coord.read_in(DEFAULT_ZONE, &keys[2]))
+                    .unwrap_or_else(|| panic!("{fanout:?} dead {dead}: the read waited for the probe"))
+                    .unwrap();
+                assert_eq!(contacted(), before + 1, "the due probe rides along with the read");
+                assert!(coord.is_node_down(dead));
+
+                coord.transport().mode.set(DeadMode::Healed);
+                now.set(2000);
+                poll_once(coord.read_in(DEFAULT_ZONE, &keys[3])).unwrap().unwrap();
+                assert!(coord.down_nodes().is_empty(), "a successful probe readmits the node");
+            }
+        }
+    }
+
+    #[test]
+    fn default_zone_writes_replay_hints_only_to_replicas_that_acknowledged() {
+        for dead in [1, 3] {
+            let coord = Coordinator::new(
+                9,
+                Ring::from_members(3, 64, [1, 2, 3]),
+                ReadConcern::Majority,
+                BlackholedReplica::new(dead),
+            );
+            let keys = keys_led_by(&coord, dead);
+            coord.transport().mode.set(DeadMode::TimeOut);
+            for key in &keys[..4] {
+                poll_once(coord.write_in(DEFAULT_ZONE, key, b"v", WriteConcern::Majority))
+                    .unwrap()
+                    .unwrap();
+            }
+            assert_eq!(coord.pending_hints(dead), 4);
+
+            coord.transport().mode.set(DeadMode::Hang);
+            poll_once(coord.write_in(DEFAULT_ZONE, &keys[4], b"v", WriteConcern::Majority))
+                .unwrap_or_else(|| panic!("dead {dead}: the write waited on hint replay"))
+                .unwrap();
+            assert_eq!(coord.pending_hints(dead), 4);
+
+            coord.transport().mode.set(DeadMode::Healed);
+            let delivered = || coord.transport().delivered.borrow().get(&dead).copied().unwrap_or(0);
+            poll_once(coord.write_in(DEFAULT_ZONE, &keys[5], b"v", WriteConcern::Majority))
+                .unwrap()
+                .unwrap();
+            assert_eq!(coord.pending_hints(dead), 0);
+            assert_eq!(delivered(), 5, "the write itself plus four replayed hints");
+
+            coord.transport().mode.set(DeadMode::TimeOut);
+            for key in &keys[..3] {
+                poll_once(coord.write_in(DEFAULT_ZONE, key, b"w", WriteConcern::Majority))
+                    .unwrap()
+                    .unwrap();
+            }
+            assert_eq!(poll_once(coord.replay_hints(dead)), Some(0));
+            assert_eq!(coord.pending_hints(dead), 3, "undelivered hints stay queued");
+        }
+    }
+
+    #[test]
+    fn membership_refresh_starts_with_members_not_marked_down() {
+        let (coord, _now) = fd_coordinator(1, ReadFanout::Digest);
+        let keys = keys_led_by(&coord, 1);
+        assert!(poll_once(coord.adopt_from_any_member()).is_none(), "node 1 is asked first");
+
+        coord.transport().mode.set(DeadMode::TimeOut);
+        poll_once(coord.write_in(DEFAULT_ZONE, &keys[0], b"v", WriteConcern::Majority))
+            .unwrap()
+            .unwrap();
+        coord.transport().mode.set(DeadMode::Hang);
+        assert_eq!(poll_once(coord.adopt_from_any_member()), Some(true));
+        assert_eq!(coord.ring_epoch(), 1);
+    }
+
+    fn poll_ticking<F: Future>(clock: &HedgeClock, future: F) -> Option<F::Output> {
+        let mut future = std::pin::pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        for _ in 0..32 {
+            if let Poll::Ready(out) = future.as_mut().poll(&mut cx) {
+                return Some(out);
+            }
+            clock.advance();
+        }
+        None
+    }
+
+    #[test]
+    fn hedged_reads_teach_the_failure_detector_about_a_silent_replica() {
+        for many in [false, true] {
+            let (coord, _now) = fd_coordinator(2, ReadFanout::Digest);
+            let coord = coord
+                .with_digest_hedge(Duration::from_millis(40))
+                .with_failure_detector(crate::failure::FdConfig {
+                    failure_threshold: 2,
+                    open_cooldown_ms: 1000,
+                });
+            let clock = coord.hedge_clock().unwrap();
+            let keys = keys_led_by(&coord, 2);
+            let read = |i: usize| {
+                let coord = &coord;
+                let keys = &keys;
+                async move {
+                    if many {
+                        coord.read_many_in(DEFAULT_ZONE, &keys[i..i + 2]).await.map(|_| ())
+                    } else {
+                        coord.read_in(DEFAULT_ZONE, &keys[i]).await.map(|_| ())
+                    }
+                }
+            };
+            for i in 0..2 {
+                assert!(poll_once(read(i)).is_none(), "many={many}: the silent leader holds the read");
+                poll_ticking(&clock, read(i)).unwrap().unwrap();
+            }
+            assert_eq!(coord.down_nodes(), vec![2], "many={many}");
+            poll_once(read(4))
+                .unwrap_or_else(|| panic!("many={many}: a tripped node is routed around"))
+                .unwrap();
         }
     }

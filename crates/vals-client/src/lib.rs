@@ -61,7 +61,7 @@
 //!   and [`CoordinatorService`] for hosting a coordinator with background
 //!   refresh.
 //! - Options and results: [`WriteConcern`], [`Persistence`], [`WriteOptions`],
-//!   [`ReadConcern`], [`ReadFanout`], [`Stored`], [`Version`], [`CasResult`], [`SloppyAck`],
+//!   [`ReadConcern`], [`ReadFanout`], [`FdConfig`], [`Stored`], [`Version`], [`CasResult`], [`SloppyAck`],
 //!   [`BatchResult`], [`WriteOutcome`], [`ScanQuery`], [`CreditStats`], and
 //!   the errors [`CoordError`], [`ReplicaError`], [`RangeDeleteMiss`] and
 //!   [`TransportError`].
@@ -116,7 +116,9 @@
 //! - **Deadlines.** Each RPC has the deadline from [`ClientConfig`] (5 s by
 //!   default). An operation that refreshes the ring or waits for client
 //!   credits can take longer than one deadline; wrap it in your own timeout if
-//!   you need an end-to-end bound.
+//!   you need an end-to-end bound. A connection that receives nothing for a
+//!   whole deadline while it awaits a reply (or a handshake) is closed, and
+//!   the next request to that node opens a new one.
 //!
 //! # Persistence and consistency
 //!
@@ -172,6 +174,56 @@
 //! Buffered majority writes are faster (no device sync per write) and still
 //! survive the loss of any minority of replicas; choose them when a
 //! simultaneous power loss of a key's replicas is acceptable to you.
+//!
+//! # Replica outages
+//!
+//! With majority concerns, operations keep succeeding while a minority of a
+//! key's replicas is out. How long each operation waits depends on how the
+//! replica fails:
+//!
+//! - A **refused** connection (a crashed or restarting process) fails at
+//!   once, and the operation goes on with the other replicas.
+//! - A **silent** replica (a host that lost power or its network, or a
+//!   firewall dropping packets) returns no error. A write still finishes as
+//!   soon as `W` other replicas acknowledge it. A read asks `R` replicas
+//!   first, so if the silent one is among them the read waits for the RPC
+//!   deadline before asking another.
+//!
+//! For a long-running client, use:
+//!
+//! - [`ClientConfig::default()`] (5 s connect and RPC deadlines, finite
+//!   budgets). Choose the RPC deadline as the longest a read may stall when a
+//!   replica goes silent, but above your slowest legitimate request (device
+//!   syncs under load, large scan pages).
+//! - [`Coordinator::with_failure_detector`]`(`[`FdConfig::default()`]`)`.
+//!   Three consecutive failures (a timeout counts) mark a node down: reads go
+//!   to its peers, writes stop sending to it, and once per cooldown one
+//!   request also goes to it as a probe that majority operations do not wait
+//!   for. A probe that answers before its operation completes brings the
+//!   node back; otherwise the next probe tries again. Without a
+//!   detector, every read whose first `R` replicas include a silent node
+//!   waits a full deadline for as long as the outage lasts.
+//! - For reads that must not stall for a deadline, host the coordinator in a
+//!   [`CoordinatorService`] and add
+//!   [`with_digest_hedge`](Coordinator::with_digest_hedge) with a delay
+//!   above your normal read latency (for example 50 ms). A read then asks
+//!   one more replica when a reply is that late, and the detector counts the
+//!   replica it gave up on as failed, so a silent node is marked down after
+//!   a few reads.
+//!
+//! Each coordinator detects failures by itself: with one coordinator per
+//! thread, every thread pays the detection cost once. Measured on three hosts
+//! (RF 3, eight client threads with 64 majority operations in flight at about
+//! 2,000 per second, half writes, one host's traffic dropped for 30 s):
+//!
+//! | Client | First 5 s of the outage | Rest of the outage | After the host returns |
+//! |---|---|---|---|
+//! | No detector | reads stall for the 5 s deadline; throughput near zero | same | normal within 2 s |
+//! | Detector | throughput near zero until the first deadlines expire | normal rate | normal within 2 s |
+//! | Detector and 50 ms hedge | normal rate, read p99 62 ms | normal rate, read p99 3 ms | normal |
+//!
+//! In local tests, killing and restarting a replica process (refused
+//! connections) did not slow the client in any configuration.
 
 pub mod coord;
 pub mod net;

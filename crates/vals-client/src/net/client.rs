@@ -26,6 +26,10 @@ use super::{catalog_from_wire, frame_msg, FrameRead, MAX_CONN_SEND_BUF, MAX_FRAM
 
 type IdMap<V> = HashMap<u64, V, BuildHasherDefault<crate::net::FxHasher>>;
 
+fn is_unreachable(error: &TransportError) -> bool {
+    matches!(error, TransportError::Timeout | TransportError::Unavailable)
+}
+
 fn try_transport_credit(
     pool: &Rc<RefCell<CreditPool>>,
     node: NodeId,
@@ -137,6 +141,7 @@ pub struct ConnState {
     budget_node: NodeId,
     reader_bytes: usize,
     last_io: Option<Instant>,
+    silent_since: Option<Instant>,
     idle_resumed: bool,
 }
 
@@ -205,12 +210,32 @@ impl ConnState {
             self.sent_total = 0;
             self.min_send_watermark = None;
             self.negotiated = None;
-            self.last_io = Some(Instant::now());
+            let now = Instant::now();
+            self.last_io = Some(now);
             self.idle_resumed = false;
+            self.await_reply_from(now);
             self.out.extend_from_slice(&crate::proto::encode_hello());
             self.enqueued_total = self.out.len() as u64;
         }
         Ok(())
+    }
+
+    fn silence_limit(&self) -> Option<Instant> {
+        let limit = if self.negotiated.is_some() {
+            self.rpc_deadline
+        } else {
+            self.connect_deadline
+        };
+        Some(self.silent_since? + limit?)
+    }
+
+    fn await_reply_from(&mut self, now: Instant) {
+        if self.silent_since.is_none() {
+            self.silent_since = Some(now);
+            if let Some(limit) = self.silence_limit() {
+                self.next_deadline = Some(self.next_deadline.map_or(limit, |n| n.min(limit)));
+            }
+        }
     }
 
     fn fail_expired(&mut self, now: Instant, wake: &mut Vec<Waker>) {
@@ -231,6 +256,13 @@ impl ConnState {
             }
         }
         self.next_deadline = next;
+        match self.silence_limit() {
+            Some(limit) if limit <= now && self.sock.is_some() => {
+                self.reset_failed_as(wake, TransportError::Timeout);
+            }
+            Some(limit) => self.next_deadline = Some(next.map_or(limit, |n| n.min(limit))),
+            None => {}
+        }
     }
 
     fn resolve_sent(&mut self, wake: &mut Vec<Waker>) {
@@ -298,6 +330,7 @@ impl ConnState {
             .values()
             .filter(|pending| pending.result.is_none())
             .filter_map(|pending| pending.deadline_at)
+            .chain(self.silence_limit())
             .min();
         Some(waiter)
     }
@@ -348,6 +381,7 @@ impl ConnState {
         self.release_reader_budget();
         self.driver = None;
         self.negotiated = None;
+        self.silent_since = None;
         for (id, mut w) in self.pending.drain() {
             let outcome = match w.result.take() {
                 Some(result) => result.map(|bytes| AccountedBytes {
@@ -407,7 +441,11 @@ impl ConnState {
             }
         }
         if self.out_pos != pos_before {
-            self.last_io = Some(Instant::now());
+            let now = Instant::now();
+            self.last_io = Some(now);
+            if self.negotiated.is_some() {
+                self.await_reply_from(now);
+            }
         }
         if ok && self.out_pos == self.out.len() {
             self.out = Vec::new();
@@ -549,6 +587,7 @@ impl ConnState {
                 Poll::Pending => {
                     if got_frame {
                         self.last_io = Some(Instant::now());
+                        self.silent_since = None;
                     }
                     return Ok(());
                 }
@@ -1254,8 +1293,13 @@ impl Transport for NetTransport {
         let futs = by_shard.into_iter().map(|(shard, indices)| async move {
             let mut shard_out = Vec::with_capacity(indices.len());
             let mut response_guards = Vec::new();
+            let mut unreachable: Option<TransportError> = None;
             for chunk in indices.chunks(wire::MAX_MIXED_BATCH_READ_ENTRIES) {
                 let mut chunk = chunk;
+                if let Some(error) = &unreachable {
+                    shard_out.extend(chunk.iter().map(|&i| (i, Err(error.clone()))));
+                    continue;
+                }
                 if self.mixed_batch_reads
                     && self.mixed_batch_read_support(node, shard).is_none()
                 {
@@ -1275,8 +1319,17 @@ impl Transport for NetTransport {
                             .await
                             .map(MixedReadReply::Digest),
                     };
+                    if let Err(error) = &result {
+                        if is_unreachable(error) {
+                            unreachable = Some(error.clone());
+                        }
+                    }
                     shard_out.push((i, result));
                     chunk = &chunk[1..];
+                    if let Some(error) = &unreachable {
+                        shard_out.extend(chunk.iter().map(|&i| (i, Err(error.clone()))));
+                        continue;
+                    }
                     if chunk.is_empty() {
                         continue;
                     }
@@ -1373,6 +1426,13 @@ impl Transport for NetTransport {
                                 }
                                 break;
                             }
+                            Err(error) if is_unreachable(&error) => {
+                                while chunk_out.len() < chunk.len() {
+                                    chunk_out.push(Err(error.clone()));
+                                }
+                                unreachable = Some(error);
+                                break;
+                            }
                             _ => {
                                 batch_failed = true;
                                 break;
@@ -1383,6 +1443,10 @@ impl Transport for NetTransport {
                 if scalar || batch_failed {
                     chunk_out.clear();
                     for &i in chunk {
+                        if let Some(error) = &unreachable {
+                            chunk_out.push(Err(error.clone()));
+                            continue;
+                        }
                         self.mixed_scalar_probes
                             .set(self.mixed_scalar_probes.get() + 1);
                         let result = match reads[i].role {
@@ -1398,6 +1462,11 @@ impl Transport for NetTransport {
                                 .await
                                 .map(MixedReadReply::Digest),
                         };
+                        if let Err(error) = &result {
+                            if is_unreachable(error) {
+                                unreachable = Some(error.clone());
+                            }
+                        }
                         chunk_out.push(result);
                     }
                 }

@@ -2,6 +2,8 @@ use super::*;
 
 const SLOPPY_FALLBACK_SLACK: usize = 2;
 
+const HINT_REPLAY_WINDOW: usize = 64;
+
 pub(super) enum AckKind {
     Acked,
     Skewed,
@@ -283,6 +285,52 @@ impl<T: Transport> Coordinator<T> {
         match &self.fd {
             Some(fd) => fd.borrow_mut().admit(node, (self.clock)()),
             None => true,
+        }
+    }
+
+    pub(super) fn read_plan(&self, reps: &[NodeId], needed: usize) -> (Vec<NodeId>, usize) {
+        let Some(fd) = &self.fd else {
+            return (reps.to_vec(), needed.min(reps.len()));
+        };
+        let now = (self.clock)();
+        let fd = fd.borrow();
+        let mut ranked: Vec<(u8, NodeId)> = reps.iter().map(|&n| (fd.rank(n, now), n)).collect();
+        ranked.sort_by_key(|&(rank, _)| rank.saturating_sub(1));
+        let healthy = ranked.iter().take_while(|&&(rank, _)| rank <= 1).count();
+        let probes = ranked[healthy..].iter().take_while(|&&(rank, _)| rank == 2).count();
+        if healthy < needed || probes == 0 {
+            return (ranked.into_iter().map(|(_, n)| n).collect(), needed.min(reps.len()));
+        }
+        let mut order: Vec<NodeId> = ranked[..needed].iter().map(|&(_, n)| n).collect();
+        order.extend(ranked[healthy..healthy + probes].iter().map(|&(_, n)| n));
+        order.extend(ranked[needed..healthy].iter().map(|&(_, n)| n));
+        order.extend(ranked[healthy + probes..].iter().map(|&(_, n)| n));
+        (order, needed + probes)
+    }
+
+    pub(super) fn fd_note_overtaken(&self, nodes: impl IntoIterator<Item = NodeId>) {
+        let Some(fd) = &self.fd else { return };
+        let now = (self.clock)();
+        let mut seen = Vec::new();
+        for node in nodes {
+            if !seen.contains(&node) {
+                seen.push(node);
+                fd.borrow_mut().record_failure(node, now);
+            }
+        }
+    }
+
+    pub(super) fn members_by_health(&self) -> Vec<NodeId> {
+        let members: Vec<NodeId> = self.ring.borrow().members().collect();
+        match &self.fd {
+            Some(fd) => {
+                let now = (self.clock)();
+                let fd = fd.borrow();
+                let mut members = members;
+                members.sort_by_key(|&n| fd.rank(n, now).saturating_sub(1));
+                members
+            }
+            None => members,
         }
     }
 
@@ -592,12 +640,14 @@ impl<T: Transport> Coordinator<T> {
         }
 
         let failed = RefCell::new(Vec::new());
+        let acked_by = RefCell::new(Vec::new());
         let stale_epoch = Cell::new(None::<u64>);
         let rejected = Cell::new(0usize);
         let busy = Cell::new(0usize);
         let overloaded = Cell::new(false);
         let home_acks = {
             let failed = &failed;
+            let acked_by = &acked_by;
             let stale_epoch = &stale_epoch;
             let rejected = &rejected;
             let busy = &busy;
@@ -611,7 +661,10 @@ impl<T: Transport> Coordinator<T> {
                                 .fd_apply(node, zone_id, key, value, version, persistence)
                                 .await,
                         ) {
-                            AckKind::Acked => Ok(()),
+                            AckKind::Acked => {
+                                acked_by.borrow_mut().push(node);
+                                Ok(())
+                            }
                             AckKind::Skewed => {
                                 rejected.set(rejected.get() + 1);
                                 Err(())
@@ -689,8 +742,8 @@ impl<T: Transport> Coordinator<T> {
         let failed = failed.into_inner();
         let hinted = self.record_hints(zone_id, key, value, version, &failed);
         if zone_id == DEFAULT_ZONE {
-            for &node in reps {
-                if !failed.contains(&node) && self.hints.borrow().pending(node) > 0 {
+            for node in acked_by.into_inner() {
+                if self.hints.borrow().pending(node) > 0 {
                     self.replay_hints(node).await;
                 }
             }
@@ -920,26 +973,45 @@ impl<T: Transport> Coordinator<T> {
     }
 
     /// Tries to deliver the hints held for `node` now and returns how many
-    /// were delivered; the rest stay queued. Hints are also replayed
-    /// automatically when a later write reaches that node.
+    /// were delivered; the rest stay queued. Hints are sent 64 at a time, and
+    /// replay stops after a group with a failure. Hints are also replayed
+    /// automatically when a later default-zone write is acknowledged by that
+    /// node.
     pub async fn replay_hints(&self, node: NodeId) -> usize {
-        let held = self.hints.borrow_mut().drain(node);
+        let mut held = self.hints.borrow_mut().drain(node).into_iter();
         let mut delivered = 0;
         let mut still_failed = Vec::new();
-        for hint in held {
-            match self
-                .fd_apply(
-                    node,
-                    DEFAULT_ZONE,
-                    &hint.key,
-                    hint.value.as_deref(),
-                    hint.version,
-                    Persistence::Buffered,
-                )
-                .await
-            {
-                Ok(applied) if applied_is_ack(applied) => delivered += 1,
-                Ok(_) | Err(_) => still_failed.push(hint),
+        loop {
+            let window: Vec<Hint> = held.by_ref().take(HINT_REPLAY_WINDOW).collect();
+            if window.is_empty() {
+                break;
+            }
+            let results = vals_rt::join_all(
+                window
+                    .iter()
+                    .map(|hint| {
+                        self.fd_apply(
+                            node,
+                            DEFAULT_ZONE,
+                            &hint.key,
+                            hint.value.as_deref(),
+                            hint.version,
+                            Persistence::Buffered,
+                        )
+                    })
+                    .collect(),
+            )
+            .await;
+            let before = still_failed.len();
+            for (hint, result) in window.into_iter().zip(results) {
+                match result {
+                    Ok(applied) if applied_is_ack(applied) => delivered += 1,
+                    Ok(_) | Err(_) => still_failed.push(hint),
+                }
+            }
+            if still_failed.len() > before {
+                still_failed.extend(held);
+                break;
             }
         }
         self.hints.borrow_mut().restore(node, still_failed);

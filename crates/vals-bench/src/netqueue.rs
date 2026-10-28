@@ -209,7 +209,7 @@ fn counts_json(values: &[u64]) -> String {
     format!("{{{}}}", parts.join(","))
 }
 
-fn json_str(s: &str) -> String {
+pub(super) fn json_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for ch in s.chars() {
@@ -292,7 +292,7 @@ struct NqConfig {
     deleter_clock_skew_ms: u64,
 }
 
-fn env_f64(name: &str, default: f64) -> f64 {
+pub(super) fn env_f64(name: &str, default: f64) -> f64 {
     std::env::var(name)
         .ok()
         .and_then(|s| s.trim().parse().ok())
@@ -682,7 +682,7 @@ impl Target {
     }
 }
 
-fn parse_peers(spec: &str) -> Vec<(u32, Vec<SocketAddr>)> {
+pub(super) fn parse_peers(spec: &str) -> Vec<(u32, Vec<SocketAddr>)> {
     let sep = if spec.contains(';') { ';' } else { ',' };
     let groups: Vec<&str> = if sep == ';' {
         spec.split(';').collect()

@@ -30,6 +30,7 @@ mod rtqueue;
 use rtqueue::*;
 mod netqueue;
 use netqueue::*;
+mod netprogress;
 mod rtdiag;
 mod graph;
 mod backupdrill;
@@ -389,6 +390,12 @@ fn main() {
         "netqueue" => {
             workload_netqueue(
                 backend,
+                args.get(3).map(String::as_str),
+                args.get(4).map(String::as_str),
+            )
+        }
+        "netprogress" => {
+            netprogress::workload_netprogress(
                 args.get(3).map(String::as_str),
                 args.get(4).map(String::as_str),
             )

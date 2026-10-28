@@ -10,7 +10,8 @@
 //! Only the default zone is used. Startup discovers membership and the catalog
 //! from seeds; reads use `ReadConcern::Majority`, so R = RF / 2 + 1 follows the
 //! zone's current RF. Puts/deletes request device-durable
-//! majority acknowledgements; finite transport connect/RPC deadlines stay on.
+//! majority acknowledgements; finite transport connect/RPC deadlines stay on,
+//! and a failure detector routes reads around a replica that stops answering.
 //! Reads select the greatest LWW Version (HLC, then writer id), not the last
 //! request by wall-clock completion. An acknowledged write may lose to a
 //! greater Version, and a failed/timed-out write may still have taken effect.
@@ -34,7 +35,7 @@ use std::thread;
 
 use tokio::sync::{mpsc, oneshot};
 use vals_client::{
-    reactor, Coordinator, NetTransport, NodeId, ReadConcern, Ring, Stored, Version,
+    reactor, Coordinator, FdConfig, NetTransport, NodeId, ReadConcern, Ring, Stored, Version,
     WriteConcern, WriteOptions, DEFAULT_ZONE,
 };
 
@@ -246,7 +247,8 @@ fn parse_nodes(list: &str) -> Result<Nodes> {
 fn initialize(nodes: &str) -> Result<impl FnMut(Operation) -> Result<Reply>> {
     let nodes = parse_nodes(nodes)?;
     let transport = NetTransport::connect_sharded(nodes.clone());
-    let coord = Coordinator::new(100, Ring::new(3), ReadConcern::Majority, transport);
+    let coord = Coordinator::new(100, Ring::new(3), ReadConcern::Majority, transport)
+        .with_failure_detector(FdConfig::default());
     vals_rt::block_on(discover(&coord, &nodes), reactor::poll_io)?;
     Ok(move |operation| {
         vals_rt::block_on(async {

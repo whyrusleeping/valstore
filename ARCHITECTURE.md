@@ -395,13 +395,22 @@ Three layers, weakest-but-cheapest to strongest-but-slowest:
 ### Failure detection
 
 An **opt-in, coordinator-side circuit breaker** (`failure::FailureDetector`)
-observes RPC outcomes per node: after a few consecutive transport errors a node
-trips open and the coordinator **fast-fails** RPCs to it — no connect attempt —
-so the write path hints it and reads route around it (sloppy fallback / fewer
-responders). It auto-recovers by admitting a single probe after a cooldown. It is
-request-driven (no heartbeat thread) and informs **routing only**: it never
-changes membership. The cluster rides a failure out via hints + sloppy quorum and
-recovers when the node returns; eviction stays an explicit PD decision.
+observes RPC outcomes per node: after a few consecutive transport errors
+(timeouts included) a node trips open and the coordinator **fast-fails** RPCs to
+it — no connect attempt — so the write path hints it. Reads order each key's
+replicas healthy first, so a tripped node is only asked when its peers cannot
+make the read concern. It auto-recovers by admitting a single probe after a
+cooldown; a read sends a due probe in addition to the replicas it needs, so the
+probe never holds the read. With digest hedging, a replica whose reply a read
+gave up on after the hedge fired also counts as a failure, so a silent node trips
+after a few hedged reads rather than after RPC deadlines. It is request-driven (no
+heartbeat thread) and informs **routing only**: it never changes membership. The
+cluster rides a failure out via hints + sloppy quorum and recovers when the node
+returns; eviction stays an explicit PD decision. Hints are replayed only to a node
+that has just acknowledged a write, in windows of 64 that stop at the first
+failure, so replay never makes a write wait on an unreachable node. The client
+guidance (recommended detector and hedge settings, measured outage behaviour) is
+in the `vals-client` crate documentation, "Replica outages".
 
 ---
 
@@ -563,7 +572,13 @@ Custom binary protocol over TCP (no gRPC/serde on the hot path):
   peer that won't drain; and finite default connect/hello and per-RPC **deadlines**
   (both 5 seconds, checked by the reactor flush hook) fail a request whose connection or
   reply never completes with `TransportError::Timeout`, so a silent **black-hole**
-  peer is observable to the failure detector instead of hanging forever. The default
+  peer is observable to the failure detector instead of hanging forever. A
+  connection that receives nothing for a whole RPC deadline (the connect deadline
+  during the handshake) while it awaits a reply is closed, even if every caller has
+  since given up on its request, so the next request dials afresh instead of
+  waiting out TCP retransmission or SYN backoff to a host that has come back. A batched
+  read whose RPC times out or finds the node unavailable fails its keys on that
+  node at once instead of retrying them one by one. The default
   network coordinator also limits caller write key/value pressure globally and per
   destination node; these logical credits are not a byte-for-byte transport heap cap. The two replies that can legitimately outgrow a frame — a range
   **scan** and an anti-entropy **bucket pull** — are **paged** under a server
