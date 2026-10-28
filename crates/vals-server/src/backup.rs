@@ -6,7 +6,7 @@ use vals_cluster::zone::ZoneConfig;
 
 use crate::config::PdConfig;
 
-pub const USAGE: &str = "valsd backup create -s <pd-admin-socket> --out <new-dir>\n  \
+pub const USAGE: &str = "valsd backup create -s <pd-admin-socket> --out <new-dir> [--stale-copies fail|omit|keep]\n  \
      valsd backup verify <dir>\n  \
      valsd backup restore-pd -c <target-pd.conf> [--incarnation <32 hex digits>] <dir>\n  \
      valsd backup load -s <target-pd-admin-socket> <dir>\n  \
@@ -14,9 +14,17 @@ pub const USAGE: &str = "valsd backup create -s <pd-admin-socket> --out <new-dir
 
 pub fn backup_main(args: &[String]) -> ExitCode {
     match args.split_first() {
-        Some((cmd, rest)) if cmd == "create" => match parse_flags(rest, &["-s", "--out"]) {
+        Some((cmd, rest)) if cmd == "create" => match parse_flags(rest, &["-s", "--out", "--stale-copies"]) {
             Ok((flags, [])) => match (flags.get("-s"), flags.get("--out")) {
-                (Some(socket), Some(out)) => finish("backup create", create(socket, out)),
+                (Some(socket), Some(out)) => {
+                    let stale = flags
+                        .get("--stale-copies")
+                        .map_or(Ok(backup::StaleCopies::Fail), |s| backup::StaleCopies::parse(s));
+                    match stale {
+                        Ok(stale) => finish("backup create", create(socket, out, stale)),
+                        Err(e) => usage_error(&e),
+                    }
+                }
                 _ => usage_error("backup create requires `-s <pd-admin-socket>` and `--out <new-dir>`"),
             },
             Ok(_) => usage_error("backup create takes no positional arguments"),
@@ -143,7 +151,7 @@ fn with_capture_dir<T>(f: impl FnOnce(&Path) -> Result<T, String>) -> Result<T, 
     result
 }
 
-fn create(socket: &str, out: &str) -> Result<String, String> {
+fn create(socket: &str, out: &str, stale: backup::StaleCopies) -> Result<String, String> {
     vals_cluster::observe::init_stderr_logger();
     let out = absolute(Path::new(out))?;
     let mut captures = 0u32;
@@ -151,7 +159,7 @@ fn create(socket: &str, out: &str) -> Result<String, String> {
     let socket = PathBuf::from(socket);
     let mut cluster = NetCluster::new(|| capture_via(&socket, &capture_dir, &mut captures));
     let tool = format!("valsd {}", env!("CARGO_PKG_VERSION"));
-    let manifest = backup::create_backup(&out, &mut cluster, &tool, &mut |line: &str| {
+    let manifest = backup::create_backup(&out, &mut cluster, &tool, stale, &mut |line: &str| {
         eprintln!("valsd backup: {line}")
     })?;
     let (records, puts, tombstones) = manifest.zones.iter().fold((0, 0, 0), |acc, zone| {

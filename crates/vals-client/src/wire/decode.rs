@@ -495,6 +495,19 @@ pub fn decode_request(payload: &[u8]) -> Result<OwnedRequest, WireError> {
                 after,
             })
         }
+        OP_GC_FLOOR => {
+            let zone_id = r.u32()?;
+            if r.pos != payload.len() {
+                return Err(WireError::TrailingBytes);
+            }
+            Ok(OwnedRequest::GcFloor { zone_id })
+        }
+        OP_CLEANUP_STATUS => {
+            if r.pos != payload.len() {
+                return Err(WireError::TrailingBytes);
+            }
+            Ok(OwnedRequest::CleanupStatus)
+        }
         other => Err(WireError::BadTag(other)),
     }
 }
@@ -748,6 +761,24 @@ pub fn decode_response(payload: &[u8]) -> Result<Response, WireError> {
         RESP_DENIED => Ok(Response::Denied),
         RESP_BUSY => Ok(Response::Busy),
         RESP_WATERMARK => Ok(Response::Watermark(r.u64()?)),
+        RESP_GC_FLOOR => Ok(Response::GcFloor(r.u64()?)),
+        RESP_CLEANUP_STATUS => {
+            let ring_epoch = r.u64()?;
+            let gc_grace_ms = r.u64()?;
+            let records = r.u64()?;
+            let unsettled = r.list(|r| {
+                let zone_id = r.u32()?;
+                let flags = r.u8()?;
+                if flags > 0b11 {
+                    return Err(WireError::BadTag(flags));
+                }
+                let (lapped, pending_rehome) = (flags & 1 != 0, flags & 2 != 0);
+                let kept = r.u64()?;
+                let samples = r.list(|r| Ok(r.bytes()?.to_vec()))?;
+                Ok(UnsettledZone { zone_id, lapped, pending_rehome, kept, samples })
+            })?;
+            Ok(Response::CleanupStatus { ring_epoch, gc_grace_ms, records, unsettled })
+        }
         RESP_ERR => {
             let msg = std::str::from_utf8(r.bytes()?)
                 .map_err(|_| WireError::BadUtf8)?

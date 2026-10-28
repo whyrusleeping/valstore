@@ -11,7 +11,10 @@ struct RehomeCopyCursor {
     at: Option<Vec<u8>>,
     done: bool,
     last_pending_ms: u64,
+    held: Option<(Vec<u8>, u64)>,
 }
+
+const REHOME_HOLD_RETRY_MS: u64 = 5_000;
 
 pub(super) async fn rehome_copy_apply<D: BlockDevice + AsyncRead>(
     store: &std::cell::RefCell<VersionedStore<D>>,
@@ -70,6 +73,54 @@ pub(super) fn rehome_copy_next(page: &crate::coord::ScanPage) -> Option<Option<V
     let mut next = page.entries.last()?.0.clone();
     next.push(0);
     Some(Some(next))
+}
+
+async fn rehome_target_only_leftover<D: BlockDevice + AsyncRead>(
+    shared: &ServerShared<D>,
+    store: &std::cell::RefCell<VersionedStore<D>>,
+    zone_id: ZoneId,
+    (lo, hi): (Option<&[u8]>, Option<&[u8]>),
+    page: &crate::coord::ScanPage,
+    older_than_ms: u64,
+) -> Option<Option<Vec<u8>>> {
+    let dev = store.borrow().device_handle();
+    let mut after = lo.map(<[u8]>::to_vec);
+    loop {
+        let reply = crate::net::serve_scan_keys(
+            store,
+            dev.as_ref(),
+            shared.read_gate(),
+            after.as_deref(),
+            hi,
+            shared.read_site(zone_id),
+        )
+        .await;
+        let crate::wire::Response::Scan { entries, more, resume, .. } = reply else {
+            return None;
+        };
+        for (key, stored) in &entries {
+            if stored.value.is_some()
+                && stored.version.physical_ms() < older_than_ms
+                && page.entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)).is_err()
+            {
+                return Some(Some(key.clone()));
+            }
+        }
+        if !more {
+            return Some(None);
+        }
+        let next = resume.or_else(|| {
+            entries.last().map(|(k, _)| {
+                let mut k = k.clone();
+                k.push(0);
+                k
+            })
+        })?;
+        if after.as_deref().is_some_and(|a| next.as_slice() <= a) {
+            return None;
+        }
+        after = Some(next);
+    }
 }
 
 pub(super) fn rehome_copy_apply_fragments<D: BlockDevice>(
@@ -221,6 +272,7 @@ pub(super) async fn rehome_copy_loop<D: BlockDevice + AsyncRead + 'static>(
                                         at: None,
                                         done: false,
                                         last_pending_ms: now_ms,
+                                        held: None,
                                     });
                                     crate::observe::counters().rehome_copy_restarts.inc();
                                     true
@@ -257,10 +309,14 @@ pub(super) async fn rehome_copy_loop<D: BlockDevice + AsyncRead + 'static>(
                         at: None,
                         done: false,
                         last_pending_ms: now_ms,
+                        held: None,
                     });
                 }
                 let (source, done, mut at) = {
                     let e = &cursors[&ck];
+                    if e.held.as_ref().is_some_and(|(_, retry_ms)| now_ms < *retry_ms) {
+                        continue;
+                    }
                     (e.source, e.done, e.at.clone())
                 };
                 if done {
@@ -274,7 +330,9 @@ pub(super) async fn rehome_copy_loop<D: BlockDevice + AsyncRead + 'static>(
                     continue;
                 }
                 for _ in 0..pages_per_tick {
-                    let cursor = at.as_deref().or(lo);
+                    let cursor = at.as_deref().or(lo).map(<[u8]>::to_vec);
+                    let cursor = cursor.as_deref();
+                    let page_ms = physical_now_ms();
                     let Ok(page) = transport
                         .scan(source, zone_id, cursor, hi, page_entries)
                         .await
@@ -314,6 +372,44 @@ pub(super) async fn rehome_copy_loop<D: BlockDevice + AsyncRead + 'static>(
                     }
                     if !copied {
                         break;
+                    }
+                    let grace = store.borrow().gc_grace_ms();
+                    if grace != 0 {
+                        let window_hi = next.as_deref().or(hi);
+                        match rehome_target_only_leftover(
+                            &shared,
+                            store.as_ref(),
+                            zone_id,
+                            (cursor, window_hi),
+                            &page,
+                            page_ms.saturating_sub(grace / 2),
+                        )
+                        .await
+                        {
+                            Some(None) => {}
+                            Some(Some(key)) => {
+                                crate::observe::counters().rehome_copy_target_only_blocks.inc();
+                                let Some(e) = cursors.get_mut(&ck) else { break };
+                                let repeat = e.held.as_ref().is_some_and(|(held, _)| *held == key);
+                                e.held = Some((key.clone(), now_ms.saturating_add(REHOME_HOLD_RETRY_MS)));
+                                if repeat {
+                                    break;
+                                }
+                                log::warn!(
+                                    "node {}: re-home copy of zone {zone_id} range {:?} is held: this target \
+                                     holds key {:?}, older than half the tombstone-GC grace, that source node \
+                                     {source} does not; it may be a leftover whose delete the source collected",
+                                    shared.node_id,
+                                    lower,
+                                    key
+                                );
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                    if let Some(e) = cursors.get_mut(&ck) {
+                        e.held = None;
                     }
                     crate::observe::counters().rehome_copy_pages.inc();
                     *shared.rehome_copy_progress.borrow_mut()

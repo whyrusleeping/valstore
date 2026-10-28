@@ -154,7 +154,7 @@ has enough assignment granularity to remove most ring-draw skew, not that every
 workload can reach 1.00.
 
 This is now a measured capacity issue, not a speculative tail. The
-[task 0130 sustained-ceiling run](../bench/bootes-soak-lab/run-20260809T221529Z-0130-ceiling/FINDINGS.md)
+task 0130 sustained-ceiling run
 ended at 6 h 25 min when one records engine filled; its node received 1.79× the
 applies of the cold node while the other engines retained space. Hundreds of
 automatic splits did not help because populated split children correctly
@@ -777,7 +777,7 @@ of keys and versions to iterate.
 on the keys only one of them replicates — the descent never converges those buckets and
 every sweep re-examines them (measured ~68k digests/s at steady state with zero churn).
 The fix groups each store's leaf accumulators **by the key's replica set**
-(`leaves[replica-set][bucket]`, [`replica.rs`](../crates/vals-cluster/src/replica.rs)) and
+(`leaves[replica-set][bucket]`, [`replica/`](../crates/vals-cluster/src/replica)) and
 scopes the tree exchange to the keyspace *both* peers replicate: when node L reconciles
 with peer P, each side folds only the groups whose replica set contains **both** L and P.
 So a converged RF<N pair matches at the root round and examines ~0 digests, while a genuine
@@ -785,7 +785,9 @@ divergence *within* the shared keyspace still heals with the full hierarchical-d
 localization. Keys a node holds but the peer does not (sloppy-quorum fallback, post-membership
 leftovers) are **not** AE's job — they are healed by hinted handoff and the over-replication
 cleanup pass (which pushes them to the rightful owners before forgetting); comparing them in
-AE was pure waste. The grouping fn is the ring's placement (`ring.replicas` / `replicas_in_zone`,
+AE was pure waste. The value pull applies the same rule per key: digest pages list every key
+of a differing bucket, and a key the peer does not own (current or pending set) is skipped
+even when the local node owns it, so a former owner's leftover never enters through AE. The grouping fn is the ring's placement (`ring.replicas` / `replicas_in_zone`,
 agreeing exactly with the reconcile/cleanup `keep` predicate); a placement change (ring/catalog
 epoch) re-seeds the grouped accumulators from the engine's current keyset under the new
 replica sets.
@@ -1077,6 +1079,22 @@ they are load-bearing and worth recording. Full rationale is in `ARCHITECTURE.md
   (`vals_expired_tombstones_skipped`). Otherwise anti-entropy from a replica that has not
   collected yet copies it straight back, and the replicas never all drop it. Blind applies
   can skip it only with the winner directory; without it they store it as before.
+  **Former-owner copies** (0515). A node that no longer owns a key (cleanup has not
+  forgotten it yet, an aborted re-home target, a sloppy fallback) may hold a put whose newer
+  tombstone every owner has collected. The owners' admission floor refuses that put on every
+  path that writes it to them (cleanup handoff, read repair). AE does not pull it at all.
+  `valsd backup create` reads every replica directly, so its merge applies the floor itself.
+  A put held only by non-owners (or only by a pending re-home target) is merged only if its
+  physical time is at or above the `GcFloor` of every owner shard, read after that owner's stream
+  passed the key. If that holds, no owner had collected a newer tombstone when it was read, so
+  the owner's copy of any delete wins the merge. Otherwise the copy is ambiguous: its delete
+  may have been collected, or it was never copied to the current owners. `create` then fails
+  unless the operator picks `--stale-copies omit` or `keep` (docs/backup-restore.md).
+  Cleanup counts every copy of a non-owned key that a lap moves past without releasing,
+  and reports per zone whether a lap under the current ring, started after the latest
+  `CleanupStatus` check, released them all. `add-node` and `remove-node` refuse to run
+  until every member that stays reports that, so a membership change cannot make such a
+  holder an owner, unless the operator passes `--force`.
 - **Capped shadow folds** (`engine/merge.rs`, `Engine::shadow_fold_window`, task 0383).
   Overwrite and delete garbage in frozen runs is shadowed by versions in *other* runs,
   so no capped suffix merge sees it. A fold rewrites one **window** of adjacent runs

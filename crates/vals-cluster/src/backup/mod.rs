@@ -20,7 +20,7 @@ pub use create::{
 };
 pub use export::{
     merge_replicas, merge_replicas_into, ring_params, zone_sources, MergeStats, NetReplicaSource,
-    ReplicaPage, ReplicaSource,
+    ReplicaPage, ReplicaSource, StaleCopies, ZonePlacement,
 };
 pub use restore::{
     check_restored, compare_backup, lineage_of, load_backup, restore_pd, CompareReport, LoadReport,

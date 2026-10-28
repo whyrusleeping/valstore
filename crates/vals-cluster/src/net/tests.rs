@@ -5212,3 +5212,129 @@ fn transport_bounds_drop_slow_and_stalled_clients_without_starving_healthy_clien
     assert!(usage.1 <= limits.max_requests);
     assert!(usage.2 <= limits.max_queued_bytes);
 }
+
+#[test]
+fn rehome_copy_holds_while_the_target_keeps_an_old_leftover_the_source_lacks() {
+    use crate::liveness::{LivenessLog, MemLivenessLog};
+    use crate::node::Node;
+    use crate::replica::Applied;
+    use crate::zonestore::{MemZoneStore, ZoneGeom};
+
+    let zone_id = 11;
+    let cfg = ZoneConfig { name: "leftover".into(), rf: 1, ordering: Ordering::Sorted, scope: None };
+    let ring = Ring::from_members(1, 64, [1, 2, 3]);
+    let mut boundary = b"m".to_vec();
+    while ring.replicas_in_zone(zone_id, b"", 1, None) == ring.replicas_in_zone(zone_id, &boundary, 1, None) {
+        boundary.push(b'x');
+    }
+    let source = ring.replicas_in_zone(zone_id, b"", 1, None)[0];
+    let target = ring.replicas_in_zone(zone_id, &boundary, 1, None)[0];
+    let binds: Vec<_> = (0..3).map(|_| crate::node::Node::bind().unwrap()).collect();
+    let peers: Vec<(NodeId, SocketAddr)> =
+        binds.iter().enumerate().map(|(i, (_, addr))| ((i + 1) as NodeId, *addr)).collect();
+    let now = crate::hlc::physical_now_ms();
+    let mut handles = Vec::new();
+    for (i, (listener, _)) in binds.into_iter().enumerate() {
+        let node = (i + 1) as NodeId;
+        let provider =
+            MemZoneStore::new(node, ZoneGeom {
+                block_size: 256,
+                seg_blocks: 4,
+                reserved_blocks: 0,
+                region_blocks: 8192,
+            });
+        let zone0 = provider.open(DEFAULT_ZONE, Ordering::Unsorted).unwrap();
+        let mut catalog = Catalog::new();
+        catalog.insert(zone_id, cfg.clone());
+        let log = MemLivenessLog::new();
+        if node != target {
+            log.store(now - 1_000).unwrap();
+        }
+        handles.push(crate::testutil::running(Node::serve_zoned_with_liveness_and_settings(
+            node,
+            listener,
+            zone0,
+            provider,
+            catalog,
+            ring.clone(),
+            peers.clone(),
+            Duration::from_secs(3600),
+            60_000,
+            log,
+            None,
+            crate::node_settings::NodeSettings { rehome_copy_page_entries: 64, ..Default::default() },
+        )));
+    }
+    for (_, addr) in &peers {
+        push_members_full(*addr, 1, &peers);
+    }
+    let addr = |node: NodeId| peers[(node - 1) as usize].1;
+    let map = |token: &[u8], pending: Option<&[u8]>| {
+        RangeMap::from_splits_tokens_and_pending(
+            vec![boundary.clone()],
+            vec![Vec::new(), token.to_vec()],
+            vec![None, pending.map(<[u8]>::to_vec)],
+        )
+        .unwrap()
+    };
+    let push = |epoch: u64, map: &RangeMap| {
+        for (_, a) in &peers {
+            push_range_map_full(*a, epoch, zone_id, map);
+        }
+    };
+    let apply = |node: NodeId, key: &[u8], value: Option<&[u8]>, ms: u64| {
+        rpc_request(addr(node), &Request::Apply {
+            epoch: u64::MAX,
+            zone_id,
+            key,
+            value,
+            version: crate::hlc::Version { hlc: ms << crate::hlc::COUNTER_BITS, node: 9 },
+        })
+    };
+    let eventually = |what: &str, mut ok: Box<dyn FnMut() -> bool + '_>| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ok() {
+            assert!(Instant::now() < deadline, "timed out: {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let mut zombie = boundary.clone();
+    zombie.extend_from_slice(b"/zombie");
+    let mut live = boundary.clone();
+    live.extend_from_slice(b"/live");
+
+    push(10, &map(&boundary, None));
+    eventually("the source takes writes", Box::new(|| apply(source, b"a-anchor", Some(b"a"), now) == Response::Apply(Applied::Won)));
+    eventually(
+        "the old owner takes the value",
+        Box::new(|| apply(target, &zombie, Some(b"zombie"), now - 600_000) == Response::Apply(Applied::Won)),
+    );
+    push(11, &map(b"", None));
+    eventually("the source owns the range", Box::new(|| apply(source, &live, Some(b"live"), now) == Response::Apply(Applied::Won)));
+    assert_eq!(
+        apply(source, &zombie, Some(b"zombie"), now - 600_000),
+        Response::Apply(Applied::Rejected),
+        "the source refuses the old value, as if it had collected its delete"
+    );
+
+    let blocks_before = crate::observe::snapshot().rehome_copy_target_only_blocks;
+    push(12, &map(b"", Some(&boundary)));
+    eventually(
+        "the copy notices the leftover",
+        Box::new(|| crate::observe::snapshot().rehome_copy_target_only_blocks > blocks_before),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    let (_, stats) = range_stats(addr(target));
+    let stat = stats.into_iter().find(|s| s.zone_id == zone_id && s.lower_bound == boundary).unwrap();
+    assert!(stat.rehome_copy_complete_epoch < 12, "the copy completed over a stale leftover: {stat:?}");
+
+    assert_eq!(apply(target, &zombie, None, now), Response::Apply(Applied::Won), "the operator deletes the leftover");
+    eventually(
+        "the copy completes once the leftover is gone",
+        Box::new(|| {
+            let (_, stats) = range_stats(addr(target));
+            stats.iter().any(|s| s.zone_id == zone_id && s.lower_bound == boundary && s.rehome_copy_complete_epoch >= 12)
+        }),
+    );
+    drop(handles);
+}

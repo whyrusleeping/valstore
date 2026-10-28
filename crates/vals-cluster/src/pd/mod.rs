@@ -19,6 +19,7 @@ use crate::wire::{self, Request, Response, WireRangeMap, WireZone};
 use crate::zone::{ordering_from_u8, ordering_to_u8, Catalog, ZoneConfig, ZoneId, DEFAULT_ZONE};
 
 mod balance;
+mod cleanup_gate;
 mod daemon;
 mod driver;
 mod push;
@@ -33,6 +34,7 @@ use driver::*;
 use push::*;
 use state::*;
 
+pub use cleanup_gate::{check_membership_change, MembershipChange};
 pub use driver::{AddressedMembers, PlacementDriver, RingConfig};
 pub use settings::{PdPlacementOverrides, PdPlacementSettings};
 pub use snapshot::{

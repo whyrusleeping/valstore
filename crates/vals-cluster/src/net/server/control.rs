@@ -229,6 +229,11 @@ pub(super) fn serve_control_request<D: BlockDevice>(
             ))
         }
         OwnedRequest::GetWatermark => Response::Watermark(shared.watermark()),
+        OwnedRequest::GcFloor { zone_id } => match shared.zone_store(zone_id) {
+            Ok(store) => Response::GcFloor(store.borrow().admission_floor_ms(crate::hlc::physical_now_ms())),
+            Err(e) => Response::Err(e),
+        },
+        OwnedRequest::CleanupStatus => shared.cleanup_status_reply(),
         _ => Response::Err("data request requires the async server".into()),
     }
 }

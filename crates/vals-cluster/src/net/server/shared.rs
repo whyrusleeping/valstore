@@ -57,6 +57,8 @@ impl<D: BlockDevice> ServerShared<D> {
             rehome_copy_progress: RefCell::new(FastMap::default()),
             range_write_marks: RefCell::new(FastMap::default()),
             rehome_copy_holds: RefCell::new(FastMap::default()),
+            cleanup_status: RefCell::new(FastMap::default()),
+            cleanup_recheck: Cell::new((0, None)),
             zone_forget_gens: RefCell::new(FastMap::default()),
             rehome_transport: RefCell::new(None),
             read_gate: ReadGate::new(),
@@ -515,6 +517,101 @@ impl<D: BlockDevice> ServerShared<D> {
             .borrow()
             .get(&(zone_id, lower.to_vec()))
             .is_some_and(|&until| until > now_ms)
+    }
+
+    pub(crate) fn zone_copy_hold_active(&self, zone_id: ZoneId, now_ms: u64) -> bool {
+        self.rehome_copy_holds
+            .borrow()
+            .iter()
+            .any(|((zone, _), &until)| *zone == zone_id && until > now_ms)
+    }
+
+    pub(crate) fn note_cleanup_kept(&self, zone_id: ZoneId, kept: u64, samples: &[Vec<u8>]) {
+        let mut status = self.cleanup_status.borrow_mut();
+        let zone = status.entry(zone_id).or_default();
+        zone.clean = None;
+        if kept >= zone.kept {
+            zone.kept = kept;
+            zone.samples = samples.to_vec();
+        }
+    }
+
+    pub(crate) fn note_cleanup_lap(
+        &self,
+        zone_id: ZoneId,
+        lap_gen: Option<u64>,
+        stamp: (u64, u64, u64),
+        kept: u64,
+        samples: Vec<Vec<u8>>,
+        forget_pending: bool,
+    ) {
+        let mut status = self.cleanup_status.borrow_mut();
+        let zone = status.entry(zone_id).or_default();
+        zone.lapped = lap_gen;
+        zone.clean = lap_gen.filter(|_| kept == 0 && !forget_pending);
+        zone.stamp = stamp;
+        zone.kept = kept;
+        zone.samples = samples;
+    }
+
+    pub(crate) fn note_cleanup_placement(&self, zone_id: ZoneId, moved: bool, stamp: (u64, u64, u64)) {
+        if let Some(zone) = self.cleanup_status.borrow_mut().get_mut(&zone_id) {
+            if moved {
+                zone.clean = None;
+                zone.lapped = None;
+            } else {
+                zone.stamp = stamp;
+            }
+        }
+    }
+
+    pub(crate) fn cleanup_recheck_gen(&self) -> u64 {
+        self.cleanup_recheck.get().0
+    }
+
+    pub(crate) fn cleanup_status_reply(&self) -> Response {
+        let gc_grace_ms = self.gc_grace_reported_ms();
+        let (mut gen, at) = self.cleanup_recheck.get();
+        let reuse = Duration::from_millis((gc_grace_ms / 2).min(600_000));
+        if at.is_none_or(|at| at.elapsed() >= reuse) {
+            gen += 1;
+            self.cleanup_recheck.set((gen, Some(std::time::Instant::now())));
+            self.sweep_notify.signal();
+        }
+        let epoch = self.ring_epoch();
+        let stamp = (epoch, self.catalog_epoch(), self.range_map_epoch());
+        let fresh = |z: &CleanupZoneStatus, lap: Option<u64>| z.stamp == stamp && lap.is_some_and(|g| g >= gen);
+        let status = self.cleanup_status.borrow();
+        let unsettled = self
+            .sweep_zone_ids(false)
+            .into_iter()
+            .filter(|&zone_id| zone_id == DEFAULT_ZONE || self.zone_config(zone_id).is_some())
+            .filter_map(|zone_id| {
+                let zone = status.get(&zone_id);
+                let pending_rehome = zone_id != DEFAULT_ZONE
+                    && (self.zone_copy_hold_active(zone_id, crate::hlc::physical_now_ms())
+                        || self
+                            .with_sorted_range_map(zone_id, |map| map.pending().iter().any(Option::is_some))
+                            .unwrap_or(false));
+                if !pending_rehome && zone.is_some_and(|z| fresh(z, z.clean)) {
+                    return None;
+                }
+                Some(crate::wire::UnsettledZone {
+                    zone_id,
+                    lapped: zone.is_some_and(|z| fresh(z, z.lapped)),
+                    pending_rehome,
+                    kept: zone.map_or(0, |z| z.kept),
+                    samples: zone.map_or_else(Vec::new, |z| z.samples.clone()),
+                })
+            })
+            .collect();
+        let records = self.zones.borrow().values().map(|s| s.borrow().tracked_keys() as u64).sum();
+        Response::CleanupStatus { ring_epoch: epoch, gc_grace_ms, records, unsettled }
+    }
+
+    pub(crate) fn gc_grace_reported_ms(&self) -> u64 {
+        let stores = self.zones.borrow().values().map(|s| s.borrow().gc_grace_ms()).max().unwrap_or(0);
+        stores.max(self.liveness_grace_ms().unwrap_or(0))
     }
 
     pub(crate) fn prune_rehome_copy_holds(&self, now_ms: u64) {

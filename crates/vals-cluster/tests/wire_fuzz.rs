@@ -4,7 +4,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use vals_cluster::wire::{
     decode_request, decode_response, encode_request_payload, encode_response_payload,
     OwnedRangeMap, OwnedRangeStat, OwnedRequest, OwnedWrite, OwnedZone, Request, Response,
-    RtFragment, WireRangeMap, WireSlice, WireWrite, WireZone,
+    RtFragment, UnsettledZone, WireRangeMap, WireSlice, WireWrite, WireZone,
 };
 use vals_cluster::{Applied, Stored, Version};
 
@@ -181,7 +181,9 @@ impl Rng {
 }
 
 fn gen_owned_request(r: &mut Rng) -> OwnedRequest {
-    match r.below(22) {
+    match r.below(24) {
+        23 => OwnedRequest::CleanupStatus,
+        22 => OwnedRequest::GcFloor { zone_id: r.next_u64() as u32 },
         21 => {
             let n = r.below(8);
             OwnedRequest::MultiScan {
@@ -310,7 +312,22 @@ fn gen_owned_request(r: &mut Rng) -> OwnedRequest {
 }
 
 fn gen_response(r: &mut Rng) -> Response {
-    match r.below(21) {
+    match r.below(23) {
+        22 => Response::CleanupStatus {
+            ring_epoch: r.next_u64(),
+            gc_grace_ms: r.next_u64(),
+            records: r.next_u64(),
+            unsettled: (0..r.below(4))
+                .map(|_| UnsettledZone {
+                    zone_id: r.next_u64() as u32,
+                    lapped: r.bool(),
+                    pending_rehome: r.bool(),
+                    kept: r.next_u64(),
+                    samples: (0..r.below(4)).map(|_| r.buf(8)).collect(),
+                })
+                .collect(),
+        },
+        21 => Response::GcFloor(r.next_u64()),
         20 => {
             let keys_only = r.bool();
             let n = r.below(8);
@@ -675,6 +692,8 @@ fn encode_owned_req(o: &OwnedRequest) -> Vec<u8> {
             digest: *digest,
             after: after.as_deref(),
         }),
+        O::GcFloor { zone_id } => encode_request_payload(&Request::GcFloor { zone_id: *zone_id }),
+        O::CleanupStatus => encode_request_payload(&Request::CleanupStatus),
     }
 }
 

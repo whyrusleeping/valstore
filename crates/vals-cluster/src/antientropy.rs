@@ -69,7 +69,20 @@ pub struct CleanupProgress<D: BlockDevice> {
     pub next_cursor: Option<Vec<u8>>,
     pub wrapped: bool,
     pub deferred: bool,
+    pub kept: usize,
+    pub kept_samples: Vec<Vec<u8>>,
     pub forget_plan: Option<vals_store::CompactPlan<D>>,
+}
+
+pub const CLEANUP_KEPT_SAMPLES: usize = 4;
+
+impl<D: BlockDevice> CleanupProgress<D> {
+    fn note_kept(&mut self, key: &[u8]) {
+        self.kept += 1;
+        if self.kept_samples.len() < CLEANUP_KEPT_SAMPLES {
+            self.kept_samples.push(key.to_vec());
+        }
+    }
 }
 
 impl<D: BlockDevice> Default for CleanupProgress<D> {
@@ -82,6 +95,8 @@ impl<D: BlockDevice> Default for CleanupProgress<D> {
             next_cursor: None,
             wrapped: false,
             deferred: false,
+            kept: 0,
+            kept_samples: Vec::new(),
             forget_plan: None,
         }
     }
@@ -228,7 +243,8 @@ pub(crate) async fn reconcile_scoped_gate<D: BlockDevice + AsyncRead, P: AePeer>
         Some(counterpart),
         gate,
         |key| {
-            if !ring.replicas(key).contains(&local_node) {
+            let owners = ring.replicas(key);
+            if !owners.contains(&local_node) || !owners.contains(&counterpart) {
                 return false;
             }
             if shard_count > 1 {
@@ -316,7 +332,7 @@ pub(crate) async fn reconcile_scoped_zone_gate<D: BlockDevice + AsyncRead, P: Ae
                 ),
                 None => ring.replicas_in_zone(zone_id, place, rf, scope),
             };
-            if !owners.contains(&local_node) {
+            if !owners.contains(&local_node) || !owners.contains(&counterpart) {
                 return false;
             }
             if shard_count > 1 {
@@ -1043,6 +1059,7 @@ async fn cleanup_with<D: BlockDevice + vals_spdk::AsyncRead, T: Transport, G: Fo
         };
         if stored.version != listed_version {
             progress.deferred = true;
+            progress.note_kept(&key);
             completed_cursor = Some(key);
             continue;
         }
@@ -1094,10 +1111,16 @@ async fn cleanup_with<D: BlockDevice + vals_spdk::AsyncRead, T: Transport, G: Fo
             release.push((key.clone(), stored.version));
         } else {
             progress.deferred = true;
+            progress.note_kept(&key);
         }
         completed_cursor = Some(key);
         if key_failed || handoff_started.elapsed() >= CLEANUP_HANDOFF_WALL_BUDGET {
             progress.next_cursor = completed_cursor.clone();
+            if local.borrow().engine().ordering() == vals_store::Ordering::Sorted {
+                if let Some(past) = progress.next_cursor.as_mut() {
+                    past.push(0);
+                }
+            }
             progress.wrapped = false;
             progress.deferred = true;
             break;
@@ -1831,7 +1854,7 @@ mod tests {
             DEFAULT_BUCKETS,
             &ring,
             3,
-            9,
+            2,
             zid,
             2,
             Some(&scope),
@@ -1850,7 +1873,7 @@ mod tests {
             DEFAULT_BUCKETS,
             &ring,
             1,
-            9,
+            2,
             zid,
             2,
             Some(&scope),
@@ -1918,7 +1941,7 @@ mod tests {
     #[test]
     fn sorted_zone_reconcile_does_not_adopt_sibling_shard_keys() {
         use crate::partition::RangeMap;
-        let ring = Ring::from_members(1, 64, [1]);
+        let ring = Ring::from_members(2, 64, [1, 9]);
         let zid = 5;
         const K: usize = 2;
         let splits: Vec<Vec<u8>> = (1..10)
@@ -1941,7 +1964,7 @@ mod tests {
             1,
             9,
             zid,
-            1,
+            2,
             None,
             Some(&map),
             (0, K),
@@ -1969,7 +1992,7 @@ mod tests {
 
     #[test]
     fn default_zone_reconcile_does_not_adopt_sibling_shard_keys() {
-        let ring = Ring::from_members(1, 64, [1]);
+        let ring = Ring::from_members(2, 64, [1, 9]);
         const K: usize = 2;
 
         let mut peer = store(9);
@@ -2007,6 +2030,50 @@ mod tests {
             saw_mine && saw_sibling,
             "the key set must land on both shard 1 and its sibling"
         );
+    }
+
+    #[test]
+    fn reconcile_pulls_only_keys_the_peer_also_owns() {
+        let ring = Ring::from_members(2, 64, [1, 2, 3]);
+        let zid = 5;
+        let mut peer = store(3);
+        let keys: Vec<Vec<u8>> = (0..300).map(|i| format!("k{i:03}").into_bytes()).collect();
+        for k in &keys {
+            peer.apply(k, Some(b"v"), v(100, 3)).unwrap();
+        }
+        let shared = |owners: Vec<NodeId>| owners.contains(&1) && owners.contains(&3);
+        let default = RefCell::new(store(1));
+        run(reconcile_scoped(&default, &LocalPeer(&peer), DEFAULT_BUCKETS, &ring, 1, 3, (0, 1), None)).unwrap();
+        let zoned = RefCell::new(store(1));
+        run(reconcile_scoped_zone(
+            &zoned,
+            &LocalPeer(&peer),
+            DEFAULT_BUCKETS,
+            &ring,
+            1,
+            3,
+            zid,
+            2,
+            None,
+            None,
+            (0, 1),
+            None,
+        ))
+        .unwrap();
+        let (mut pulled, mut skipped) = (0, 0);
+        for k in &keys {
+            for (store, owners) in [(&default, ring.replicas(k)), (&zoned, ring.replicas_in_zone(zid, k, 2, None))] {
+                let both = shared(owners.clone());
+                assert_eq!(
+                    store.borrow().get(k).unwrap().is_some(),
+                    both,
+                    "key {k:?} with owners {owners:?}: only keys both peers own are pulled"
+                );
+                pulled += usize::from(both);
+                skipped += usize::from(owners.contains(&1) && !both);
+            }
+        }
+        assert!(pulled > 0 && skipped > 0, "the key set must include shared keys and keys only node 1 owns");
     }
 
     #[test]
@@ -2949,6 +3016,33 @@ mod tests {
             f.borrow().get(&key).unwrap().is_some(),
             "the key is retained for a later pass"
         );
+    }
+
+    #[test]
+    fn sorted_cleanup_moves_past_a_key_no_owner_confirms() {
+        use crate::coord::LocalCluster;
+        let ring = Ring::from_members(1, 64, [1, 2, 3]);
+        let keys: Vec<Vec<u8>> = (0..200).map(|i| format!("k{i:04}").into_bytes()).collect();
+        let stuck = keys.iter().find(|k| ring.replicas(k) == vec![1]).unwrap().clone();
+        let later = keys.iter().find(|k| **k > stuck && ring.replicas(k) == vec![2]).unwrap().clone();
+        let cfg = Config { seg_blocks: 4, reserved_blocks: 0, ordering: Ordering::Sorted };
+        let mut f = VersionedStore::new(Engine::create_prewiped(MemBlockDevice::new(256, 256), cfg), 3).unwrap();
+        f.apply(&stuck, Some(b"v"), v(100, 9)).unwrap();
+        f.apply(&later, Some(b"v"), v(100, 9)).unwrap();
+        let f = RefCell::new(f);
+        let mut lc = LocalCluster::new();
+        lc.insert(1, store(1));
+        lc.insert(2, store(2));
+        lc.set_down(1, true);
+        let pass = |resume: Option<&[u8]>| {
+            run(cleanup_scoped(&f, &lc, &ring, 3, usize::MAX, (0, 1), resume, None, || true, || true, || false))
+                .unwrap()
+        };
+        let first = pass(None);
+        assert_eq!((first.kept, first.kept_samples.clone()), (1, vec![stuck.clone()]));
+        let second = pass(first.next_cursor.as_deref());
+        assert_eq!(second.kept, 0, "the next pass starts after the key it could not hand off");
+        assert_eq!(lc.store(2).unwrap().borrow().get(&later).unwrap().as_deref(), Some(&b"v"[..]));
     }
 
     #[test]

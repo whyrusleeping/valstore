@@ -5,7 +5,7 @@ use crate::partition::RangeMap;
 use crate::pd::{placement_equivalent, AddressedMembers, PdInspection, PdStateView};
 use crate::zone::{ZoneConfig, ZoneId};
 
-use super::export::{covered, merged_range_tombstones};
+use super::export::{covered, merged_range_tombstones, StaleCopies, ZonePlacement};
 use super::*;
 
 pub trait BackupCluster {
@@ -106,10 +106,11 @@ pub fn create_backup(
     out: &Path,
     cluster: &mut dyn BackupCluster,
     tool: &str,
+    stale: StaleCopies,
     progress: &mut dyn FnMut(&str),
 ) -> Result<Manifest, String> {
     std::fs::create_dir(out).map_err(|e| format!("create {}: {e}", out.display()))?;
-    let result = create_into(out, cluster, tool, progress);
+    let result = create_into(out, cluster, tool, stale, progress);
     if result.is_err() {
         let _ = std::fs::remove_dir_all(out);
     }
@@ -120,6 +121,7 @@ fn create_into(
     out: &Path,
     cluster: &mut dyn BackupCluster,
     tool: &str,
+    stale: StaleCopies,
     progress: &mut dyn FnMut(&str),
 ) -> Result<Manifest, String> {
     let first = cluster.capture()?;
@@ -151,7 +153,9 @@ fn create_into(
         let path = out.join(&name);
         let mut writer = create_records(&path, zone_id).map_err(|e| format!("create {}: {e}", path.display()))?;
         let mut omitted = 0u64;
-        let stats = merge_replicas_into(sources, &mut |record| {
+        let placement = ZonePlacement::new(&view, (ring_vnodes, ring_rf), zone_id, &cfg);
+        let fence = (stale != StaleCopies::Keep).then_some(&placement);
+        let stats = merge_replicas_into(sources, fence, &mut |record| {
             if covered(&rts, &record) {
                 omitted += 1;
                 return Ok(());
@@ -159,6 +163,27 @@ fn create_into(
             writer.push(&record).map_err(|e| format!("write backup record: {e}"))
         })
         .map_err(|e| format!("zone {zone_id} ({}): {e}", cfg.name))?;
+        if stats.stale_copies_omitted > 0 {
+            let samples = stats.stale_samples.join("; ");
+            if stale == StaleCopies::Fail {
+                return Err(format!(
+                    "zone {zone_id} ({}): {} keys have a put held only by nodes that are not current owners of the \
+                     key, below the tombstone-GC floor of at least one owner; that owner will never accept it, and the \
+                     cluster cannot tell whether its delete was collected or the value was never copied to the \
+                     current owners. Rerun with `--stale-copies omit` to back up what the owners serve, or \
+                     `--stale-copies keep` to include these copies (only if no such key was deleted). Examples: \
+                     {samples}",
+                    cfg.name,
+                    stats.stale_copies_omitted
+                ));
+            }
+            progress(&format!(
+                "zone {zone_id} ({}): omitted {} puts held only by non-owners below some owner's tombstone-GC \
+                 floor: {samples}",
+                cfg.name,
+                stats.stale_copies_omitted
+            ));
+        }
         for fragment in rts.fragments() {
             writer
                 .push_range_tombstone(&crate::rt_sync::to_wire(fragment))
@@ -171,13 +196,15 @@ fn create_into(
             .map_err(|e| format!("sync {}: {e}", path.display()))?;
         progress(&format!(
             "zone {zone_id} ({}): {} records ({} put, {} tombstone), {} range tombstones ({omitted} covered records \
-             omitted) from {} replica entries on {replicas} replica shards",
+             omitted) from {} replica entries on {replicas} replica shards ({} non-owner copies below some \
+             owner's tombstone-GC floor omitted)",
             cfg.name,
             summary.counts.records,
             summary.counts.puts,
             summary.counts.tombstones,
             summary.range_tombstones,
-            stats.replica_entries
+            stats.replica_entries,
+            stats.stale_copies_omitted
         ));
         zones.push(ZoneEntry {
             id: zone_id,

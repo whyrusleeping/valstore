@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 use vals_store::range_tombstone::FragmentSet;
 
 use crate::antientropy::DEFAULT_BUCKETS;
-use crate::pd::AddressedMembers;
+use crate::partition::RangeMap;
+use crate::pd::{AddressedMembers, PdStateView};
 use crate::replica::{pack_version, Stored};
-use crate::ring::NodeId;
+use crate::ring::{hash64, NodeId, Ring};
 use crate::wire::{self, Request, Response, RtFragment};
-use crate::zone::{ZoneConfig, ZoneId};
+use crate::zone::{Ordering, ZoneConfig, ZoneId, DEFAULT_ZONE};
 
 use super::{Record, RecordWriter};
 
@@ -30,6 +31,83 @@ pub trait ReplicaSource {
     fn next_page(&mut self) -> Result<Option<ReplicaPage>, String>;
     fn range_tombstones(&mut self) -> Result<Vec<RtFragment>, String> {
         Ok(Vec::new())
+    }
+    fn holder(&self) -> Option<(NodeId, usize)> {
+        None
+    }
+    fn gc_floor_ms(&mut self) -> Result<u64, String> {
+        Ok(0)
+    }
+}
+
+pub struct ZonePlacement {
+    zone_id: ZoneId,
+    rf: usize,
+    scope: Option<BTreeSet<NodeId>>,
+    ring: Ring,
+    map: Option<RangeMap>,
+    shards: BTreeMap<NodeId, usize>,
+}
+
+impl ZonePlacement {
+    pub fn new(
+        view: &PdStateView,
+        (vnodes, ring_rf): (u32, usize),
+        zone_id: ZoneId,
+        cfg: &ZoneConfig,
+    ) -> Self {
+        let sorted = zone_id != DEFAULT_ZONE && cfg.ordering == Ordering::Sorted;
+        ZonePlacement {
+            zone_id,
+            rf: cfg.rf,
+            scope: cfg.scope.clone(),
+            ring: Ring::from_weighted(ring_rf.max(1), vnodes.max(1), view.members.iter().map(|(n, w, _)| (*n, *w))),
+            map: sorted.then(|| view.range_maps.get(&zone_id).cloned().unwrap_or_else(RangeMap::single)),
+            shards: view.members.iter().map(|(n, _, addrs)| (*n, addrs.len())).collect(),
+        }
+    }
+
+    pub fn owners(&self, key: &[u8]) -> Vec<(NodeId, usize)> {
+        let (mut all, pending) = self.placement(key);
+        for owner in pending {
+            if !all.contains(&owner) {
+                all.push(owner);
+            }
+        }
+        all
+    }
+
+    fn placement(&self, key: &[u8]) -> (Vec<(NodeId, usize)>, Vec<(NodeId, usize)>) {
+        let shard = |node: NodeId, place: &[u8]| {
+            let count = self.shards.get(&node).copied().unwrap_or(1).max(1) as u64;
+            (node, (hash64(place) % count) as usize)
+        };
+        let Some(map) = &self.map else {
+            let nodes = if self.zone_id == DEFAULT_ZONE {
+                self.ring.replicas(key)
+            } else {
+                self.ring.replicas_in_zone(self.zone_id, key, self.rf, self.scope.as_ref())
+            };
+            return (nodes.into_iter().map(|n| shard(n, key)).collect(), Vec::new());
+        };
+        let token = map.range_token(key);
+        let current = self.ring.replicas_in_zone(self.zone_id, token, self.rf, self.scope.as_ref());
+        let mut pending = Vec::new();
+        if let Some(target) = map.pending_for_key(key) {
+            for node in map.replicas_for_key_while_rehoming(&self.ring, self.zone_id, key, self.rf, self.scope.as_ref()) {
+                for place in [token, target] {
+                    let owner = shard(node, place);
+                    if !(current.contains(&node) && place == token) && !pending.contains(&owner) {
+                        pending.push(owner);
+                    }
+                }
+            }
+        }
+        (current.into_iter().map(|n| shard(n, token)).collect(), pending)
+    }
+
+    pub fn current_owners(&self, key: &[u8]) -> Vec<(NodeId, usize)> {
+        self.placement(key).0
     }
 }
 
@@ -51,10 +129,32 @@ pub(super) fn covered(set: &FragmentSet, record: &Record) -> bool {
     !set.is_empty() && set.cover(&record.key).is_some_and(|cover| pack_version(record.version) <= cover)
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MergeStats {
     pub replica_entries: u64,
     pub records: u64,
+    pub stale_copies_omitted: u64,
+    pub stale_samples: Vec<String>,
+}
+
+pub const STALE_SAMPLES: usize = 20;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaleCopies {
+    Fail,
+    Omit,
+    Keep,
+}
+
+impl StaleCopies {
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "fail" => Ok(StaleCopies::Fail),
+            "omit" => Ok(StaleCopies::Omit),
+            "keep" => Ok(StaleCopies::Keep),
+            other => Err(format!("--stale-copies expects fail, omit or keep, got {other:?}")),
+        }
+    }
 }
 
 struct Cursor {
@@ -62,17 +162,28 @@ struct Cursor {
     buf: VecDeque<(Vec<u8>, Stored)>,
     last: Option<Vec<u8>>,
     done: bool,
+    floor: Option<u64>,
 }
 
 impl Cursor {
     fn head(&mut self) -> Result<Option<Vec<u8>>, String> {
         while self.buf.is_empty() && !self.done {
+            self.floor = None;
             match self.source.next_page()? {
                 None => self.done = true,
                 Some(page) => self.buf.extend(page),
             }
         }
         Ok(self.buf.front().map(|(key, _)| key.clone()))
+    }
+
+    fn floor(&mut self) -> Result<u64, String> {
+        if let Some(floor) = self.floor {
+            return Ok(floor);
+        }
+        let floor = self.source.gc_floor_ms()?;
+        self.floor = Some(floor);
+        Ok(floor)
     }
 
     fn pop(&mut self) -> Result<Stored, String> {
@@ -100,21 +211,71 @@ pub(super) fn key_text(key: &[u8]) -> String {
 
 pub fn merge_replicas<W: Write>(
     sources: Vec<Box<dyn ReplicaSource>>,
+    placement: Option<&ZonePlacement>,
     out: &mut RecordWriter<W>,
 ) -> Result<MergeStats, String> {
-    merge_replicas_into(sources, &mut |record| {
+    merge_replicas_into(sources, placement, &mut |record| {
         out.push(&record).map_err(|e| format!("write backup record: {e}"))
     })
 }
 
+type Held = (Stored, Vec<usize>);
+
+fn fenced_winner(
+    key: &[u8],
+    held: &[Held],
+    winner: usize,
+    placement: Option<&ZonePlacement>,
+    cursors: &mut [Cursor],
+    shard_cursor: &HashMap<(NodeId, usize), usize>,
+) -> Result<Option<usize>, String> {
+    let Some(placement) = placement else {
+        return Ok(Some(winner));
+    };
+    let stale_candidate = |(stored, holders): &Held, cursors: &[Cursor], owners: &[(NodeId, usize)]| {
+        stored.value.is_some()
+            && holders
+                .iter()
+                .all(|&i| cursors[i].source.holder().is_some_and(|holder| !owners.contains(&holder)))
+    };
+    if held[winner].0.value.is_none() || held[winner].1.iter().any(|&i| cursors[i].source.holder().is_none()) {
+        return Ok(Some(winner));
+    }
+    let current = placement.current_owners(key);
+    if !stale_candidate(&held[winner], cursors, &current) {
+        return Ok(Some(winner));
+    }
+    let mut floor = 0u64;
+    for owner in &placement.owners(key) {
+        let Some(&c) = shard_cursor.get(owner) else {
+            return Err(format!(
+                "key {}: owner node {} shard {} has no replica source to check its tombstone-GC floor",
+                key_text(key),
+                owner.0,
+                owner.1
+            ));
+        };
+        floor = floor.max(cursors[c].floor()?);
+    }
+    Ok(held
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| !stale_candidate(h, cursors, &current) || h.0.version.physical_ms() >= floor)
+        .reduce(|best, next| if next.1 .0.version.wins_over(&best.1 .0.version) { next } else { best })
+        .map(|(j, _)| j))
+}
+
 pub fn merge_replicas_into(
     sources: Vec<Box<dyn ReplicaSource>>,
+    placement: Option<&ZonePlacement>,
     sink: &mut dyn FnMut(Record) -> Result<(), String>,
 ) -> Result<MergeStats, String> {
     let mut cursors: Vec<Cursor> = sources
         .into_iter()
-        .map(|source| Cursor { source, buf: VecDeque::new(), last: None, done: false })
+        .map(|source| Cursor { source, buf: VecDeque::new(), last: None, done: false, floor: None })
         .collect();
+    let shard_cursor: HashMap<(NodeId, usize), usize> =
+        cursors.iter().enumerate().filter_map(|(i, c)| c.source.holder().map(|h| (h, i))).collect();
     let mut heap: BinaryHeap<Reverse<(Vec<u8>, usize)>> = BinaryHeap::new();
     for (i, cursor) in cursors.iter_mut().enumerate() {
         if let Some(key) = cursor.head()? {
@@ -127,18 +288,18 @@ pub fn merge_replicas_into(
         while heap.peek().is_some_and(|Reverse((next, _))| *next == key) {
             group.push(heap.pop().expect("peeked").0 .1);
         }
-        let mut held: Vec<(Stored, usize)> = Vec::with_capacity(group.len());
+        let mut held: Vec<Held> = Vec::with_capacity(group.len());
         for &i in &group {
             let stored = cursors[i].pop()?;
             stats.replica_entries += 1;
-            if let Some((other, holder)) = held.iter().find(|(other, _)| other.version == stored.version) {
+            if let Some((other, holders)) = held.iter_mut().find(|(other, _)| other.version == stored.version) {
                 if other.value != stored.value {
                     return Err(format!(
                         "replicas disagree at the identical version {:?} for key {}: {} and {} \
                          hold different {}; refusing to back up corrupt data",
                         stored.version,
                         key_text(&key),
-                        cursors[*holder].source.label(),
+                        cursors[holders[0]].source.label(),
                         cursors[i].source.label(),
                         if stored.value.is_some() != other.value.is_some() {
                             "kinds (put vs tombstone)"
@@ -147,17 +308,39 @@ pub fn merge_replicas_into(
                         },
                     ));
                 }
+                holders.push(i);
             } else {
-                held.push((stored, i));
+                held.push((stored, vec![i]));
             }
             if let Some(next) = cursors[i].head()? {
                 heap.push(Reverse((next, i)));
             }
         }
-        let (stored, _) = held
-            .into_iter()
-            .reduce(|best, next| if next.0.version.wins_over(&best.0.version) { next } else { best })
+        let winner = held
+            .iter()
+            .enumerate()
+            .reduce(|best, next| if next.1 .0.version.wins_over(&best.1 .0.version) { next } else { best })
+            .map(|(j, _)| j)
             .expect("a merge group is non-empty");
+        let chosen = fenced_winner(&key, &held, winner, placement, &mut cursors, &shard_cursor)?;
+        if chosen != Some(winner) {
+            stats.stale_copies_omitted += 1;
+            if stats.stale_samples.len() < STALE_SAMPLES {
+                let (stored, holders) = &held[winner];
+                let held_by: Vec<String> = holders.iter().map(|&i| cursors[i].source.label()).collect();
+                stats.stale_samples.push(format!(
+                    "key {} at {:?} (physical {} ms) is held only by {}",
+                    key_text(&key),
+                    stored.version,
+                    stored.version.physical_ms(),
+                    held_by.join(", ")
+                ));
+            }
+        }
+        let Some(chosen) = chosen else {
+            continue;
+        };
+        let (stored, _) = held.swap_remove(chosen);
         sink(Record { key, version: stored.version, value: stored.value })?;
         stats.records += 1;
     }
@@ -316,6 +499,21 @@ impl NetReplicaSource {
 impl ReplicaSource for NetReplicaSource {
     fn label(&self) -> String {
         format!("node {} shard {} ({}) zone {}", self.node, self.shard, self.addr, self.zone_id)
+    }
+
+    fn holder(&self) -> Option<(NodeId, usize)> {
+        Some((self.node, self.shard))
+    }
+
+    fn gc_floor_ms(&mut self) -> Result<u64, String> {
+        match self.request(&Request::GcFloor { zone_id: self.zone_id }) {
+            Ok(Response::GcFloor(ms)) => Ok(ms),
+            Ok(other) => Err(format!("{}: expected a GC-floor reply, got {other:?}", self.label())),
+            Err(e) => Err(format!(
+                "{e} (this node could not report its tombstone-GC floor, which the backup needs to judge \
+                 a copy held by a node that does not own the key; upgrade every node)"
+            )),
+        }
     }
 
     fn range_tombstones(&mut self) -> Result<Vec<RtFragment>, String> {

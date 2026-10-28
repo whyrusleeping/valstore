@@ -534,6 +534,8 @@ counters! {
     rehome_copy_resumes,
     /// Re-home copies restarted from the range start across an abort gap: the source's unmirrored-write mark moved, the pinned source was lost, or local cleanup forgot keys in the zone since the cursor was cut.
     rehome_copy_restarts,
+    /// Re-home copy pages held back because the target holds a value, older than half the tombstone-GC grace, that the source does not hold: a former owner's leftover whose delete the source may have collected. The copy cannot complete while it is there; the check is retried every 5 s.
+    rehome_copy_target_only_blocks,
     /// Failures persisting the durable hint store.
     hint_persist_errors,
     /// Inbound connections dropped by a server at the protocol handshake (bad magic, or an unsupported/too-old version).

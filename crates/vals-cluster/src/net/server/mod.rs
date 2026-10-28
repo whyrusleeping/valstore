@@ -168,6 +168,8 @@ pub(crate) struct ServerShared<D: BlockDevice> {
     pub(crate) rehome_copy_progress: RefCell<FastMap<(ZoneId, Vec<u8>), u64>>,
     range_write_marks: RefCell<FastMap<ZoneId, ZoneWriteMarks>>,
     rehome_copy_holds: RefCell<FastMap<(ZoneId, Vec<u8>), u64>>,
+    cleanup_status: RefCell<FastMap<ZoneId, CleanupZoneStatus>>,
+    cleanup_recheck: Cell<(u64, Option<std::time::Instant>)>,
     zone_forget_gens: RefCell<FastMap<ZoneId, u64>>,
     rehome_transport: RefCell<Option<RehomeTransport>>,
     read_gate: ReadGate,
@@ -287,6 +289,15 @@ impl RangeLoadTracker {
             sampled_at: std::time::Instant::now(),
         }
     }
+}
+
+#[derive(Default)]
+struct CleanupZoneStatus {
+    clean: Option<u64>,
+    lapped: Option<u64>,
+    stamp: (u64, u64, u64),
+    kept: u64,
+    samples: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -413,6 +424,7 @@ pub(crate) use placement::catalog_to_wire;
 pub(crate) use read_gate::{InflightGuard, ReadGate, ReadPause};
 #[cfg(test)]
 pub(crate) use control::serve_request;
+pub(crate) use scan::serve_scan_keys;
 #[cfg(test)]
 pub(crate) use scan::{serve_scan, serve_scan_counted, set_zone_scan_reply_budget};
 

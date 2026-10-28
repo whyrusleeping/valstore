@@ -2,7 +2,9 @@ pub use vals_client::net::*;
 
 mod server;
 
-pub(crate) use server::{accept_loop, server_poll, ReadGate, ReadPause, ServerShared};
+pub(crate) use server::{
+    accept_loop, serve_scan_keys, server_poll, ReadGate, ReadPause, ServerShared,
+};
 pub use server::{ReplicaServer, ServerHandle, ShardedServer};
 
 #[cfg(test)]

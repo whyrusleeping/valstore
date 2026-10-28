@@ -90,6 +90,53 @@
     }
 
     #[test]
+    fn gc_floor_request_and_reply_roundtrip() {
+        let frame = encode_request(&Request::GcFloor { zone_id: 7 });
+        assert_eq!(hex(payload(&frame)), "1807000000");
+        assert_eq!(
+            decode_request(payload(&frame)).unwrap(),
+            OwnedRequest::GcFloor { zone_id: 7 }
+        );
+        let mut trailing = payload(&frame).to_vec();
+        trailing.push(0);
+        assert_eq!(decode_request(&trailing), Err(WireError::TrailingBytes));
+        let reply = encode_response(&Response::GcFloor(1_700_000_000_123));
+        assert_eq!(payload(&reply)[0], RESP_GC_FLOOR);
+        assert_eq!(
+            decode_response(payload(&reply)).unwrap(),
+            Response::GcFloor(1_700_000_000_123)
+        );
+    }
+
+    #[test]
+    fn cleanup_status_request_and_reply_roundtrip() {
+        let frame = encode_request(&Request::CleanupStatus);
+        assert_eq!(hex(payload(&frame)), "19");
+        assert_eq!(decode_request(payload(&frame)).unwrap(), OwnedRequest::CleanupStatus);
+        let mut trailing = payload(&frame).to_vec();
+        trailing.push(0);
+        assert_eq!(decode_request(&trailing), Err(WireError::TrailingBytes));
+        let status = Response::CleanupStatus {
+            ring_epoch: 9,
+            gc_grace_ms: 60_000,
+            records: 12,
+            unsettled: vec![
+                UnsettledZone {
+                    zone_id: 3,
+                    lapped: true,
+                    pending_rehome: false,
+                    kept: 2,
+                    samples: vec![b"a".to_vec(), Vec::new()],
+                },
+                UnsettledZone { zone_id: 0, lapped: false, pending_rehome: true, kept: 0, samples: Vec::new() },
+            ],
+        };
+        let reply = encode_response(&status);
+        assert_eq!(payload(&reply)[0], RESP_CLEANUP_STATUS);
+        assert_eq!(decode_response(payload(&reply)).unwrap(), status);
+    }
+
+    #[test]
     fn busy_reply_roundtrips() {
         let reply = encode_response(&Response::Busy);
         assert_eq!(payload(&reply)[0], RESP_BUSY);

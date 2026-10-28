@@ -55,4 +55,6 @@ mod merge_stress_tests;
 #[cfg(test)]
 mod wipe_tests;
 #[cfg(test)]
+mod former_owner_tests;
+#[cfg(test)]
 mod seed_reap_tests;

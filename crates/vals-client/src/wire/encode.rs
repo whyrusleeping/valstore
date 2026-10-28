@@ -417,6 +417,13 @@ pub fn encode_request_payload(req: &Request) -> Vec<u8> {
             put_u64(&mut b, digest);
             put_opt(&mut b, after);
         }
+        Request::GcFloor { zone_id } => {
+            b.push(OP_GC_FLOOR);
+            put_u32(&mut b, zone_id);
+        }
+        Request::CleanupStatus => {
+            b.push(OP_CLEANUP_STATUS);
+        }
     }
     b
 }
@@ -686,6 +693,22 @@ pub fn encode_response_into(b: &mut Vec<u8>, resp: &Response) {
         Response::Watermark(ms) => {
             b.push(RESP_WATERMARK);
             put_u64(b, *ms);
+        }
+        Response::GcFloor(ms) => {
+            b.push(RESP_GC_FLOOR);
+            put_u64(b, *ms);
+        }
+        Response::CleanupStatus { ring_epoch, gc_grace_ms, records, unsettled } => {
+            b.push(RESP_CLEANUP_STATUS);
+            put_u64(b, *ring_epoch);
+            put_u64(b, *gc_grace_ms);
+            put_u64(b, *records);
+            put_list(b, unsettled, |b, zone| {
+                put_u32(b, zone.zone_id);
+                b.push(zone.lapped as u8 | (zone.pending_rehome as u8) << 1);
+                put_u64(b, zone.kept);
+                put_list(b, &zone.samples, |b, key| put_bytes(b, key));
+            });
         }
         Response::Denied => {
             b.push(RESP_DENIED);

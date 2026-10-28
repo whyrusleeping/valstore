@@ -184,8 +184,9 @@ can alter copied spans or range indexes under the worker.
 This dedicated range copy does not inherit the store-wide cleanup cursor, key/RPC
 limits, 250 ms wall budget, or five-second sweep cadence. Anti-entropy is not a
 fallback for failed placement moves: `VersionedStore::scoped_leaf_digests`
-includes only keys both peers currently own, so a key retained by a former owner
-is invisible to every AE pull. Only push-side mirroring/copy can make that key
+includes only keys both peers currently own, and the pull skips every key in a
+differing bucket that the peer does not own too (0515), so a key retained by a
+former owner is invisible to every AE pull. Only push-side mirroring/copy can make that key
 visible at the new placement.
 
 The write path fences stale coordinators after cutover. For sorted zones, a node
@@ -402,6 +403,19 @@ zone's RF/scope remains satisfiable, use the existing
 `valsd admin -s <socket> remove-node <id>` membership operation so the PD derives
 a new required-owner set. There is no manual `abort-rehome` admin command.
 
+With `gc_grace > 0` the copier also checks, page by page, the target's own
+entries in the page's window. A live value that the source lacks, and that is
+older than half the grace, may be a former owner's leftover whose delete the
+source already collected. Cutting over would make the target serve it, so the
+page is not counted as copied and the copy stays incomplete until the key is
+gone (`vals_rehome_copy_target_only_blocks`). Younger target-only values are
+in-flight mirrors and pass. The check is keys-only: it reads the target's index,
+not its values. With RF > 1, an old acknowledged write that the source owner
+missed also holds the copy, until anti-entropy repairs the source. Only a copy
+that no current owner holds holds it for good. A held copy is rechecked every
+5 s. Ring changes (`add-node`, `remove-node`) are checked separately, before
+the PD commits them ([`backup-restore.md`](backup-restore.md#consistency-contract)).
+
 Aborted-then-retried copies resume instead of re-scanning. The copy cursor is
 keyed by the range and pending token and survives the abort's epoch bump; on
 re-prepare the copier revalidates it against its pinned source's
@@ -429,7 +443,7 @@ sorted zone grown from a single range: 46 inherited ranges converged to zero
 unrehomed with no operator intervention, exact key counts and zero consistency
 errors through a SIGKILL'd owner mid-copy and a PD restart mid-move —
 `bench/lab-rehome-20260808/FINDINGS.md`). The client-parity gate is satisfied
-by task 0144: current valsgo decodes map-v2/v3 replies and routes by committed
+by task 0144: the current Go client decodes map-v2/v3 replies and routes by committed
 range tokens; older Go clients must be upgraded. Data-path fencing for stale
 coordinators landed in task 0150.
 

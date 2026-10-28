@@ -2061,6 +2061,11 @@ impl<D: BlockDevice> VersionedStore<D> {
         }
     }
 
+    pub fn admission_floor_ms(&self, wall_ms: u64) -> u64 {
+        self.advance_live_admission_cutoff(wall_ms);
+        if self.gc_grace_ms == 0 { 0 } else { self.live_admission_cutoff_ms.get() }
+    }
+
     pub(super) fn durable_gc_cutoff_ms(&self) -> Option<u64> {
         if self.gc_grace_ms == 0 {
             return None;

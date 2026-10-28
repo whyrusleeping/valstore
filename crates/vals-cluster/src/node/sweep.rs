@@ -151,6 +151,15 @@ impl LogEvery {
     }
 }
 
+struct LapTally {
+    placement: crate::replica::CleanupPlacement,
+    start_gen: u64,
+    saw_copy_hold: bool,
+    moved: bool,
+    kept: u64,
+    samples: Vec<Vec<u8>>,
+}
+
 #[derive(Debug)]
 pub(super) struct CleanupLap {
     origin: Option<Vec<u8>>,
@@ -595,6 +604,8 @@ pub(super) async fn sweep_loop<D: BlockDevice + AsyncRead + 'static>(
         std::collections::HashMap::new();
     let mut cleanup_laps: std::collections::HashMap<ZoneId, CleanupLap> =
         std::collections::HashMap::new();
+    let mut lap_tallies: std::collections::HashMap<ZoneId, LapTally> =
+        std::collections::HashMap::new();
     let mut ae_error_log = LogEvery::default();
     let mut cleanup_dirty: std::collections::HashSet<ZoneId> =
         std::collections::HashSet::new();
@@ -603,6 +614,7 @@ pub(super) async fn sweep_loop<D: BlockDevice + AsyncRead + 'static>(
     let mut cleanup_placements: std::collections::HashMap<ZoneId, crate::replica::CleanupPlacement> =
         std::collections::HashMap::new();
     let mut last_cleanup_stamp: Option<(u64, u64, u64, u64)> = None;
+    let mut last_recheck_gen = 0u64;
     loop {
         shared.sweep_notified().await;
         if shared.is_shutdown() {
@@ -610,6 +622,11 @@ pub(super) async fn sweep_loop<D: BlockDevice + AsyncRead + 'static>(
         }
         let eager = shared.take_rebalance_pending();
         shared.note_sweep_pass();
+        let recheck_gen = shared.cleanup_recheck_gen();
+        if recheck_gen != last_recheck_gen {
+            cleanup_done.clear();
+            last_recheck_gen = recheck_gen;
+        }
         let stamp = cleanup_stamp(&shared);
         if last_cleanup_stamp != Some(stamp) {
             cleanup_done.clear();
@@ -756,8 +773,12 @@ pub(super) async fn sweep_loop<D: BlockDevice + AsyncRead + 'static>(
                 if cleanup_laps.contains_key(&zone_id) {
                     cleanup_dirty.insert(zone_id);
                 }
+                if let Some(tally) = lap_tallies.get_mut(&zone_id) {
+                    tally.moved = true;
+                }
             }
             cleanup_placements.insert(zone_id, placement.clone());
+            shared.note_cleanup_placement(zone_id, moved, (stamp.0, stamp.1, stamp.2));
             store.borrow_mut().set_cleanup_placement(placement.clone());
             prepared_zones.push((zone_id, cfg, range_map, placement));
         }
@@ -968,11 +989,22 @@ pub(super) async fn sweep_loop<D: BlockDevice + AsyncRead + 'static>(
             let lap = cleanup_laps.entry(zone_id).or_insert_with(|| {
                 CleanupLap::starting_at(cleanup_origin(&store.borrow(), node_id, shard_index, zone_id))
             });
+            let tally = lap_tallies
+                .entry(zone_id)
+                .or_insert_with(|| LapTally {
+                    placement: placement.clone(),
+                    start_gen: shared.cleanup_recheck_gen(),
+                    saw_copy_hold: false,
+                    moved: false,
+                    kept: 0,
+                    samples: Vec::new(),
+                });
             let burst_left = burst_budget.saturating_sub(burst_spent);
             let burst_started = std::time::Instant::now();
             let burst_ops = shared.foreground_ops();
             let mut lap_done = false;
             loop {
+                tally.saw_copy_hold |= shared.zone_copy_hold_active(zone_id, physical_now_ms());
                 let gate = QuiesceGate {
                     shared: &shared,
                     consecutive_timeouts: &cleanup_quiesce_timeouts,
@@ -1040,6 +1072,7 @@ pub(super) async fn sweep_loop<D: BlockDevice + AsyncRead + 'static>(
                     break;
                 }
                 let mut burst_more = false;
+                tally.saw_copy_hold |= shared.zone_copy_hold_active(zone_id, physical_now_ms());
                 match cleaned {
                     Ok(mut progress) => {
                         crate::observe::counters()
@@ -1050,6 +1083,15 @@ pub(super) async fn sweep_loop<D: BlockDevice + AsyncRead + 'static>(
                             .add(progress.probe_released as u64);
                         if progress.released > 0 {
                             shared.bump_zone_forget_gen(zone_id);
+                        }
+                        if progress.kept > 0 {
+                            tally.kept += progress.kept as u64;
+                            for key in progress.kept_samples.drain(..) {
+                                if tally.samples.len() < crate::antientropy::CLEANUP_KEPT_SAMPLES {
+                                    tally.samples.push(key);
+                                }
+                            }
+                            shared.note_cleanup_kept(zone_id, tally.kept, &tally.samples);
                         }
                         if shared.maintenance_paused_for_wipe() {
                             if let Some(plan) = progress.forget_plan.take() {
@@ -1087,7 +1129,22 @@ pub(super) async fn sweep_loop<D: BlockDevice + AsyncRead + 'static>(
                         if lap.advance(progress.next_cursor, progress.wrapped) {
                             crate::observe::counters().cleanup_traversals.inc();
                             lap_done = true;
-                            if !cleanup_dirty.remove(&zone_id) {
+                            let held = !tally.saw_copy_hold
+                                && !tally.moved
+                                && with_cleanup_placement(&shared, zone_id, |base, map| {
+                                    tally.placement.unchanged_at(base, map)
+                                })
+                                .unwrap_or(false);
+                            shared.note_cleanup_lap(
+                                zone_id,
+                                held.then_some(tally.start_gen),
+                                (stamp.0, stamp.1, stamp.2),
+                                tally.kept,
+                                std::mem::take(&mut tally.samples),
+                                store.borrow().cleanup_forget_pending(),
+                            );
+                            let rechecked = tally.start_gen >= shared.cleanup_recheck_gen();
+                            if !cleanup_dirty.remove(&zone_id) && rechecked && !tally.saw_copy_hold {
                                 cleanup_done.insert(zone_id);
                             }
                         } else {
@@ -1117,6 +1174,7 @@ pub(super) async fn sweep_loop<D: BlockDevice + AsyncRead + 'static>(
             burst_spent += burst_started.elapsed();
             if lap_done {
                 cleanup_laps.remove(&zone_id);
+                lap_tallies.remove(&zone_id);
             }
         }
         if shared.resync_pending() && refill_ok {

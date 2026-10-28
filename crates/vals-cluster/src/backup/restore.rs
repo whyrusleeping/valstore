@@ -664,7 +664,8 @@ pub fn compare_backup(
                 .map_err(|e| format!("zone {zone_id} ({}): {e}", cfg.name))?,
             Ordering::Unsorted => FragmentSet::default(),
         };
-        merge_replicas_into(sources, &mut |record| {
+        let unfenced = None;
+        merge_replicas_into(sources, unfenced, &mut |record| {
             if covered(&target_rts, &record) {
                 return Ok(());
             }

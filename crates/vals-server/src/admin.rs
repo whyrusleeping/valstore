@@ -3,7 +3,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::mpsc;
 
-use vals_cluster::pd::{AdminMutation, AdminOutcome, PdDaemon, PartitionError, SplitMode};
+use vals_cluster::pd::{
+    check_membership_change, AdminMutation, AdminOutcome, MembershipChange, PdDaemon, PartitionError, SplitMode,
+};
 use vals_cluster::zone::{ZoneConfig, ZoneId};
 use vals_cluster::Ordering;
 
@@ -155,7 +157,14 @@ pub fn handle_command(pd: &PdDaemon, line: &str) -> String {
 }
 
 fn try_handle(pd: &PdDaemon, line: &str) -> Result<String, String> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
+    let mut parts: Vec<&str> = line.split_whitespace().collect();
+    let force = parts.last() == Some(&"--force");
+    if force {
+        parts.pop();
+        if !matches!(parts.first(), Some(&"add-node" | &"remove-node")) {
+            return Err("--force applies only to add-node and remove-node".into());
+        }
+    }
     match parts.as_slice() {
         ["ping"] => Ok("ok".into()),
         ["status"] => {
@@ -246,7 +255,8 @@ fn try_handle(pd: &PdDaemon, line: &str) -> Result<String, String> {
         ["add-node", id, weight] => {
             let id = parse(id, "node id")?;
             let weight = parse(weight, "weight")?;
-            proposed(pd, AdminMutation::Add(id, weight, Vec::new()))
+            let gate = membership_gate(pd, MembershipChange::Add(id), &[], force)?;
+            proposed(pd, AdminMutation::Add(id, weight, Vec::new())).map(|ok| format!("{ok}; {gate}"))
         }
         ["add-node", id, weight, addrs] => {
             let id = parse(id, "node id")?;
@@ -255,11 +265,14 @@ fn try_handle(pd: &PdDaemon, line: &str) -> Result<String, String> {
                 .split(',')
                 .map(|a| a.parse().map_err(|_| format!("bad address {a:?}")))
                 .collect::<Result<Vec<_>, _>>()?;
-            proposed(pd, AdminMutation::Add(id, weight, addrs))
+            let gate = membership_gate(pd, MembershipChange::Add(id), &addrs, force)?;
+            proposed(pd, AdminMutation::Add(id, weight, addrs)).map(|ok| format!("{ok}; {gate}"))
         }
 
         ["remove-node", id] => {
-            proposed(pd, AdminMutation::Remove(parse(id, "node id")?))
+            let id = parse(id, "node id")?;
+            let gate = membership_gate(pd, MembershipChange::Remove(id), &[], force)?;
+            proposed(pd, AdminMutation::Remove(id)).map(|ok| format!("{ok}; {gate}"))
         }
 
         ["create-zone", name, rf, ordering] => {
@@ -338,6 +351,29 @@ fn try_handle(pd: &PdDaemon, line: &str) -> Result<String, String> {
              pd-add-learner|pd-remove-learner|pd-replace)"
         )),
     }
+}
+
+fn membership_gate(
+    pd: &PdDaemon,
+    change: MembershipChange,
+    incoming: &[std::net::SocketAddr],
+    force: bool,
+) -> Result<String, String> {
+    if force {
+        return Ok("cleanup gate skipped (--force)".into());
+    }
+    let view = pd.inspect().ok_or("pd inspection unavailable")?;
+    check_membership_change(&view.members, &view.range_maps, change, incoming)
+        .map(|settled| format!("cleanup gate: {settled}"))
+        .map_err(|why| {
+            format!(
+                "membership change refused, nothing applied: {why}. A node that becomes an owner serves the \
+                 copies it holds, so a copy whose delete was collected would come back. Wait for cleanup to \
+                 settle; delete a key that should stay deleted (cleanup then releases its copy); wipe a node \
+                 before it joins; or rerun with --force to accept that risk \
+                 (docs/backup-restore.md#consistency-contract)"
+            )
+        })
 }
 
 fn id_list(ids: &[u64]) -> String {
@@ -677,6 +713,20 @@ mod tests {
             assert!(Instant::now() < deadline, "range not committed: {ranges}");
             std::thread::sleep(Duration::from_millis(10));
         }
+        pd.shutdown();
+    }
+
+    #[test]
+    fn membership_changes_need_a_settled_cleanup_or_force() {
+        let pd = spawn_pd();
+        let refused = handle_command(&pd, "add-node 2 1");
+        assert!(refused.starts_with("err: membership change refused, nothing applied"), "{refused}");
+        assert!(refused.contains("node 1 has no data address"), "{refused}");
+        assert!(handle_command(&pd, "members").ends_with("\n1 1 -"));
+        let forced = handle_command(&pd, "add-node 2 1 --force");
+        assert!(forced.starts_with("ok committed index="), "{forced}");
+        assert!(forced.ends_with("cleanup gate skipped (--force)"), "{forced}");
+        assert_eq!(handle_command(&pd, "members --force"), "err: --force applies only to add-node and remove-node");
         pd.shutdown();
     }
 

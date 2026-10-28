@@ -85,7 +85,7 @@ layout version (§3.6), replacing an older length-sniffing heuristic.
 ## 1. Wire protocol (`vals-cluster`)
 
 Custom binary RPC over TCP — no gRPC/serde on the hot path. Defined in
-[`wire.rs`](../crates/vals-client/src/wire.rs) (pure encode/decode, re-exported by
+[`wire/`](../crates/vals-client/src/wire) (pure encode/decode, re-exported by
 `vals-cluster`) and framed by the mux transport in
 [`net/`](../crates/vals-cluster/src/net/).
 
@@ -138,7 +138,7 @@ their request; a second implementation must send a valid hello first or it is
 dropped.
 
 Protocol v2 is a flag-day deployment: mixed v1/v2 clusters are unsupported, and
-sibling clients/tools (`valsgo` and `bootes`) must be upgraded before the cluster.
+out-of-tree clients and tools must be upgraded before the cluster.
 Do not use a v1 binary to read data written by v2; old decoders truncate the high
 32 bits of the writer identity and can select a different LWW winner.
 
@@ -191,6 +191,8 @@ Payload = `[u8 opcode]` then the fields below (`wire.rs:815`). Opcodes (`wire.rs
 | `RangeStatsV3` | 20 | *(none)* (V2 statistics plus exact logical-winner accounting readiness) |
 | `RangeDelete` | 21 | `[u64 epoch][u32 zone][u8 sync][version][u32 count]` then `[opt<bytes> lo][opt<bytes> hi] × count`; `count <= 4096`, no trailing bytes (sorted zones; `lo` inclusive, `hi` exclusive, absent = unbounded) |
 | `SyncRangeTombstones` | 22 | `[u32 zone][opt<u32> requester][u64 digest][opt<bytes> after]`, no trailing bytes (anti-entropy range-tombstone exchange, 0462) |
+| `GcFloor` | 24 | `[u32 zone]`, no trailing bytes (the shard's tombstone-GC admission floor for the zone; read by `valsd backup create` to judge a put held only by a non-owner, docs/backup-restore.md) |
+| `CleanupStatus` | 25 | *(none)*, no trailing bytes (over-replication cleanup state of the shard; read by the PD before `add-node`/`remove-node`, docs/backup-restore.md). Starts a fresh cleanup check unless one started within `min(gc_grace / 2, 10 min)` |
 
 `MixedBatchRead` preserves request positions, including duplicate keys. The route
 stamp applies to the whole request. `start` resumes an earlier request without
@@ -283,6 +285,8 @@ Payload = `[u8 kind]` then fields (`wire.rs:979`). Kinds (`wire.rs:54`):
 | `MixedBatchRead` | 18 | `[u32 start][u8 more][u32 count]` then mixed results in request order. Result tags: `0` value-absent; `1` value-present + `[version][opt<bytes> value]`; `2` digest-absent; `3` digest-present + `[version]`; `4` per-key Busy; `5` per-key Err + `[bytes message]` |
 | `RangeStatsV3` | 19 | `[u64 range-map epoch][u64 accounting epoch][u8 accounting ready][u32 count]` then `range-stat-v2 × count`, then an optional `[u8 recovery seeding]` (0374; 1 while an engine of a configured zone on the shard, reopened with runs at process start, has not published its first leaf seed; reseeds caused by placement changes report 0; decoders that predate it ignore the trailing byte) |
 | `RangeTombstones` | 20 | `[u8 same][u8 more][u32 count]` then `rt-entry × count`, no trailing bytes (reply to `SyncRangeTombstones`; `same = 1` carries no fragments) |
+| `GcFloor` | 22 | `[u64 ms]`: a put whose physical time is below it is refused by this shard (`0` = tombstone GC off). The floor only rises. Reply to `GcFloor`; a peer that predates it answers the request with an error |
+| `CleanupStatus` | 23 | `[u64 ring epoch][u64 gc_grace ms][u64 records][u32 count]` then per unsettled zone `[u32 zone][u8 flags][u64 kept][u32 n][bytes key × n]` (`n <= 4` sample keys; flags bit 0 `lapped`, bit 1 `pending re-home`, other bits rejected). `records` counts the entries the shard's engines track (0 only when the shard holds no data). A zone is settled once a cleanup lap that started after the latest check, under the zone's current placement and with no re-home copy hold active, released every copy of a key the shard does not own, and the zone has no pending re-home or active copy hold; `lapped` is set when such a lap finished but kept `kept` copies. Reply to `CleanupStatus` |
 
 A `MixedBatchRead` reply count cannot exceed 4096 or the unserved request tail.
 `StaleEpoch` and connection-level `Busy` replace the whole mixed reply; ordinary

@@ -104,6 +104,10 @@ struct Cluster {
 }
 
 fn write_configs(dir: &Path, addrs: &[SocketAddr]) {
+    write_configs_with(dir, addrs, "sweep = 3600s\n", "");
+}
+
+fn write_configs_with(dir: &Path, addrs: &[SocketAddr], node_extra: &str, pd_extra: &str) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("secret"), "backup-test-secret\n").unwrap();
     for id in 1..=3usize {
@@ -114,7 +118,7 @@ fn write_configs(dir: &Path, addrs: &[SocketAddr]) {
         std::fs::write(
             dir.join(format!("node{id}.conf")),
             format!(
-                "node_id = {id}\nlisten = {}\ndata_dir = node{id}\n{peers}rf = 3\nsweep = 3600s\n\
+                "node_id = {id}\nlisten = {}\ndata_dir = node{id}\n{peers}rf = 3\n{node_extra}\
                  secret_file = secret\n",
                 addrs[id - 1]
             ),
@@ -126,7 +130,7 @@ fn write_configs(dir: &Path, addrs: &[SocketAddr]) {
     std::fs::write(
         dir.join("pd.conf"),
         format!(
-            "pd_id = 1\ndata_dir = pd\n{data_nodes}rf = 3\nvnodes = 64\nzone = events 2 sorted\n\
+            "pd_id = 1\ndata_dir = pd\n{data_nodes}rf = 3\nvnodes = 64\nzone = events 2 sorted\n{pd_extra}\
              admin_socket = pd-admin.sock\nsecret_file = secret\n"
         ),
     )
@@ -483,5 +487,113 @@ fn restore_drill_rebuilds_an_exact_fenced_copy_from_a_backup() {
     let stdout = String::from_utf8_lossy(&diverged.stdout);
     assert_eq!(diverged.status.code(), Some(1), "{stdout}");
     assert!(stdout.contains("1 differences"), "{stdout}");
+    drop(target);
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+fn at_ms(ms: u64) -> Version {
+    Version { hlc: ms << 16, node: 999 }
+}
+
+fn value_on(addr: SocketAddr, zone_id: ZoneId, key: &[u8]) -> Option<Vec<u8>> {
+    match raw_request(addr, &Request::Read { epoch: u64::MAX, zone_id, key }) {
+        Response::Read(stored) => stored.and_then(|s| s.value),
+        other => panic!("read from {addr}: {other:?}"),
+    }
+}
+
+#[test]
+fn a_former_owner_copy_whose_delete_aged_out_is_neither_backed_up_nor_restored() {
+    let dir = std::env::temp_dir().join(format!("valsd-former-owner-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let addrs: Vec<SocketAddr> = (0..3).map(|_| free_addr()).collect();
+    write_configs_with(&dir, &addrs, "sweep = 1s\ngc_grace = 60s\n", "zone = sessions 2 unsorted\n");
+    let mut source = Cluster::launch(dir, addrs);
+    let coord = source.coordinator();
+    let sessions = eventually("boot zone adopted", || {
+        run(coord.refresh_catalog(1)).ok()?;
+        coord.catalog().by_name("sessions")
+    });
+    let stray = |prefix: &str| -> (Vec<u8>, Vec<u32>) {
+        (0..10_000)
+            .map(|i| format!("{prefix}-{i}").into_bytes())
+            .map(|key| {
+                let owners = coord.replicas_for(sessions, &key).unwrap();
+                (key, owners)
+            })
+            .find(|(_, owners)| !owners.contains(&3))
+            .unwrap()
+    };
+    let (zombie, owners) = stray("zombie");
+    let (fresh, _) = stray("fresh");
+    let addr = |node: u32| source.addrs[node as usize - 1];
+    let now = now_ms();
+    for &owner in &owners {
+        eventually("owner serves the zone", || {
+            let reply = raw_request(addr(owner), &apply_request(sessions, b"anchor", Some(b"a"), at_ms(now)));
+            (reply == Response::Apply(Applied::Won)).then_some(())
+        });
+        let reply = raw_request(addr(owner), &apply_request(sessions, &zombie, None, at_ms(now - 3_000_000)));
+        assert_eq!(reply, Response::Apply(Applied::Won), "a delete older than the grace is acknowledged");
+        assert_eq!(value_on(addr(owner), sessions, &zombie), None);
+    }
+    eventually("the former owner serves the zone", || {
+        let reply = raw_request(addr(3), &apply_request(sessions, &zombie, Some(b"zombie"), at_ms(now - 3_600_000)));
+        (reply == Response::Apply(Applied::Won)).then_some(())
+    });
+    raw_apply(addr(3), sessions, &fresh, Some(b"fresh"), at_ms(now));
+    std::thread::sleep(Duration::from_secs(3));
+    for &owner in &owners {
+        assert_eq!(value_on(addr(owner), sessions, &zombie), None, "owner {owner} took the stale copy back");
+    }
+    assert_eq!(value_on(addr(3), sessions, &zombie).as_deref(), Some(&b"zombie"[..]), "the stale copy stays put");
+    let refused = eventually("removing an owner is refused while node 3 keeps the copy", || {
+        let reply = admin(&source.admin_sock, &format!("remove-node {}", owners[0]));
+        (reply.contains("node 3 shard 0") && reply.contains("kept 1 copies")).then_some(reply)
+    });
+    assert!(refused.starts_with("err: membership change refused, nothing applied"), "{refused}");
+    assert!(refused.contains(&format!("zone {sessions}")) && refused.contains("--force"), "{refused}");
+    let members = admin(&source.admin_sock, "members");
+    assert_eq!(members.lines().skip(1).count(), 3, "nothing was removed: {members}");
+
+    let bk = source.dir.join("bk");
+    let bk_arg = bk.to_str().unwrap();
+    let source_sock = source.admin_sock.to_str().unwrap().to_string();
+    let refused = valsd(&["backup", "create", "-s", &source_sock, "--out", bk_arg]);
+    let stdout = String::from_utf8_lossy(&refused.stdout);
+    assert_eq!(refused.status.code(), Some(1), "an ambiguous former-owner copy fails the default: {stdout}");
+    assert!(stdout.contains("--stale-copies omit"), "{stdout}");
+    assert!(!bk.exists());
+    let created =
+        ok(&valsd(&["backup", "create", "-s", &source_sock, "--out", bk_arg, "--stale-copies", "omit"]), "backup create");
+    let got = read_backup(&bk);
+    assert!(!got[&sessions].contains_key(&zombie), "the backup holds the stale copy: {created}");
+    assert_eq!(got[&sessions].get(&fresh).map(|(_, v)| v.clone()), Some(Some(b"fresh".to_vec())));
+    source.stop_all();
+
+    let target_dir = std::env::temp_dir().join(format!("valsd-former-owner-target-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target_dir);
+    let target_addrs: Vec<SocketAddr> = (0..3).map(|_| free_addr()).collect();
+    write_configs_with(&target_dir, &target_addrs, "sweep = 3600s\n", "zone = sessions 2 unsorted\n");
+    let target_conf = target_dir.join("pd.conf");
+    ok(&valsd(&["backup", "restore-pd", "-c", target_conf.to_str().unwrap(), bk_arg]), "restore-pd");
+    let target = Cluster::launch(target_dir, target_addrs);
+    let target_sock = target.admin_sock.to_str().unwrap().to_string();
+    eventually("restored PD leads", || {
+        Some(incarnation_of(&admin(&target.admin_sock, "status"))).filter(|id| id.len() == 32)
+    });
+    ok(&valsd(&["backup", "load", "-s", &target_sock, bk_arg]), "backup load");
+    let compared = ok(&valsd(&["backup", "compare", "-s", &target_sock, bk_arg]), "backup compare");
+    assert!(compared.contains("target matches"), "{compared}");
+    let coord = target.coordinator();
+    eventually("restored catalog", || {
+        run(coord.refresh_catalog(1)).ok()?;
+        (coord.catalog().by_name("sessions") == Some(sessions)).then_some(())
+    });
+    assert_eq!(run(coord.read_in(sessions, &zombie)).unwrap().and_then(|s| s.value), None, "deleted stays deleted");
+    assert_eq!(run(coord.read_in(sessions, &fresh)).unwrap().and_then(|s| s.value), Some(b"fresh".to_vec()));
     drop(target);
 }

@@ -416,6 +416,18 @@ pub(crate) async fn serve_scan<D: BlockDevice + AsyncRead>(
     serve_scan_counted(store, dev, gate, lo, hi, max, range_tombstones, site).await.0
 }
 
+pub(crate) async fn serve_scan_keys<D: BlockDevice + AsyncRead>(
+    store: &RefCell<VersionedStore<D>>,
+    dev: &D,
+    gate: &ReadGate,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+    site: crate::integrity::ReadSite,
+) -> Response {
+    let (unbounded, range_tombstones, keys_only) = (0, true, true);
+    serve_scan_mode(store, dev, gate, lo, hi, unbounded, range_tombstones, keys_only, site).await.0
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_scan_counted<D: BlockDevice + AsyncRead>(
     store: &RefCell<VersionedStore<D>>,

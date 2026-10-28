@@ -28,6 +28,8 @@ const OP_RANGE_STATS_V3: u8 = 20;
 const OP_RANGE_DELETE: u8 = 21;
 const OP_SYNC_RANGE_TOMBSTONES: u8 = 22;
 const OP_MULTI_SCAN: u8 = 23;
+const OP_GC_FLOOR: u8 = 24;
+const OP_CLEANUP_STATUS: u8 = 25;
 const RESP_MULTI_SCAN: u8 = 21;
 
 #[cfg(test)]
@@ -62,6 +64,17 @@ const RESP_RANGE_STATS_V2: u8 = 17;
 const RESP_MIXED_BATCH_READ: u8 = 18;
 const RESP_RANGE_STATS_V3: u8 = 19;
 const RESP_RANGE_TOMBSTONES: u8 = 20;
+const RESP_GC_FLOOR: u8 = 22;
+const RESP_CLEANUP_STATUS: u8 = 23;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsettledZone {
+    pub zone_id: ZoneId,
+    pub lapped: bool,
+    pub pending_rehome: bool,
+    pub kept: u64,
+    pub samples: Vec<Vec<u8>>,
+}
 
 pub const MAX_MIXED_BATCH_READ_ENTRIES: usize = 4096;
 
@@ -271,6 +284,10 @@ pub enum Request<'a> {
         digest: u64,
         after: Option<&'a [u8]>,
     },
+    GcFloor {
+        zone_id: ZoneId,
+    },
+    CleanupStatus,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -382,6 +399,10 @@ pub enum OwnedRequest {
         digest: u64,
         after: Option<Vec<u8>>,
     },
+    GcFloor {
+        zone_id: ZoneId,
+    },
+    CleanupStatus,
 }
 
 impl OwnedRequest {
@@ -471,6 +492,13 @@ pub enum Response {
     },
     StaleEpoch(u64),
     Watermark(u64),
+    GcFloor(u64),
+    CleanupStatus {
+        ring_epoch: u64,
+        gc_grace_ms: u64,
+        records: u64,
+        unsettled: Vec<UnsettledZone>,
+    },
     Denied,
     Busy,
     Err(String),

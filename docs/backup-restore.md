@@ -53,6 +53,11 @@ data address(es).
 4. Writes `MANIFEST` last: sizes, CRC-32C and record counts of every file. A
    directory without a `MANIFEST` is an incomplete backup.
 
+`--stale-copies fail|omit|keep` (default `fail`) chooses what happens to puts
+held only by nodes that are not current owners of the key when an owner refuses
+them (see
+[Consistency contract](#consistency-contract)).
+
 Exit codes: 0 success (`ok backup <id> -> <dir>: ...`), 1 failure (`err: ...`,
 nothing usable left behind), 2 usage error.
 
@@ -72,7 +77,7 @@ ordering and RF.
 | Versions | Every record keeps its 16-byte HLC version, so a restore can reproduce exact LWW order. |
 | Tombstones | Kept, with versions, when they are a key's newest version on any replica. Tombstones already garbage-collected on every replica are absent, which is the same logical state. |
 | Range tombstones (sorted zones, [`range-deletes.md`](range-deletes.md)) | The overlay of every replica's fragment set, with versions, after the point records. Keys they cover are not written: a covered key is absent, which is the same logical state. Fragments already collected under `gc_grace` on every replica are absent. |
-| Replica duplicates | Merged: one record per key, holding the highest version seen on any replica. Two replicas holding **different** contents (value, or put vs tombstone) at the **identical** version are corruption: the backup fails and names both replicas. |
+| Replica duplicates | Merged: one record per key, holding the highest version seen on any replica (puts held only by non-owners are fenced, see the consistency contract). Two replicas holding **different** contents (value, or put vs tombstone) at the **identical** version are corruption: the backup fails and names both replicas. |
 | Range maps, split points, placement tokens | In the PD state, as committed. |
 
 Not captured:
@@ -111,16 +116,86 @@ Not captured:
   A re-home that is pending at both captures is fine, because both its source
   and its target are read.
 
-Known limitation: a leftover copy on a node that **no longer owns** a key, one
-that over-replication cleanup has not removed yet, takes part in the merge. If
-every owner has already garbage-collected a newer tombstone for that key, the
-leftover put wins and reappears in the backup. Tombstone GC grace makes this
-window rare. Anti-entropy has the same exposure.
+- **Copies on nodes that do not own the key are fenced.** A node can still hold a
+  key it no longer owns: a former owner before over-replication cleanup removes
+  it, a re-home target after an abort, or a sloppy-quorum fallback. The merge
+  computes each key's owners from the captured placement (ring, catalog, range
+  map, and pending re-home targets). Records held by a current owner, and every
+  tombstone, are always merged. A **put** held only by non-owners, or only by a
+  pending re-home target (whose legitimate copies the current owner also
+  holds), is merged only if its version is at or above the tombstone-GC floor
+  of **every** owner shard, pending targets included. That floor is the one below which the owner
+  refuses a put (`GcFloor`, [`formats.md`](formats.md) §1.3). It is read only
+  when such a copy would win, after the owner's stream has passed the key, so a
+  tombstone the owner collected before or while it was read cannot be missed.
+  With `gc_grace = 0s` every floor is 0, so nothing is fenced.
+
+  Such a put below some owner's floor is **ambiguous**. Its delete may have
+  been collected, or the value may never have reached the current owners. The
+  cluster cannot tell which, and that owner will never accept it, so cleanup
+  cannot hand it off either. `create` therefore fails by
+  default, names up to 20 such keys and the nodes that hold them, and leaves
+  nothing behind. Rerun with `--stale-copies omit` to back up what the owners
+  serve (the omitted keys are listed in the progress output), or with
+  `--stale-copies keep` to include every copy as before. Use `keep` only if
+  none of those keys was deleted.
+
+  Inside the cluster, the same floor keeps cleanup handoff and read repair from
+  bringing such a copy back, and anti-entropy pulls only keys both peers own.
+  Remaining assumptions:
+  - Every owner that was an owner when the delete was written received the
+    tombstone within `gc_grace`
+    ([`../ARCHITECTURE.md`](../ARCHITECTURE.md#deletes-and-tombstones)).
+  - An owner that has seen no data progress yet (an empty node that just
+    became an owner or a pending re-home target) has floor 0. Until its first
+    write it would accept such a copy from a cleanup handoff.
+  - A re-home to a node that still holds such a copy does not complete. For
+    each page, the target checks its own entries in the page's window. A value
+    the source lacks, and older than half the grace, holds the copy, so the PD
+    aborts the move rather than cut over to it
+    (`vals_rehome_copy_target_only_blocks`, with a warning naming the key).
+    Delete the key on the target, or let the move stay aborted.
+  - A membership change (`add-node`, `remove-node`, a weight change) can make
+    a node that holds such a copy an owner again, and an owner serves what it
+    holds. The PD therefore refuses the change unless every member that stays
+    answers `CleanupStatus`, has adopted the current membership, and has
+    finished an over-replication cleanup lap of every zone, started after the
+    check began, that released every copy of a key it does not own. The check
+    passes without that only when every member, including a departing node,
+    answers that tombstone GC is off (`gc_grace = 0s`); a member that does not
+    answer or has no data address fails it. A copy that not every owner
+    confirms keeps the zone unsettled (a refusing owner, as for a put under a
+    collected point or range delete, or an unreachable one), and the refusal
+    names the node, the zone and up to four sample keys. To resolve it,
+    delete a key that should stay deleted (the owner then holds a newer delete,
+    so cleanup releases the copy), or rerun the command with `--force`, which
+    lets the node serve its copies (the right call only if those values were
+    never deleted). A node that `add-node` brings in must hold no data unless
+    tombstone GC is off on every member: the PD asks it at the addresses given
+    to `add-node` and refuses one that holds records (wipe a removed node before
+    it rejoins). A pending re-home also refuses the change, both in the PD
+    state and on any member, and so does a re-home copy hold that outlives an
+    abort (`rehome_copy_hold_ms`): cleanup treats a pending target's or a held
+    range's copies as owned, so it cannot vouch for them, and a lap that ran
+    under such a hold or under a placement that has since changed does not
+    count. A check reuses a cleanup lap that started within
+    `min(gc_grace / 2, 10 min)`. The PD waits up to 4 s for laps to finish;
+    rerun the command if a large store needs longer.
+
+  Regression tests: `backup::tests::merge_*`, `node::former_owner_tests` (including
+  a membership change after a real tombstone GC, the return of a removed
+  stale holder, and a pending then aborted re-home whose target holds the
+  stale copy), `pd::cleanup_gate::tests`,
+  `net::tests::rehome_copy_holds_while_the_target_keeps_an_old_leftover_the_source_lacks`,
+  and the `valsd` drill
+  `a_former_owner_copy_whose_delete_aged_out_is_neither_backed_up_nor_restored`.
+  `compare` applies no fence: a non-owner copy on the target shows up as a
+  difference.
 
 ## Limits and evidence
 
-- Validated by local tests only (L0: file backend, loopback, small data). There
-  is no SPDK or hardware run, and backup throughput is unmeasured.
+- Validated by local tests only (file backend, loopback, small data). There
+  has been no SPDK or hardware run, and backup throughput is unmeasured.
 - The tool pulls replicas one request at a time from a single thread, with
   two round trips per page per replica shard, and reads every replica (RF×
   read amplification). It has no rate limit of its own. The node-side digest
@@ -129,7 +204,10 @@ window rare. Anti-entropy has the same exposure.
   whole duration.
 - Memory: for each replica shard the tool holds one digest page of keys (at
   most 8 MiB) plus the values of at most 256 keys.
-- Every member must answer. There is no partial backup with a node down.
+- Every member must answer. There is no partial backup with a node down. When
+  a put held only by non-owners would win, the owners must also answer
+  `GcFloor`. If a node runs a build that predates that request, `create` fails
+  with an upgrade message.
 - No incremental or continuous backup and no point-in-time recovery: each
   backup is a full copy.
 
@@ -137,8 +215,8 @@ window rare. Anti-entropy has the same exposure.
 
 A restore never touches the source cluster and never reuses its identity. It
 builds a **new cluster** from the backup: new PD data directories, empty
-freshly provisioned data nodes, and a **new cluster incarnation** (task 0283;
-[`deploy.md`](deploy.md#cluster-incarnation-id)). The restored PD records its
+freshly provisioned data nodes, and a **new cluster incarnation**
+([`deploy.md`](deploy.md#cluster-incarnation-id)). The restored PD records its
 lineage (the source incarnation, the backup id and the source PD index), so
 the copy is traceable and a surviving or restarted old PD stays fenced out:
 target nodes bind to the new incarnation on the first push and refuse
@@ -196,8 +274,7 @@ way.
    written, so run `verify` (step 1) first. A zone's range tombstones are
    applied only after its whole file has been read and checked, at their
    original versions, as `RangeDelete` slices to every replica of each range
-   they overlap, so a damaged file never deletes data. The target nodes must
-   support range deletes (every current build does).
+   they overlap, so a damaged file never deletes data.
 6. **Check the copy:**
 
    ```
@@ -232,12 +309,13 @@ error.
 
 ### Limits and evidence
 
-- Validated by local tests only (L0: file backend, loopback, one PD, three
+- Validated by local tests only (file backend, loopback, one PD, three
   nodes, small data), including a drill test that backs up a cluster, stops
   it, restores it into empty nodes on new addresses, loads, compares, reads
   every key through a client, restarts the old PD with its push targets
-  pointed at the target nodes and checks that they refuse it. No SPDK, three-PD or hardware drill, and load and
-  compare throughput are unmeasured.
+  pointed at the target nodes and checks that they refuse it. There has been
+  no SPDK, three-PD or hardware drill, and load and compare throughput are
+  unmeasured.
 - `load` runs one batch at a time from a single thread with no rate limit,
   and writes RF× the backup's records. `compare` costs the same as `create`.
 - Every target node must be reachable and must stay so for the whole load.
@@ -249,7 +327,8 @@ error.
   until compare passes.
 - Hint backlogs, node-local files and configs are not restored (they are not
   in the backup).
-- **Format compatibility.** Backups are written as zone-file version 2 (range
-  tombstones, task 0448) whether or not a zone holds any. Builds from before
-  0448 refuse version 2 files in `verify`, `load` and `compare`, so restore a
-  new backup with a current build. Current builds still load version 1 files.
+- **Format compatibility.** Backups are written as zone-file version 2 (which
+  carries range tombstones) whether or not a zone holds any. Builds that
+  predate version 2 refuse such files in `verify`, `load` and `compare`, so
+  restore a backup with a build at least as new as the one that wrote it.
+  Current builds still load version 1 files.

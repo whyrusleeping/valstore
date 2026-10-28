@@ -10,6 +10,7 @@ use crate::partition::RangeMap;
 use crate::pd::{AddressedMembers, PdDaemon, PdStateView, RingConfig};
 use crate::replica::Stored;
 use crate::wire::RtFragment;
+use crate::ring::{NodeId, Ring};
 use crate::zone::Catalog;
 
 fn v(hlc: u64, node: u64) -> Version {
@@ -54,7 +55,7 @@ fn rt(lo: Option<&str>, hi: Option<&str>, version: Version) -> RtFragment {
 
 fn merged(sources: Vec<Box<dyn ReplicaSource>>) -> Result<Vec<Record>, String> {
     let mut writer = RecordWriter::new(Vec::new(), 7).unwrap();
-    merge_replicas(sources, &mut writer)?;
+    merge_replicas(sources, None, &mut writer)?;
     let (bytes, _) = writer.finish().unwrap();
     let mut reader = RecordReader::new(bytes.as_slice()).unwrap();
     let mut out = Vec::new();
@@ -319,7 +320,7 @@ fn create_writes_a_verifiable_backup_and_verify_catches_damage() {
     let root = scratch("create");
     let out = root.join("bk");
     let mut cluster = FakeCluster { captures: VecDeque::from([capture.clone(), capture.clone()]), data: data.clone(), rts: BTreeMap::new() };
-    let manifest = create_backup(&out, &mut cluster, "test", &mut |_| {}).unwrap();
+    let manifest = create_backup(&out, &mut cluster, "test", StaleCopies::Fail, &mut |_| {}).unwrap();
     assert_eq!(manifest.source_incarnation, capture.view().incarnation.unwrap());
     assert_eq!(
         manifest.zones.iter().map(|z| (z.id, z.counts.records)).collect::<Vec<_>>(),
@@ -327,11 +328,11 @@ fn create_writes_a_verifiable_backup_and_verify_catches_damage() {
     );
     let (_, report) = verify(&out).unwrap();
     assert_eq!(report.counts, RecordCounts { records: 4, puts: 3, tombstones: 1 });
-    assert!(create_backup(&out, &mut cluster, "test", &mut |_| {}).unwrap_err().contains("exists"));
+    assert!(create_backup(&out, &mut cluster, "test", StaleCopies::Fail, &mut |_| {}).unwrap_err().contains("exists"));
 
     let changed = root.join("changed");
     let mut cluster = FakeCluster { captures: VecDeque::from([capture.clone(), grown]), data, rts: BTreeMap::new() };
-    let error = create_backup(&changed, &mut cluster, "test", &mut |_| {}).unwrap_err();
+    let error = create_backup(&changed, &mut cluster, "test", StaleCopies::Fail, &mut |_| {}).unwrap_err();
     assert!(error.contains("membership changed"), "{error}");
     assert!(!changed.exists(), "a discarded backup leaves no directory behind");
 
@@ -406,7 +407,7 @@ fn small_backup(name: &str) -> SmallBackup {
     let root = scratch(name);
     let out = root.join("bk");
     let mut cluster = FakeCluster { captures: VecDeque::from([capture.clone(), capture.clone()]), data: data.clone(), rts: BTreeMap::new() };
-    create_backup(&out, &mut cluster, "test", &mut |_| {}).unwrap();
+    create_backup(&out, &mut cluster, "test", StaleCopies::Fail, &mut |_| {}).unwrap();
     SmallBackup { root, out, capture, zone, data }
 }
 
@@ -643,7 +644,7 @@ fn backups_merge_every_replicas_range_tombstones_omit_covered_records_and_compar
     let out = root.join("bk");
     let mut cluster =
         FakeCluster { captures: VecDeque::from([capture.clone(), capture.clone()]), data: data.clone(), rts: rts.clone() };
-    create_backup(&out, &mut cluster, "test", &mut |_| {}).unwrap();
+    create_backup(&out, &mut cluster, "test", StaleCopies::Fail, &mut |_| {}).unwrap();
     let (_, report) = verify(&out).unwrap();
     assert_eq!((report.counts.records, report.range_tombstones), (2, 2));
     let (records, held) = read_file(&std::fs::read(out.join(zone_file_name(zone))).unwrap()).unwrap();
@@ -669,4 +670,234 @@ fn backups_merge_every_replicas_range_tombstones_omit_covered_records_and_compar
     assert!(missing.samples.iter().any(|s| s.contains("the backup holds it, the target does not")), "{:?}", missing.samples);
     assert!(missing.samples.iter().any(|s| s.contains("the backup has no such key")), "{:?}", missing.samples);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+struct HeldSource {
+    holder: (NodeId, usize),
+    pages: VecDeque<ReplicaPage>,
+    floor_ms: u64,
+    floor_calls: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl ReplicaSource for HeldSource {
+    fn label(&self) -> String {
+        format!("node {} shard {}", self.holder.0, self.holder.1)
+    }
+
+    fn next_page(&mut self) -> Result<Option<ReplicaPage>, String> {
+        Ok(self.pages.pop_front())
+    }
+
+    fn holder(&self) -> Option<(NodeId, usize)> {
+        Some(self.holder)
+    }
+
+    fn gc_floor_ms(&mut self) -> Result<u64, String> {
+        self.floor_calls.set(self.floor_calls.get() + 1);
+        Ok(self.floor_ms)
+    }
+}
+
+fn at_ms(ms: u64, node: u64) -> Version {
+    v(ms << crate::hlc::COUNTER_BITS, node)
+}
+
+fn three_nodes(zones: Catalog, range_maps: HashMap<ZoneId, RangeMap>) -> PdStateView {
+    let addr = |port: u16| vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))];
+    PdStateView {
+        incarnation: Some(1),
+        lineage: None,
+        members: vec![(1, 1, addr(9001)), (2, 1, addr(9002)), (3, 1, addr(9003))],
+        zones,
+        range_maps,
+    }
+}
+
+fn key_where(prefix: &str, want: impl Fn(&[(NodeId, usize)]) -> bool, placement: &ZonePlacement) -> String {
+    (0..10_000)
+        .map(|i| format!("{prefix}-{i}"))
+        .find(|key| want(&placement.owners(key.as_bytes())))
+        .expect("some key has the wanted placement")
+}
+
+fn fenced_merge(
+    placement: &ZonePlacement,
+    data: Vec<(NodeId, u64, Vec<(Vec<u8>, Stored)>)>,
+) -> (Vec<Record>, MergeStats, usize) {
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+    let sources = data
+        .into_iter()
+        .map(|(node, floor_ms, mut entries)| -> Box<dyn ReplicaSource> {
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            Box::new(HeldSource {
+                holder: (node, 0),
+                pages: VecDeque::from([entries]),
+                floor_ms,
+                floor_calls: calls.clone(),
+            })
+        })
+        .collect();
+    let mut out = Vec::new();
+    let stats = merge_replicas_into(sources, Some(placement), &mut |record| {
+        out.push(record);
+        Ok(())
+    })
+    .unwrap();
+    (out, stats, calls.get())
+}
+
+#[test]
+fn merge_omits_a_former_owner_put_below_every_owner_gc_floor_and_keeps_everything_else() {
+    let view = three_nodes(Catalog::new(), HashMap::new());
+    let placement = ZonePlacement::new(&view, (64, 2), DEFAULT_ZONE, &ZoneConfig::default_config(2));
+    let stray = |prefix: &str| key_where(prefix, |owners| !owners.iter().any(|o| o.0 == 3), &placement);
+    let (zombie, fresh, deleted, older, shared) =
+        (stray("zombie"), stray("fresh"), stray("deleted"), stray("older"), stray("shared"));
+    let owned_by_3 = key_where("own3", |owners| owners.iter().any(|o| o.0 == 3), &placement);
+    let floor = 10_000;
+    let entry = |key: &str, ms: u64, value: Option<&str>| match value {
+        Some(value) => put(key, at_ms(ms, 1), value),
+        None => tomb(key, at_ms(ms, 1)),
+    };
+    let owners_of = |key: &str| placement.owners(key.as_bytes()).into_iter().map(|o| o.0).collect::<Vec<_>>();
+    let mut per_node: BTreeMap<NodeId, Vec<(Vec<u8>, Stored)>> = BTreeMap::new();
+    for node in owners_of(&older) {
+        per_node.entry(node).or_default().push(entry(&older, 1_000, Some("owner-old")));
+    }
+    for node in owners_of(&shared) {
+        per_node.entry(node).or_default().push(entry(&shared, 5_000, Some("both")));
+    }
+    per_node.entry(3).or_default().extend([
+        entry(&zombie, 5_000, Some("zombie")),
+        entry(&fresh, 20_000, Some("fresh")),
+        entry(&deleted, 5_000, None),
+        entry(&older, 6_000, Some("stale-newer")),
+        entry(&shared, 5_000, Some("both")),
+        entry(&owned_by_3, 2_000, Some("old-but-owned")),
+    ]);
+    let data = per_node.into_iter().map(|(node, entries)| (node, floor, entries)).collect();
+    let older_key = older.clone();
+    let (records, stats, floor_calls) = fenced_merge(&placement, data);
+    let got: BTreeMap<String, (u64, Option<String>)> = records
+        .into_iter()
+        .map(|r| {
+            (String::from_utf8(r.key).unwrap(), (r.version.physical_ms(), r.value.map(|v| String::from_utf8(v).unwrap())))
+        })
+        .collect();
+    let want: BTreeMap<String, (u64, Option<String>)> = [
+        (fresh, (20_000, Some("fresh".to_string()))),
+        (deleted, (5_000, None)),
+        (older, (1_000, Some("owner-old".to_string()))),
+        (shared, (5_000, Some("both".to_string()))),
+        (owned_by_3, (2_000, Some("old-but-owned".to_string()))),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(got, want, "only the stale former-owner puts are left out");
+    assert!(!got.contains_key(&zombie));
+    assert_eq!(stats.stale_copies_omitted, 2, "the zombie and the stale newer copy of `older`");
+    assert!(floor_calls > 0);
+
+    let (records, stats, _) = fenced_merge(&placement, vec![
+        (1, floor, Vec::new()),
+        (2, 4_000, Vec::new()),
+        (3, floor, vec![entry(&zombie, 5_000, Some("zombie"))]),
+    ]);
+    assert!(records.is_empty(), "one owner whose floor is above the copy may have collected its delete");
+    assert_eq!(stats.stale_copies_omitted, 1);
+    assert!(stats.stale_samples[0].contains("held only by node 3"), "{:?}", stats.stale_samples);
+
+    let (records, stats, _) = fenced_merge(&placement, vec![
+        (1, 4_000, Vec::new()),
+        (2, 5_000, Vec::new()),
+        (3, floor, vec![entry(&zombie, 5_000, Some("zombie"))]),
+    ]);
+    assert_eq!(records.len(), 1, "every owner would still admit the copy, so none collected a newer delete");
+    assert_eq!(stats.stale_copies_omitted, 0);
+
+    let owner = owners_of(&older_key)[0];
+    let (records, _, floor_calls) = fenced_merge(&placement, vec![
+        (owner, floor, vec![entry(&older_key, 1_000, Some("owner-old"))]),
+        (3, floor, Vec::new()),
+    ]);
+    assert_eq!(records.len(), 1);
+    assert_eq!(floor_calls, 0, "no floor is fetched unless a non-owner put would win");
+
+    let mut unfenced = Vec::new();
+    merge_replicas_into(
+        vec![
+            Box::new(HeldSource {
+                holder: (3, 0),
+                pages: VecDeque::from([vec![entry(&zombie, 5_000, Some("zombie"))]]),
+                floor_ms: floor,
+                floor_calls: Default::default(),
+            }),
+        ],
+        None,
+        &mut |record| {
+            unfenced.push(record);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(unfenced.len(), 1, "without placement nothing is fenced");
+}
+
+#[test]
+fn merge_trusts_only_current_owners_and_fences_pending_or_aborted_rehome_targets_leftovers() {
+    let zone = 7;
+    let mut zones = Catalog::new();
+    zones.insert(zone, ZoneConfig { name: "s".into(), rf: 1, ordering: Ordering::Sorted, scope: None });
+    let ring = Ring::from_weighted(1, 64, [(1, 1), (2, 1), (3, 1)]);
+    let owner = |token: &[u8]| ring.replicas_in_zone(zone, token, 1, None)[0];
+    let split = (0..1000)
+        .map(|i| format!("m{i:03}").into_bytes())
+        .find(|split| owner(split) != owner(b""))
+        .expect("some token moves the range");
+    let (source, target) = (owner(b""), owner(&split));
+    let other = [1, 2, 3].into_iter().find(|n| *n != source && *n != target).unwrap();
+    let mut key = split.clone();
+    key.extend_from_slice(b"/k");
+    let map = |pending: Option<Vec<u8>>| {
+        RangeMap::from_splits_tokens_and_pending(vec![split.clone()], vec![Vec::new(), Vec::new()], vec![None, pending])
+            .unwrap()
+    };
+    let key_str = String::from_utf8(key.clone()).unwrap();
+    let merge = |placement: &ZonePlacement, on_source: Option<u64>, on_target: Option<u64>, target_floor: u64| {
+        let copy = |ms: Option<u64>| ms.map(|ms| vec![put(&key_str, at_ms(ms, 1), "copy")]).unwrap_or_default();
+        let (records, stats, _) = fenced_merge(placement, vec![
+            (source, 10_000, copy(on_source)),
+            (target, target_floor, copy(on_target)),
+            (other, 10_000, Vec::new()),
+        ]);
+        (records.len(), stats.stale_copies_omitted)
+    };
+    let pending = three_nodes(zones.clone(), HashMap::from([(zone, map(Some(split.clone())))]));
+    let pending = ZonePlacement::new(&pending, (64, 1), zone, &zones.get(zone).unwrap().clone());
+    assert!(pending.owners(&key).iter().any(|o| o.0 == target));
+    assert_eq!(merge(&pending, Some(5_000), Some(5_000), 0), (1, 0), "a copy the current owner also holds is kept");
+    assert_eq!(merge(&pending, None, Some(20_000), 0), (1, 0), "a young pending-target write is kept");
+    assert_eq!(
+        merge(&pending, None, Some(5_000), 0),
+        (0, 1),
+        "an old copy only the pending target holds is a former owner's leftover the source may have collected"
+    );
+    let (records, stats, _) = fenced_merge(&pending, vec![
+        (source, 19_000, Vec::new()),
+        (target, 0, Vec::new()),
+        (other, 10_000, vec![put(&key_str, at_ms(5_000, 1), "zombie")]),
+    ]);
+    assert!(
+        records.is_empty() && stats.stale_copies_omitted == 1,
+        "an empty pending target's low floor does not vouch for a copy the source may have collected"
+    );
+    let aborted = three_nodes(zones.clone(), HashMap::from([(zone, map(None))]));
+    let aborted = ZonePlacement::new(&aborted, (64, 1), zone, &zones.get(zone).unwrap().clone());
+    assert_eq!(merge(&aborted, None, Some(5_000), 10_000), (0, 1), "after an abort the target's old leftover is stale");
+    let (records, _, _) = fenced_merge(&aborted, vec![
+        (source, 10_000, Vec::new()),
+        (target, 10_000, vec![put(&key_str, at_ms(20_000, 1), "young")]),
+        (other, 10_000, Vec::new()),
+    ]);
+    assert_eq!(records.len(), 1, "a leftover the owner would still admit is kept");
 }
