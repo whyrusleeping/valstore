@@ -5,6 +5,10 @@ building it, a local test cluster, every config key, the PD (control plane)
 and how to keep it available, storage profiles and sizing, SPDK provisioning,
 day-to-day administration, systemd, and the failure modes an operator sees.
 
+Which revision to run, what it was tested on and its known limits are in
+[`evaluation.md`](evaluation.md); before exposing any port, work through the
+[security checklist](#security-checklist).
+
 For the data model and the client API, read
 [`getting-started.md`](getting-started.md) first. The full list of tuning
 keys and their legacy environment aliases is in
@@ -157,7 +161,7 @@ sweep     = 5s                 # anti-entropy cadence, default 5s (reloadable)
 gc_grace  = 0s                 # default 0s; > 0 enables tombstone GC + the liveness lease
 secret_file = /etc/vals/secret # or: secret = <literal> (not both)
 metrics   = 127.0.0.1:9464     # optional: Prometheus scrape endpoint
-admin_socket = /run/vals/n1.sock # optional: node admin socket (ping, zone-stats, dump)
+admin_socket = /run/vals-node/admin.sock # optional: node admin socket (ping, zone-stats, dump)
 log_level = info               # optional: error|warn|info|debug|trace|off (reloadable)
 
 # engine geometry
@@ -237,7 +241,7 @@ rf        = 3                    # default 3: authoritative ring RF, pushed to e
 vnodes    = 128                  # default 128: virtual nodes per weight unit on the ring
 state_capacity_mib = 256         # default 256: bound on live PD state; restart to change
 zone      = events 3 sorted      # repeatable: boot zones (<name> <rf> <sorted|unsorted>)
-admin_socket = /run/vals/pd.sock # default: <data_dir>/admin.sock
+admin_socket = /run/vals-pd/admin.sock # default: <data_dir>/admin.sock
 secret_file  = /etc/vals/secret  # or: secret = <literal> (not both)
 metrics      = 127.0.0.1:9465    # optional: Prometheus scrape endpoint
 log_level    = info              # optional (reloadable)
@@ -587,12 +591,17 @@ Follower restarts keep the term; the leader restart costs one election.
 
 Lessons from these drills:
 
-- **A black-holed host hurts more than a crashed one.** A Rust client with
-  5 s RPC deadlines nearly stopped writing while one of three hosts was
+- **A black-holed host hurts more than a crashed one.** In these drills a Rust
+  client with 5 s RPC deadlines nearly stopped writing while one of three hosts was
   unreachable without sending resets: the surviving nodes saw about 13 applies/s
-  instead of 2,000 until the host answered again. RF 3 with W 2 did not hide
-  that replica from this client. A data-node process restart, which refuses
-  connections immediately, cost only 1–2 s.
+  instead of 2,000 until the host answered again. A data-node process restart,
+  which refuses connections immediately, cost only 1–2 s. Later clients keep
+  writing at W 2 through such an outage, but a read still waits a full RPC
+  deadline for a silent replica unless the client's failure detector is on. In
+  a later drill that black-holed one of three hosts for 30 s, a client with the
+  failure detector and a 50 ms hedge showed no throughput dip, and one without
+  the detector managed about 17 operations/s. The recommended client setup is
+  in the "Replica outages" section of the `vals-client` crate docs.
 - **Control pushes to a dead host.** Each pushed address has its own thread, and
   the restart probe and range-stats poll run off the push loop, so a host that
   drops off the network delays only its own pushes. (Before this was changed,
@@ -1001,8 +1010,8 @@ handle (a second SPDK queue pair or a duplicated file descriptor) and never
 touches the serving handle.
 
 ```
-valsd admin -s /run/vals/n1.sock ping
-valsd admin -s /run/vals/n1.sock dump <zone-id-or-name> <out-path> \
+valsd admin -s /run/vals-node/admin.sock ping
+valsd admin -s /run/vals-node/admin.sock dump <zone-id-or-name> <out-path> \
     [skip-tombstones] [parallel=N] [rate_mib=N] [shard=S]
 ```
 
@@ -1064,16 +1073,42 @@ passed it.
 
 ## systemd
 
+File-backed data nodes and PDs run as an unprivileged user that owns their
+data. Create it once per host, with the config directory and the secret
+readable only by root and that user. Generate the secret on the first host
+and copy that file to every other node and PD host with the same owner and
+mode:
+
+```sh
+sudo useradd --system --home-dir /var/lib/vals --shell /usr/sbin/nologin vals
+sudo install -d -o root -g vals -m 0750 /etc/vals
+openssl rand -hex 32 | sudo install -o vals -g vals -m 0600 /dev/stdin /etc/vals/secret
+sudo install -o root -g vals -m 0640 node.conf pd.conf /etc/vals/
+```
+
 ```ini
 # /etc/systemd/system/vals-node.service
 [Unit]
 Description=vals data node
+Wants=network-online.target
 After=network-online.target
 # Restart-storm guard: at most 4 starts per 30 min, then the unit stays failed.
 StartLimitIntervalSec=1800
 StartLimitBurst=4
 
 [Service]
+User=vals
+Group=vals
+# Files and sockets valsd creates are owner-only: data, dumps, PD state
+# exports, and the admin socket (srwx------), so only this user and root can
+# send admin commands.
+UMask=0077
+# /var/lib/vals, mode 0700, owned by User: put data_dir under it.
+StateDirectory=vals
+StateDirectoryMode=0700
+# /run/vals-node, mode 0700, owned by User: admin_socket = /run/vals-node/admin.sock
+RuntimeDirectory=vals-node
+RuntimeDirectoryMode=0700
 ExecStart=/usr/local/bin/valsd node -c /etc/vals/node.conf
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
@@ -1082,20 +1117,75 @@ RestartSec=10s
 # on-disk corruption): restarting cannot fix either. Exit 75 (integrity
 # fail-fast) and crashes restart.
 RestartPreventExitStatus=1 2
-# Graceful drain on stop; the default SIGTERM is exactly right.
-TimeoutStopSec=30
+# SIGTERM drains and shuts down gracefully. A stop has taken over 30 s while
+# a node was seeding a replica; systemd sends SIGKILL after this timeout.
+TimeoutStopSec=300
 
 [Install]
 WantedBy=multi-user.target
 ```
 
+```ini
+# /etc/systemd/system/vals-pd.service
+[Unit]
+Description=vals PD
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=1800
+StartLimitBurst=4
+
+[Service]
+User=vals
+Group=vals
+UMask=0077
+StateDirectory=vals
+StateDirectoryMode=0700
+# admin_socket = /run/vals-pd/admin.sock
+RuntimeDirectory=vals-pd
+RuntimeDirectoryMode=0700
+ExecStart=/usr/local/bin/valsd pd -c /etc/vals/pd.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+RestartPreventExitStatus=1 2
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Each unit has its own runtime directory, because systemd removes a unit's
+runtime directory when the unit stops. A host with more than one data node
+uses a template unit instead (`vals-node@.service` with
+`RuntimeDirectory=vals-node-%i` and `-c /etc/vals/node-%i.conf`). An older
+deployment that ran as root needs `chown -R vals:vals` on its data
+directories before it switches to `User=vals`.
+
+With these units, run admin commands as the daemon user or as root, for
+example `sudo -u vals valsd admin -s /run/vals-pd/admin.sock status`. Run
+`valsd backup create` the same way, with an output directory that user can
+write: the PD writes its state export into that directory, owner-only, and
+the backup tool reads it from there.
+
+**SPDK data nodes** run as root (non-root vfio needs the extra setup in
+[`SPDK.md`](SPDK.md)), so leave out `User=`, `Group=` and `StateDirectory=`
+and keep `UMask=0077` and the runtime directory. Do not add sandboxing that
+hides devices or shared lock files from the node: `PrivateDevices=`,
+`DevicePolicy=`, `PrivateTmp=`, `ProtectSystem=strict` or a reduced
+`CapabilityBoundingSet=`. The node needs `/dev/vfio` and `/dev/hugepages`,
+and its exclusive device locks (`/run/lock/valsd-spdk-*.lock` and SPDK's
+`/var/tmp/spdk_pci_lock_*`) must be the same files that `valsd provision` and
+`valsd dump` see when you run them from a shell; a private `/tmp` and
+`/var/tmp` would hide SPDK's lock from them. Because the node runs as root,
+its admin socket is root-only, and its `dump` command can write any path:
+leave `admin_socket` unset on SPDK nodes unless you need live dumps.
+
 Set the log level with `log_level` in the config file rather than
-`VALS_LOG` in the unit. The PD unit is the same with `pd -c /etc/vals/pd.conf`.
-For SPDK nodes, add hugepage and vfio setup (see [`SPDK.md`](SPDK.md)) as
-`ExecStartPre` steps or a separate oneshot unit. The SPDK shim unlinks its
-hugepage map files as soon as it creates them, so the kernel frees every
-hugepage when the process exits, however it exits, and a restart needs no
-cleanup step.
+`VALS_LOG` in the unit. For SPDK nodes, add hugepage and vfio setup (see
+[`SPDK.md`](SPDK.md)) as `ExecStartPre` steps or a separate oneshot unit. The
+SPDK shim unlinks its hugepage map files as soon as it creates them, so the
+kernel frees every hugepage when the process exits, however it exits, and a
+restart needs no cleanup step.
 
 On hosts with unattended-upgrades and needrestart, a library upgrade can
 restart vals services at an arbitrary time. Exclude them with
@@ -1296,6 +1386,90 @@ the footer, filter and index from the device before the manifest write.
   as `vals_<name>` with its description as `# HELP`. The endpoint has no
   authentication, so bind it to a private address. Inside a process,
   `observe::snapshot()` gives the same counters programmatically.
+
+## Security checklist
+
+vals trusts its network. Data reads, writes and deletes are not
+authenticated, nothing on the wire is encrypted, and the cluster secret that
+guards control operations travels as a plain token. Anyone who can reach a
+data port can read and change every key; anyone who can also see the traffic
+can learn the secret and reconfigure the cluster. Work through this list on
+every host before you load real data. The examples use the ports and paths
+from this guide (data `7000`–`7099`, PD Raft `7100`, metrics `9464`/`9465`,
+the [systemd units](#systemd)); substitute your own.
+
+- [ ] **Isolate the data and Raft ports with a firewall, not only by
+  addressing.** Data nodes need their data ports reachable from clients, the
+  other data nodes and every PD host; a PD's Raft port only from the other PD
+  hosts; metrics only from your scraper. Data nodes never connect to a PD.
+  An `nftables` example (`nft -f` it, then make it persistent with your
+  distribution's mechanism):
+
+  ```
+  table inet vals {
+      set cluster {
+          type ipv4_addr
+          elements = { 10.0.0.1, 10.0.0.2, 10.0.0.3 }
+      }
+      set clients {
+          type ipv4_addr
+          flags interval
+          elements = { 10.0.1.0/24 }
+      }
+      set monitoring {
+          type ipv4_addr
+          elements = { 10.0.2.10 }
+      }
+      chain input {
+          type filter hook input priority filter; policy accept;
+          iif "lo" accept
+          tcp dport 7100 ip saddr @cluster accept
+          tcp dport 7000-7099 ip saddr @cluster accept
+          tcp dport 7000-7099 ip saddr @clients accept
+          tcp dport { 9464, 9465 } ip saddr @monitoring accept
+          tcp dport { 7000-7100, 9464, 9465 } drop
+      }
+  }
+  ```
+
+  Check from a host outside those sets; neither command may print `OPEN`:
+  `nc -z -w 2 10.0.0.1 7000 && echo OPEN` and
+  `nc -z -w 2 10.0.0.1 7100 && echo OPEN`.
+- [ ] **Use an overlay for any untrusted path.** If vals traffic crosses a
+  network you do not control (shared or cloud networks, links between
+  sites), carry all of it over WireGuard or Tailscale, and set `listen`,
+  `pd_peer`, `data_node` and `peer` to overlay addresses instead of
+  `0.0.0.0` or public addresses. The secret is cleartext on every
+  control push and every PD Raft connection; vals has no TLS option.
+- [ ] **Set the same secret on every node and PD.** Use `secret_file`, mode
+  `0600`, owned by the daemon user (`stat -c '%a %U' /etc/vals/secret` prints
+  `600 vals`), with identical contents everywhere (`sha256sum` matches across
+  hosts). Prefer it to `secret = <literal>`, which puts the secret in the
+  config file. Without a secret, control operations are open to anyone who
+  can reach the ports: `journalctl -u vals-node -u vals-pd | grep 'control
+  ops are OPEN'` must print nothing.
+- [ ] **Restrict the admin sockets.** Anyone who can connect to the PD socket
+  can change membership and zones and export the PD state; anyone who can
+  connect to a node socket can make the node write a dump to any path the
+  daemon user can write. With `UMask=0077` and a mode-0700 runtime
+  directory, `stat -c '%A %U' /run/vals-pd/admin.sock` prints `srwx------
+  vals` and `ls -ld /run/vals-pd` shows `drwx------`. Leave the node's
+  `admin_socket` unset unless you need live dumps, especially on SPDK nodes,
+  which run as root.
+- [ ] **Bind metrics to a private address.** The endpoint is unauthenticated
+  HTTP. Use `metrics = 127.0.0.1:9464` with a local scraper, or a private
+  address covered by the firewall above; `ss -ltn | grep -E ':946[45]'` shows
+  what is bound.
+- [ ] **Protect backups and dumps like the data.** They are complete,
+  unencrypted copies. Write them into a directory only the daemon user can
+  read (`install -d -o vals -g vals -m 0700 /backups`) and keep copies off
+  the host just as restricted.
+- [ ] **Run file-backed daemons unprivileged.** Use the `vals` user from the
+  [systemd units](#systemd); only SPDK nodes need root.
+
+These steps limit who can reach vals. They do not add authentication or
+encryption to vals itself, so every host and client inside the firewall sets
+is trusted with all the data.
 
 ## Transport resource bounds
 

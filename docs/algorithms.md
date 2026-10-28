@@ -1177,7 +1177,7 @@ defaults (bottom group).
 | Parameter | Default | Must agree cluster-wide? | Source |
 |---|---|---|---|
 | `vnodes` (ring points/node) | 128 | **Yes** — PD-authoritative, epoch-checked | `ring.rs:31` |
-| `num_buckets` (Merkle) | 256 | **Yes** — both peers, per reconcile | `antientropy.rs:35` |
+| `num_buckets` (Merkle) | 4096 | **Yes** — both peers, per reconcile | `antientropy.rs:16` |
 | default-zone `rf` | (deployment) | **Yes** — PD-authoritative | — |
 | `max_skew_ms` (HLC ε) | 500 | Should match (per-replica check) | `hlc.rs:23` |
 | `gc_grace_ms` | 0 (GC off) | Should match (delete/wipe safety) | — |

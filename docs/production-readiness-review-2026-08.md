@@ -2,6 +2,43 @@
 
 Review target: `25914ed4` (`master`), with task 0232 and the review task modified/untracked in the working tree during review.
 
+## Current disposition (2026-10-28)
+
+This review is a historical record. Everything after this section is the
+review as written in August 2026, plus resolution notes added under some
+findings later. Its file and line references point into revision
+`25914ed4`, which predates the public history. The table below is the
+disposition of each finding at the evaluation revision `ba4694a`;
+[`evaluation.md`](evaluation.md) has the evidence, supported artifacts and
+current limitations.
+
+**Overall:** still not production-ready. `ba4694a` is offered for evaluation
+only. The correctness blockers R1–R4 and R6 are fixed. Transport security
+(R5) was declined: vals requires a private network or overlay. The heap
+corruption (R0) was never traced to a cause.
+
+| Finding | Disposition at `ba4694a` |
+|---|---|
+| R0 SPDK heap corruption | **Not resolved.** The zone-teardown race found alongside it was fixed, and a 5.5 h soak of the original workload passed. Heap-corruption aborts then recurred in later long SPDK runs on the lab hosts, whose memory has known bit errors. They were not root-caused, and investigation stopped on an owner decision because of that hardware, so a software cause is not ruled out. Permanent tripwires and core capture remain. |
+| R1 colliding writer ids | **Fixed.** Random 64-bit writer incarnations with shared HLC state; protocol version 2 carries them and refuses version 1 peers. Equal-clock convergence tests cover reads and anti-entropy. |
+| R2 Raft persistence failure | **Fixed as rescoped.** The message-ordering diagnosis was not established (see the correction under R2). A failed persistence or apply now stops the partition and the PD, discards unsent messages, and restart recovers; fault-injection tests cover each step. |
+| R3 PD state capacity | **Fixed.** Bounded, configurable PD state with per-range records and capacity metrics; tested to 24,000 ranges. |
+| R4 unsound wakers | **Fixed.** Arc-backed thread-safe wakers with cross-thread wake tests. Miri was not available for the pinned toolchain. |
+| R5 network trust model | **Declined.** Owner decision: no mTLS or data-path authentication; deployments use a private network or an overlay such as WireGuard or Tailscale. Process-wide connection, request, byte and deadline bounds shipped. No fail-closed default for non-loopback binds. Operators follow the [security checklist](deploy.md#security-checklist). |
+| R6 `format = true` | **Fixed.** Startup never formats; `format = true` is rejected; `valsd provision` formats offline after checking device serials and an explicit confirmation. |
+| R7 legal, packaging, release | **Partly.** MIT license (`LICENSE`), repository metadata, every crate `publish = false`, a software CI workflow. Open: release tags, checksums, release notes, third-party notices, package dry-runs. Evaluation uses a pinned commit instead of a release. |
+| R8 durability naming | **Fixed.** `WriteOptions { concern, persistence }` with validated `WriteConcern`, plus `ReadConcern`. Buffered writes remain the default by owner choice; device durability is an explicit per-write option. |
+| R9 client liveness and memory | **Fixed.** Finite connect and RPC deadlines and operation, byte and per-node budgets by default; unbounded is an explicit benchmark opt-out. A failure detector and hedging are recommended for replica outages. |
+| R10 central validation | **Fixed.** Checked geometry, cadence, zone and membership invariants enforced in the PD; `valsd node --check-config` and `valsd pd --check-config`. |
+| R11 restore | **Fixed.** `valsd backup create/verify/restore-pd/load/compare`, qualified once on three PDs and three SPDK nodes with tombstone GC off ([details](backup-restore.md#hardware-qualification)). With `gc_grace > 0`, old values cannot be loaded (see [`evaluation.md`](evaluation.md#known-limitations)). |
+| R12 legacy formats, hello extensibility | **Open.** Older on-disk formats are still read on purpose (newer reads older). The hello body is still a fixed 14 bytes with no extension area. Formats are documented as not frozen. |
+| R13 clock-skew wipe | **Open.** The rejoin decision still compares raw peer watermarks with no skew clamp. It applies only with `gc_grace > 0`. |
+| R14 unsafe I/O boundaries | **Open.** The SPDK write-completion flags still use relaxed atomics, and the heap scratch buffer still sets its length over uninitialized memory. |
+| R15 supported API | **Fixed.** Supported items are listed in the crate docs of `vals-client`, `vals-store`, `vals-cluster` and `vals-rt`; other items are marked internal. No API freeze. |
+| R16 environment switches | **Fixed for supported settings.** Supported PD and node settings are typed config keys; legacy `VALS_*` aliases are resolved once at startup and conflicts fail. The remaining variables are documented as diagnostic ([`configuration.md`](configuration.md)). |
+| R17 first-user path and docs | **Mostly.** A runnable `kv` example client (`crates/vals-client/examples/kv.rs`) and a local three-node demo in the README replaced the sibling-repository paths; the Merkle bucket default is corrected in `algorithms.md`. Open: `valsd` has no `--help` or `--version`, and CI checks no Markdown links. |
+| R18 release and evidence hygiene | **Partly.** A locked software CI lane runs build, tests, script tests and Clippy (warnings reported, not denied). Open: SPDK is fetched by the tag `v24.09`, not by commit; there is no SPDK-linked CI, dependency audit or link check; some parallel tests still flake on shared ports and process-wide counters. Raw benchmark captures are not in the public repository. The systemd units now run file-backed daemons unprivileged with `UMask=0077`, private runtime directories and a 300 s stop timeout ([systemd](deploy.md#systemd)). |
+
 ## Disposition
 
 **Do not describe or ship this revision as production-ready.** The software-backed build and test suite are strong, and the project has unusually detailed correctness and hardware evidence, but the review found several first-release blockers: a known SPDK heap-corruption abort, an LWW identity collision that can make replicas permanently disagree, unsafe Raft persistence ordering, an unsound public executor waker, destructive formatting in persistent daemon configuration, and no authenticated/confidential data path.

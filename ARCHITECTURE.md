@@ -1136,6 +1136,8 @@ placement model (see the bullet below). Open items are tracked in the backlog
 ## Status
 
 An as-built summary; benchmark methodology is in [`docs/SPDK.md`](docs/SPDK.md).
+Which revision to evaluate, which source each piece of evidence ran on, and
+the current limitations are in [`docs/evaluation.md`](docs/evaluation.md).
 
 ### What is built, and how it was validated
 
@@ -1144,7 +1146,8 @@ file backends, so `cargo test --workspace` (no hardware) covers the engine, the
 cluster layer, the PD, and `valsd` end to end, including crash recovery, node
 loss, restart, rejoin, and reconfiguration. Hardware validation is a second
 layer: SPDK benchmarks that count every op error and verify read values, fault
-drills on real clusters, and a multi-day application soak.
+drills on real clusters, application replays and soaks lasting hours, and a
+separate backup and restore drill.
 
 | Area | State | Hardware validation |
 |---|---|---|
@@ -1154,7 +1157,8 @@ drills on real clusters, and a multi-day application soak.
 | Zones: hash and sorted, range splits, confirmed re-home, range deletes, ascending/descending/batched scans | ✅ | SPDK runs with value verification |
 | Multi-drive JBOD nodes, server sharding, multiplexed TCP transport, epoll reactor, process-wide transport bounds | ✅ | 8-drive single box; 3-machine cluster with external clients |
 | Client: batch writes, credit backpressure, digest reads, batched reads, stale-ring self-heal, failure detector | ✅ | matched hardware A/B gates |
-| `valsd`: config, graceful shutdown, panic → abort, logging + counters + Prometheus metrics, backup/restore, dump | ✅ | multi-day soak replaying the Bluesky firehose (about 5 billion events) |
+| `valsd`: config, graceful shutdown, panic → abort, logging + counters + Prometheus metrics, dump | ✅ | a full replay of about 5 billion Bluesky firehose events on three SPDK nodes (5 h 20 min of ingest, end-of-run checks passed, crashes recovered by restart) and a 2 h mixed-profile soak with restarts |
+| Backup and restore (`valsd backup`) | ✅ | qualified once, separately from the ingest runs: three PDs and three SPDK nodes, 4.85 million records, tombstone GC off ([details](docs/backup-restore.md#hardware-qualification)) |
 | Capacity planner / balance executor | built, default-off | local gates only; the hardware A/B that would justify default-on has not run |
 | Auto-eviction (detector → PD), online drive add/retire on the zoned daemon path, linearizable zones | ◻ not built | — |
 
