@@ -20,10 +20,7 @@ impl<D: BlockDevice> Engine<D> {
         max_bytes: usize,
     ) -> Result<(Vec<KvPair>, bool), EngineError> {
         let (entries, more) = self.scan_winners_page(lo, hi, max_entries, max_bytes)?;
-        let items: Vec<(u64, ValuePtr)> = entries
-            .iter()
-            .map(|(_, e)| (self.alloc.segment_range(e.ptr.segment).0, e.ptr))
-            .collect();
+        let items = self.value_items(entries.iter().map(|(_, e)| &e.ptr))?;
         let recs = self
             .log
             .plan_read_spans(&self.dev, &items)?
@@ -45,10 +42,7 @@ impl<D: BlockDevice> Engine<D> {
         max_bytes: usize,
     ) -> Result<VersionedScanPage, EngineError> {
         let (entries, more) = self.scan_winners_page(lo, hi, max_entries, max_bytes)?;
-        let items: Vec<(u64, ValuePtr)> = entries
-            .iter()
-            .map(|(_, e)| (self.alloc.segment_range(e.ptr.segment).0, e.ptr))
-            .collect();
+        let items = self.value_items(entries.iter().map(|(_, e)| &e.ptr))?;
         let recs = self
             .log
             .plan_read_spans(&self.dev, &items)?
@@ -514,10 +508,7 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
         max_bytes: usize,
     ) -> Result<ScanSpanPage, EngineError> {
         let (entries, more) = self.scan_winners_page(lo, hi, max_entries, max_bytes)?;
-        let items: Vec<(u64, ValuePtr)> = entries
-            .iter()
-            .map(|(_, e)| (self.alloc.segment_range(e.ptr.segment).0, e.ptr))
-            .collect();
+        let items = self.value_items(entries.iter().map(|(_, e)| &e.ptr))?;
         let plan = self.log.plan_read_spans(&self.dev, &items)?;
         let keys = entries.into_iter().map(|(k, e)| (k, e.version)).collect();
         Ok((keys, plan, more))
@@ -756,10 +747,7 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
 
     pub fn plan_staged_scan(&self, done: StagedScanDone) -> Result<ScanSpanPage, EngineError> {
         let StagedScanDone { winners, more, .. } = done;
-        let items: Vec<(u64, ValuePtr)> = winners
-            .iter()
-            .map(|(_, e)| (self.alloc.segment_range(e.ptr.segment).0, e.ptr))
-            .collect();
+        let items = self.value_items(winners.iter().map(|(_, e)| &e.ptr))?;
         let plan = self.log.plan_read_spans(&self.dev, &items)?;
         let keys = winners.into_iter().map(|(k, e)| (k, e.version)).collect();
         Ok((keys, plan, more))

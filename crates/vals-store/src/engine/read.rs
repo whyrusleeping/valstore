@@ -21,6 +21,21 @@ fn valid_midpoint(midpoint: Option<Vec<u8>>, lo: Option<&[u8]>, hi: Option<&[u8]
 }
 
 impl<D: BlockDevice> Engine<D> {
+    pub(crate) fn value_start(&self, ptr: &ValuePtr) -> Result<u64, LogError> {
+        crate::vlog::value_segment_start(&self.alloc, ptr)
+    }
+
+    pub(crate) fn value_items<'a>(
+        &self,
+        ptrs: impl ExactSizeIterator<Item = &'a ValuePtr>,
+    ) -> Result<Vec<(u64, ValuePtr)>, LogError> {
+        let mut items = Vec::with_capacity(ptrs.len());
+        for ptr in ptrs {
+            items.push((self.value_start(ptr)?, *ptr));
+        }
+        Ok(items)
+    }
+
     pub fn ordering(&self) -> Ordering {
         self.ordering
     }
@@ -206,7 +221,7 @@ impl<D: BlockDevice> Engine<D> {
             None | Some(Winner::Covered(_)) => return Ok(None),
             Some(Winner::Entry(e)) => e,
         };
-        let (seg_start, _) = self.alloc.segment_range(entry.ptr.segment);
+        let seg_start = self.value_start(&entry.ptr)?;
         let rec = self
             .log
             .read_checked(&self.dev, seg_start, &entry.ptr, key, entry.version)?;
@@ -242,7 +257,7 @@ impl<D: BlockDevice> Engine<D> {
         let mut slots: Vec<(usize, u128)> = Vec::new();
         for (i, k) in keys.iter().enumerate() {
             if let Some(Winner::Entry(e)) = self.resolve_logical(k, crate::attribution::LookupCaller::Get)? {
-                items.push((self.alloc.segment_range(e.ptr.segment).0, e.ptr));
+                items.push((self.value_start(&e.ptr)?, e.ptr));
                 slots.push((i, e.version));
             }
         }
@@ -292,7 +307,7 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
         let Some(Winner::Entry(e)) = self.resolve_logical(key, crate::attribution::LookupCaller::Get)? else {
             return Ok(None);
         };
-        let seg_start = self.alloc.segment_range(e.ptr.segment).0;
+        let seg_start = self.value_start(&e.ptr)?;
         Ok(Some(self.log.plan_read(&self.dev, seg_start, &e.ptr)?))
     }
 
@@ -304,8 +319,7 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
             let Some(token) = directory.read_token(key).filter(|t| cover.is_none_or(|c| t.entry.version > c)) else {
                 return covered();
             };
-            let seg_start = self.alloc.segment_range(token.entry.ptr.segment).0;
-            return match self.log.plan_read(&self.dev, seg_start, &token.entry.ptr) {
+            return match self.value_start(&token.entry.ptr).and_then(|seg_start| self.log.plan_read(&self.dev, seg_start, &token.entry.ptr)) {
                 Ok(plan) => StagedGet::WinnerDirectory {
                     plan: Box::new(plan),
                     token,
@@ -343,8 +357,7 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
             let Some(e) = mutable.filter(|e| cover.is_none_or(|c| e.version > c)) else {
                 return covered();
             };
-            let seg_start = self.alloc.segment_range(e.ptr.segment).0;
-            return match self.log.plan_read(&self.dev, seg_start, &e.ptr) {
+            return match self.value_start(&e.ptr).and_then(|seg_start| self.log.plan_read(&self.dev, seg_start, &e.ptr)) {
                 Ok(plan) => StagedGet::Memtable(Box::new(plan)),
                 Err(e) => StagedGet::Err(EngineError::Log(e)),
             };
@@ -359,7 +372,7 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
     }
 
     pub fn plan_get_ptr(&self, ptr: &ValuePtr) -> Result<crate::vlog::ReadPlan, EngineError> {
-        let seg_start = self.alloc.segment_range(ptr.segment).0;
+        let seg_start = self.value_start(ptr)?;
         Ok(self.log.plan_read(&self.dev, seg_start, ptr)?)
     }
 }

@@ -772,7 +772,7 @@ impl<D: BlockDevice> Engine<D> {
         &self,
         token: WinnerReadToken,
     ) -> Result<crate::vlog::ReadPlan, EngineError> {
-        let seg_start = self.alloc.segment_range(token.entry.ptr.segment).0;
+        let seg_start = self.value_start(&token.entry.ptr)?;
         Ok(self.log.plan_read(&self.dev, seg_start, &token.entry.ptr)?)
     }
 

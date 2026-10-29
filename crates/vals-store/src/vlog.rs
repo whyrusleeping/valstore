@@ -107,6 +107,33 @@ pub struct ValuePtr {
     pub len: u32,
 }
 
+pub fn check_value_ptr(ptr: &ValuePtr, seg_bytes: u64) -> Result<(), LogError> {
+    if (ptr.len as usize) < HEADER_LEN || ptr.offset as u64 + ptr.len as u64 > seg_bytes {
+        return Err(LogError::Corrupt("value pointer outside its segment"));
+    }
+    Ok(())
+}
+
+fn record_span(ptr: &ValuePtr, block_size: usize, seg_bytes: u64) -> Result<(u64, usize), LogError> {
+    check_value_ptr(ptr, seg_bytes)?;
+    let bs = block_size as u64;
+    let first = ptr.offset as u64 / bs;
+    let last = (ptr.offset as u64 + ptr.len as u64 - 1) / bs;
+    Ok((first, (last - first + 1) as usize))
+}
+
+pub(crate) fn value_ptr_start(alloc: &Allocator, block_size: usize, ptr: &ValuePtr) -> Result<u64, LogError> {
+    check_value_ptr(ptr, alloc.blocks_per_segment() * block_size as u64)?;
+    value_segment_start(alloc, ptr)
+}
+
+pub(crate) fn value_segment_start(alloc: &Allocator, ptr: &ValuePtr) -> Result<u64, LogError> {
+    if ptr.segment.0 >= alloc.num_segments() {
+        return Err(LogError::Corrupt("value pointer outside its segment"));
+    }
+    Ok(alloc.segment_range(ptr.segment).0)
+}
+
 #[derive(Debug)]
 pub enum LogError {
     Io(BlockError),
@@ -577,22 +604,17 @@ impl SpanReadPlan {
     }
 }
 
-pub fn plan_read_spans_detached(block_size: usize, items: &[(u64, ValuePtr)]) -> SpanReadPlan {
+pub fn plan_read_spans_detached(
+    block_size: usize,
+    seg_bytes: u64,
+    items: &[(u64, ValuePtr)],
+) -> Result<SpanReadPlan, LogError> {
     let bs = block_size;
-    let span_blocks = |ptr: &ValuePtr| -> (u64, usize) {
-        let b = bs as u64;
-        let first = ptr.offset as u64 / b;
-        let last = (ptr.offset as u64 + ptr.len as u64 - 1) / b;
-        (first, (last - first + 1) as usize)
-    };
-    let mut recs: Vec<(u64, usize, u32)> = items
-        .iter()
-        .enumerate()
-        .map(|(slot, (seg_start, ptr))| {
-            let (first, nblocks) = span_blocks(ptr);
-            (seg_start + first, nblocks, slot as u32)
-        })
-        .collect();
+    let mut recs: Vec<(u64, usize, u32)> = Vec::with_capacity(items.len());
+    for (slot, (seg_start, ptr)) in items.iter().enumerate() {
+        let (first, nblocks) = record_span(ptr, bs, seg_bytes)?;
+        recs.push((seg_start + first, nblocks, slot as u32));
+    }
     recs.sort_unstable_by_key(|&(lba, _, _)| lba);
 
     let max_blocks = (SPAN_MAX_BYTES / bs).max(1) as u64;
@@ -627,11 +649,11 @@ pub fn plan_read_spans_detached(block_size: usize, items: &[(u64, ValuePtr)]) ->
         }
     }
 
-    SpanReadPlan {
+    Ok(SpanReadPlan {
         block_size: bs,
         spans,
         num_records: items.len(),
-    }
+    })
 }
 
 pub struct VlogWriter<'a, D: BlockDevice> {
@@ -1083,11 +1105,8 @@ impl ValueLog {
         ))
     }
 
-    fn span_blocks(&self, ptr: &ValuePtr) -> (u64, usize) {
-        let bs = self.block_size as u64;
-        let first = ptr.offset as u64 / bs;
-        let last = (ptr.offset as u64 + ptr.len as u64 - 1) / bs;
-        (first, (last - first + 1) as usize)
+    fn span_blocks(&self, ptr: &ValuePtr) -> Result<(u64, usize), LogError> {
+        record_span(ptr, self.block_size, self.seg_blocks * self.block_size as u64)
     }
 
     fn tail_overlay_off(&self, ptr: &ValuePtr, first: u64, nblocks: usize) -> Option<usize> {
@@ -1100,15 +1119,16 @@ impl ValueLog {
         (tail_block >= first && tail_block <= last).then(|| ((tail_block - first) * bs) as usize)
     }
 
-    fn read_bufs(&self, items: &[(u64, ValuePtr)]) -> Vec<Vec<u8>> {
-        items
-            .iter()
-            .map(|(_, ptr)| io_buf(self.span_blocks(ptr).1 * self.block_size))
-            .collect()
+    fn read_bufs(&self, items: &[(u64, ValuePtr)]) -> Result<(Vec<(u64, usize)>, Vec<Vec<u8>>), LogError> {
+        let mut spans = Vec::with_capacity(items.len());
+        for (_, ptr) in items {
+            spans.push(self.span_blocks(ptr)?);
+        }
+        let bufs = spans.iter().map(|&(_, n)| io_buf(n * self.block_size)).collect();
+        Ok((spans, bufs))
     }
 
-    fn record_bytes<'a>(&self, buf: &'a mut [u8], ptr: &ValuePtr) -> &'a [u8] {
-        let (first, nblocks) = self.span_blocks(ptr);
+    fn record_bytes<'a>(&self, buf: &'a mut [u8], ptr: &ValuePtr, (first, nblocks): (u64, usize)) -> &'a [u8] {
         if let Some(off) = self.tail_overlay_off(ptr, first, nblocks) {
             buf[off..off + self.block_size].copy_from_slice(&self.tail);
         }
@@ -1119,6 +1139,7 @@ impl ValueLog {
     fn decode_records_checked(
         &self,
         bufs: &mut [Vec<u8>],
+        spans: &[(u64, usize)],
         items: &[(u64, ValuePtr)],
         expected: &[(&[u8], u128)],
     ) -> Result<Vec<Record>, LogError> {
@@ -1126,9 +1147,9 @@ impl ValueLog {
             return Err(LogError::Corrupt("checked batch length mismatch"));
         }
         let mut out = Vec::with_capacity(items.len());
-        for ((buf, (_, ptr)), &(key, version)) in bufs.iter_mut().zip(items).zip(expected) {
+        for (((buf, &span), (_, ptr)), &(key, version)) in bufs.iter_mut().zip(spans).zip(items).zip(expected) {
             out.push(decode_record_value_checked(
-                self.record_bytes(buf, ptr),
+                self.record_bytes(buf, ptr, span),
                 key,
                 version,
             )?);
@@ -1143,13 +1164,10 @@ impl ValueLog {
         ptr: &ValuePtr,
     ) -> Result<Record, LogError> {
         self.drain_inflight(dev)?;
-        let (first_block, nblocks) = self.span_blocks(ptr);
-        if self.tail_overlay_off(ptr, first_block, nblocks).is_some() {
-            let mut buf = io_buf(nblocks * self.block_size);
-            dev.read_at(seg_start_lba + first_block, &mut buf)?;
-            return decode_record_value(self.record_bytes(&mut buf, ptr));
-        }
-        read_record(dev, self.block_size, seg_start_lba, ptr)
+        let span = self.span_blocks(ptr)?;
+        let mut buf = io_buf(span.1 * self.block_size);
+        dev.read_at(seg_start_lba + span.0, &mut buf)?;
+        decode_record_value(self.record_bytes(&mut buf, ptr, span))
     }
 
     pub fn read_checked<D: BlockDevice>(
@@ -1161,11 +1179,11 @@ impl ValueLog {
         expected_version: u128,
     ) -> Result<Record, LogError> {
         self.drain_inflight(dev)?;
-        let (first_block, nblocks) = self.span_blocks(ptr);
-        let mut buf = io_buf(nblocks * self.block_size);
-        dev.read_at(seg_start_lba + first_block, &mut buf)?;
+        let span = self.span_blocks(ptr)?;
+        let mut buf = io_buf(span.1 * self.block_size);
+        dev.read_at(seg_start_lba + span.0, &mut buf)?;
         decode_record_value_checked(
-            self.record_bytes(&mut buf, ptr),
+            self.record_bytes(&mut buf, ptr, span),
             expected_key,
             expected_version,
         )
@@ -1178,19 +1196,20 @@ impl ValueLog {
         expected: &[(&[u8], u128)],
     ) -> Result<Vec<Record>, LogError> {
         self.drain_inflight(dev)?;
-        let mut bufs = self.read_bufs(items);
+        let (spans, mut bufs) = self.read_bufs(items)?;
         {
             let mut ops: Vec<ReadOp<'_>> = bufs
                 .iter_mut()
+                .zip(&spans)
                 .zip(items)
-                .map(|(buf, (seg_start, ptr))| ReadOp {
-                    lba: seg_start + self.span_blocks(ptr).0,
+                .map(|((buf, &(first, _)), (seg_start, _))| ReadOp {
+                    lba: seg_start + first,
                     buf,
                 })
                 .collect();
             dev.read_batch(&mut ops)?;
         }
-        self.decode_records_checked(&mut bufs, items, expected)
+        self.decode_records_checked(&mut bufs, &spans, items, expected)
     }
 
     pub async fn read_many_async_checked<D: AsyncRead + BlockDevice>(
@@ -1200,15 +1219,15 @@ impl ValueLog {
         expected: &[(&[u8], u128)],
     ) -> Result<Vec<Record>, LogError> {
         self.drain_inflight(dev)?;
-        let mut bufs = self.read_bufs(items);
+        let (spans, mut bufs) = self.read_bufs(items)?;
 
         let acks = {
             let futs: Vec<_> = bufs
                 .iter_mut()
+                .zip(&spans)
                 .zip(items)
-                .map(|(buf, (seg_start, ptr))| {
-                    let lba = seg_start + self.span_blocks(ptr).0;
-                    dev.read_async(lba, buf.as_mut_slice())
+                .map(|((buf, &(first, _)), (seg_start, _))| {
+                    dev.read_async(seg_start + first, buf.as_mut_slice())
                 })
                 .collect();
             vals_rt::join_all(futs).await
@@ -1216,7 +1235,7 @@ impl ValueLog {
         for ack in acks {
             ack?;
         }
-        self.decode_records_checked(&mut bufs, items, expected)
+        self.decode_records_checked(&mut bufs, &spans, items, expected)
     }
 
     pub fn plan_read<D: BlockDevice>(
@@ -1226,7 +1245,7 @@ impl ValueLog {
         ptr: &ValuePtr,
     ) -> Result<ReadPlan, LogError> {
         self.drain_inflight(dev)?;
-        let (first_block, nblocks) = self.span_blocks(ptr);
+        let (first_block, nblocks) = self.span_blocks(ptr)?;
         let tail_overlay = self
             .tail_overlay_off(ptr, first_block, nblocks)
             .map(|off| (off, self.tail.to_vec()));
@@ -1247,7 +1266,7 @@ impl ValueLog {
     ) -> Result<SpanReadPlan, LogError> {
         self.drain_inflight(dev)?;
         let bs = self.block_size;
-        let mut plan = plan_read_spans_detached(bs, items);
+        let mut plan = plan_read_spans_detached(bs, self.seg_blocks * bs as u64, items)?;
 
         if self.tail_dirty && self.cur_seg.is_some() {
             let tail_lba = self.cur_seg_start + self.write_off as u64 / bs as u64;
@@ -1435,18 +1454,15 @@ fn intact_record_of_epoch(b: &[u8], epoch: u64) -> bool {
 pub fn read_record<D: BlockDevice>(
     dev: &D,
     block_size: usize,
+    seg_bytes: u64,
     seg_start_lba: u64,
     ptr: &ValuePtr,
 ) -> Result<Record, LogError> {
-    let bs = block_size as u64;
-    let total = ptr.len as u64;
-    let first_block = ptr.offset as u64 / bs;
-    let last_block = (ptr.offset as u64 + total - 1) / bs;
-    let nblocks = (last_block - first_block + 1) as usize;
+    let (first_block, nblocks) = record_span(ptr, block_size, seg_bytes)?;
     let mut buf = vec![0u8; nblocks * block_size];
     dev.read_at(seg_start_lba + first_block, &mut buf)?;
     let within = ptr.offset as usize % block_size;
-    decode_record_value(&buf[within..within + total as usize])
+    decode_record_value(&buf[within..within + ptr.len as usize])
 }
 
 #[cfg(test)]
@@ -1466,7 +1482,7 @@ mod tests {
 
     fn read_back(dev: &MemBlockDevice, alloc: &Allocator, ptr: &ValuePtr) -> Record {
         let (start, _) = alloc.segment_range(ptr.segment);
-        read_record(dev, BS, start, ptr).unwrap()
+        read_record(dev, BS, SEG_BLOCKS * BS as u64, start, ptr).unwrap()
     }
 
     #[test]
@@ -1601,6 +1617,49 @@ mod tests {
     }
 
     #[test]
+    fn value_pointers_outside_their_segment_are_refused_before_reading() {
+        let (dev, mut alloc, mut log) = setup();
+        let (_, good) = log
+            .append(&dev, &mut alloc, RecordKind::Put, 7, b"k", b"v")
+            .unwrap();
+        log.sync(&dev).unwrap();
+        let start = alloc.segment_range(good.segment).0;
+        let seg_bytes = SEG_BLOCKS * BS as u64;
+        let at = |offset: u32, len: u32| ValuePtr { segment: good.segment, offset, len };
+        let refused = |r: Result<(), LogError>| {
+            matches!(r, Err(LogError::Corrupt("value pointer outside its segment")))
+        };
+        for ptr in [
+            at(0, 0),
+            at(good.offset, 0),
+            at(good.offset, HEADER_LEN as u32 - 1),
+            at(0, u32::MAX),
+            at(u32::MAX, good.len),
+            at(seg_bytes as u32 - good.len + 1, good.len),
+        ] {
+            assert!(refused(check_value_ptr(&ptr, seg_bytes)), "{ptr:?}");
+            assert!(refused(log.read(&dev, start, &ptr).map(drop)), "{ptr:?}");
+            assert!(refused(log.read_checked(&dev, start, &ptr, b"k", 7).map(drop)), "{ptr:?}");
+            assert!(refused(log.read_many_checked(&dev, &[(start, good), (start, ptr)], &[(b"k", 7), (b"k", 7)]).map(drop)), "{ptr:?}");
+            let (items, expected) = ([(start, good), (start, ptr)], [(&b"k"[..], 7), (&b"k"[..], 7)]);
+            let many = vals_rt::block_on(log.read_many_async_checked(&dev, &items, &expected), || {});
+            assert!(refused(many.map(drop)), "{ptr:?}");
+            assert!(refused(log.plan_read(&dev, start, &ptr).map(drop)), "{ptr:?}");
+            assert!(refused(log.plan_read_spans(&dev, &[(start, good), (start, ptr)]).map(drop)), "{ptr:?}");
+            assert!(refused(plan_read_spans_detached(BS, seg_bytes, &[(start, ptr)]).map(drop)), "{ptr:?}");
+            assert!(refused(read_record(&dev, BS, seg_bytes, start, &ptr).map(drop)), "{ptr:?}");
+            assert!(refused(value_ptr_start(&alloc, BS, &ptr).map(drop)), "{ptr:?}");
+        }
+        for segment in [SegmentId(alloc.num_segments()), SegmentId(u64::MAX)] {
+            assert!(refused(value_ptr_start(&alloc, BS, &ValuePtr { segment, ..good }).map(drop)));
+        }
+        assert!(check_value_ptr(&at(seg_bytes as u32 - good.len, good.len), seg_bytes).is_ok());
+        assert_eq!(value_ptr_start(&alloc, BS, &good).unwrap(), start);
+        assert_eq!(log.read(&dev, start, &good).unwrap().value, b"v");
+        assert_eq!(log.read_many_checked(&dev, &[(start, good)], &[(b"k", 7)]).unwrap()[0].value, b"v");
+    }
+
+    #[test]
     fn detects_corruption() {
         let (dev, mut alloc, mut log) = setup();
         let (_, ptr) = log
@@ -1614,7 +1673,7 @@ mod tests {
         blk[corrupt_at] ^= 0xFF;
         dev.write_at(start, &blk).unwrap();
         assert!(matches!(
-            read_record(&dev, BS, start, &ptr),
+            read_record(&dev, BS, SEG_BLOCKS * BS as u64, start, &ptr),
             Err(LogError::Corrupt(_))
         ));
     }

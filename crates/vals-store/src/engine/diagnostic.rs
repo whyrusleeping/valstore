@@ -27,16 +27,11 @@ impl<D: BlockDevice> Engine<D> {
             let record = (|| -> Result<Record, LogError> {
                 let ptr = entry.ptr;
                 let bs = self.dev.block_size();
-                let seg_bytes = self.alloc.blocks_per_segment() * bs as u64;
-                if ptr.segment.0 >= self.alloc.num_segments()
-                    || ptr.len == 0 || ptr.offset as u64 + ptr.len as u64 > seg_bytes
-                {
-                    return Err(LogError::Corrupt("ValuePtr outside segment"));
-                }
+                let seg_start = crate::vlog::value_ptr_start(&self.alloc, bs, &ptr)?;
                 let first = ptr.offset as usize / bs;
                 let within = ptr.offset as usize % bs;
                 let mut buf = vec![0u8; (within + ptr.len as usize).div_ceil(bs) * bs];
-                self.dev.read_at(self.alloc.segment_range(ptr.segment).0 + first as u64, &mut buf)?;
+                self.dev.read_at(seg_start + first as u64, &mut buf)?;
                 crate::vlog::decode_record(&buf[within..within + ptr.len as usize])
             })();
             KeyVersion { run, handle, entry, record }

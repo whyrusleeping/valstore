@@ -881,3 +881,26 @@ fn staged_probe_bloom_fp_falls_through_to_older_hit() {
     assert_eq!(blocks, 2, "the counted probe reports both block reads");
 }
 
+#[test]
+fn value_pointers_outside_their_segment_are_refused_instead_of_panicking() {
+    let mut e = engine(Ordering::Unsorted);
+    e.put(b"k", b"v", 0).unwrap();
+    let good = e.index.get(b"k").unwrap().ptr;
+    let seg_bytes = (e.alloc.blocks_per_segment() * BS as u64) as u32;
+    for ptr in [
+        ValuePtr { segment: SegmentId(u64::MAX), ..good },
+        ValuePtr { segment: SegmentId(e.alloc.num_segments()), ..good },
+        ValuePtr { len: 0, ..good },
+        ValuePtr { offset: seg_bytes, ..good },
+    ] {
+        assert!(
+            matches!(
+                e.plan_get_ptr(&ptr),
+                Err(EngineError::Log(LogError::Corrupt("value pointer outside its segment")))
+            ),
+            "{ptr:?}"
+        );
+    }
+    assert_eq!(e.plan_get_ptr(&good).unwrap().ptr(), good);
+    assert_eq!(e.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+}

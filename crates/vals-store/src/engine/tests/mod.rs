@@ -902,7 +902,13 @@ use super::*;
                 .iter()
                 .map(|p| (e.alloc.segment_range(p.segment).0, *p))
                 .collect();
-            total_spans += crate::vlog::plan_read_spans_detached(e.block_size, &items).num_spans();
+            total_spans += crate::vlog::plan_read_spans_detached(
+                e.block_size,
+                e.alloc.blocks_per_segment() * e.block_size as u64,
+                &items,
+            )
+            .unwrap()
+            .num_spans();
         }
         (total_spans, ordered.len())
     }

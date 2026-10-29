@@ -1189,7 +1189,7 @@ impl Run {
         if bytes.len() < FOOTER_LEN {
             return Err("truncated");
         }
-        let ft = decode_footer(&bytes[bytes.len() - FOOTER_LEN..])?;
+        let ft = decode_run_footer(&bytes[bytes.len() - FOOTER_LEN..], bytes.len() as u64)?;
         let bloom = RunFilter::decode(ft.version, section(&bytes, ft.bloom_off, ft.bloom_len)?)?;
         let (index, _) = decode_index(section(&bytes, ft.index_off, ft.index_len)?, ft.version)?;
         Ok(Run {
@@ -1466,6 +1466,16 @@ struct Footer {
 
 fn decode_footer(f: &[u8]) -> Result<Footer, &'static str> {
     decode_footer_capped(f, RUN_VERSION)
+}
+
+fn decode_run_footer(f: &[u8], run_len: u64) -> Result<Footer, &'static str> {
+    let ft = decode_footer(f)?;
+    let body_len = run_len.checked_sub(FOOTER_LEN as u64).ok_or("run shorter than its footer")?;
+    let sections = [(ft.bloom_off, ft.bloom_len), (ft.index_off, ft.index_len), (ft.sidecar_off, ft.sidecar_len)];
+    if sections.iter().any(|&(off, len)| off.checked_add(len).is_none_or(|end| end > body_len)) {
+        return Err("run footer section outside the run");
+    }
+    Ok(ft)
 }
 
 fn decode_footer_capped(f: &[u8], max_version: u16) -> Result<Footer, &'static str> {
@@ -2984,7 +2994,7 @@ pub(crate) fn read_run_range_tombstones(
     }
     pace(FOOTER_LEN);
     let footer = read_run_range(dev, alloc, &handle.segs, seg_bytes, handle.len - FOOTER_LEN as u64, FOOTER_LEN)?;
-    let ft = decode_footer(&footer).map_err(SnapshotError::Corrupt)?;
+    let ft = decode_run_footer(&footer, handle.len).map_err(SnapshotError::Corrupt)?;
     if !version_supports_range_tombstones(ft.version) {
         return Ok(Vec::new());
     }
@@ -3248,7 +3258,7 @@ fn read_run_parts_inner<D: BlockDevice>(
         FOOTER_LEN,
     )?;
     let footer_same = same(0, &footer_bytes);
-    let ft = decode_footer(&footer_bytes).map_err(SnapshotError::Corrupt)?;
+    let ft = decode_run_footer(&footer_bytes, handle.len).map_err(SnapshotError::Corrupt)?;
     footer_same?;
     let bloom_bytes = read_run_range_lbas(
         dev,
@@ -3460,7 +3470,7 @@ impl<D: BlockDevice> DeviceRun<D> {
             handle.len - FOOTER_LEN as u64,
             FOOTER_LEN,
         )?;
-        let ft = decode_footer(&footer_bytes).map_err(SnapshotError::Corrupt)?;
+        let ft = decode_run_footer(&footer_bytes, handle.len).map_err(SnapshotError::Corrupt)?;
         let bloom = if filter {
             let bytes = read_run_range(
                 &*dev, alloc, &handle.segs, seg_bytes, ft.bloom_off, ft.bloom_len as usize,
@@ -4338,6 +4348,7 @@ impl<'a, D: BlockDevice> RunPrefetchScan<'a, D> {
 
 #[cfg(test)]
 mod tests {
+    mod bounds;
     mod v6;
     use super::*;
 

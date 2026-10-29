@@ -1057,11 +1057,23 @@ fn rewrite_chunk_values<D: BlockDevice>(
     if rewrite.is_empty() {
         return Ok(());
     }
-    let items: Vec<(u64, ValuePtr)> = rewrite
-        .iter()
-        .map(|&i| (alloc.segment_range(chunk[i].ptr.segment).0, chunk[i].ptr))
-        .collect();
-    let plan_spans = crate::vlog::plan_read_spans_detached(block_size, &items);
+    let mut items: Vec<(u64, ValuePtr)> = Vec::with_capacity(rewrite.len());
+    for &i in &rewrite {
+        let e = &chunk[i];
+        match crate::vlog::value_ptr_start(alloc, block_size, &e.ptr) {
+            Ok(start) => items.push((start, e.ptr)),
+            Err(LogError::Corrupt(reason)) => {
+                return Err(EngineError::CorruptValueRecord {
+                    key: e.key.clone().into_boxed_slice(),
+                    ptr: e.ptr,
+                    reason,
+                })
+            }
+            Err(e) => return Err(EngineError::from(e)),
+        }
+    }
+    let seg_bytes = alloc.blocks_per_segment() * block_size as u64;
+    let plan_spans = crate::vlog::plan_read_spans_detached(block_size, seg_bytes, &items)?;
     let expected = |slot: usize| {
         let e = &chunk[rewrite[slot]];
         (e.key.as_slice(), e.version)
