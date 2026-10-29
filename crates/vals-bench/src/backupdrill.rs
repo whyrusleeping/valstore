@@ -98,7 +98,7 @@ fn value(tag: u64, i: usize, generation: u64) -> Vec<u8> {
 }
 
 fn overwritten(i: usize) -> bool {
-    i % 3 == 0
+    i.is_multiple_of(3)
 }
 
 fn point_deleted(i: usize) -> bool {
@@ -115,7 +115,7 @@ fn range_deleted(i: usize) -> bool {
 }
 
 fn rewritten(i: usize) -> bool {
-    range_deleted(i) && i % REWRITE_EVERY == 0
+    range_deleted(i) && i.is_multiple_of(REWRITE_EVERY)
 }
 
 fn expected(kind: Kind, tag: u64, i: usize, n: usize) -> Option<Vec<u8>> {
@@ -387,7 +387,7 @@ fn probe(nodes: &[(u32, Vec<SocketAddr>)], secs: u64, rate: u64, log: &str) {
         }
         op += 1;
         let t = Instant::now();
-        if op % 2 == 0 {
+        if op.is_multiple_of(2) {
             let sent = now_ms();
             let k = format!("p{tag}-{seq:09}");
             match run(coord.write_in(probe_zone, k.as_bytes(), sent.to_string().as_bytes(), options())) {

@@ -68,29 +68,28 @@ fn monotonic_ms() -> u64 {
 fn sampled_memory() -> (u64, u64) {
     let now = monotonic_ms();
     let last = LAST_SAMPLE_MS.load(Ordering::Relaxed);
-    if last == 0 || now.saturating_sub(last) >= SAMPLE_INTERVAL_MS {
-        if LAST_SAMPLE_MS
+    if (last == 0 || now.saturating_sub(last) >= SAMPLE_INTERVAL_MS)
+        && LAST_SAMPLE_MS
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
-        {
-            if let Some(rss) = crate::observe::process_resident_bytes() {
-                CACHED_RSS.store(rss, Ordering::Relaxed);
-                crate::observe::gauges().process_resident_bytes.set(rss);
-            }
-            if let Some(swap) = crate::observe::process_swap_bytes() {
-                CACHED_SWAP.store(swap, Ordering::Relaxed);
-                crate::observe::gauges().process_swap_bytes.set(swap);
-            }
-            if let Some(budget) = budget_bytes() {
-                CACHED_OVER_BUDGET.store(
-                    check(
-                        CACHED_RSS.load(Ordering::Relaxed),
-                        CACHED_SWAP.load(Ordering::Relaxed),
-                        budget,
-                    ),
-                    Ordering::Relaxed,
-                );
-            }
+    {
+        if let Some(rss) = crate::observe::process_resident_bytes() {
+            CACHED_RSS.store(rss, Ordering::Relaxed);
+            crate::observe::gauges().process_resident_bytes.set(rss);
+        }
+        if let Some(swap) = crate::observe::process_swap_bytes() {
+            CACHED_SWAP.store(swap, Ordering::Relaxed);
+            crate::observe::gauges().process_swap_bytes.set(swap);
+        }
+        if let Some(budget) = budget_bytes() {
+            CACHED_OVER_BUDGET.store(
+                check(
+                    CACHED_RSS.load(Ordering::Relaxed),
+                    CACHED_SWAP.load(Ordering::Relaxed),
+                    budget,
+                ),
+                Ordering::Relaxed,
+            );
         }
     }
     (

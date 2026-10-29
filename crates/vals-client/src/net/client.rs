@@ -161,9 +161,7 @@ impl MuxConn {
         node: NodeId,
         pool: Rc<RefCell<CreditPool>>,
     ) -> Self {
-        let mut state = ConnState::default();
-        state.budget_pool = Some(pool);
-        state.budget_node = node;
+        let state = ConnState { budget_pool: Some(pool), budget_node: node, ..ConnState::default() };
         MuxConn {
             addr,
             st: RefCell::new(state),
@@ -1422,7 +1420,7 @@ impl Transport for NetTransport {
         }
         out.into_iter()
             .map(|result| {
-                result.unwrap_or_else(|| Err(TransportError::Unavailable))
+                result.unwrap_or(Err(TransportError::Unavailable))
             })
             .collect()
     }

@@ -1472,10 +1472,9 @@ impl PdDaemon {
                 if pending_range_ops.is_empty()
                     && pd.epoch() >= balance_lock_clear_through
                     && pd.range_maps().values().all(|map| map.active_rehomes() == 0)
+                    && pd.clear_orphan_balance_lock().unwrap_or(false)
                 {
-                    if pd.clear_orphan_balance_lock().unwrap_or(false) {
-                        balance_lock_clear_through = pd.last_index();
-                    }
+                    balance_lock_clear_through = pd.last_index();
                 }
                 if pending_range_ops.is_empty() && pd.is_leader() && pd.epoch() >= pd.last_index() {
                     let _ = pd.collect_orphan_range_maps();
@@ -2241,10 +2240,9 @@ impl PdDaemon {
                     && pd.is_leader()
                     && pd.epoch() >= balance_lock_clear_through
                     && pd.range_maps().values().all(|map| map.active_rehomes() == 0)
+                    && pd.clear_orphan_balance_lock().unwrap_or(false)
                 {
-                    if pd.clear_orphan_balance_lock().unwrap_or(false) {
-                        balance_lock_clear_through = pd.last_index();
-                    }
+                    balance_lock_clear_through = pd.last_index();
                 }
                 if pending_range_ops.is_empty() && pd.is_leader() && pd.epoch() >= pd.last_index() {
                     let _ = pd.collect_orphan_range_maps();

@@ -737,7 +737,7 @@ impl DiagnosisBudget {
     }
 
     pub(crate) fn spend(&mut self, bytes: usize) -> bool {
-        if bytes > self.bytes || (self.operations % 256 == 0 && std::time::Instant::now() >= self.deadline) {
+        if bytes > self.bytes || (self.operations.is_multiple_of(256) && std::time::Instant::now() >= self.deadline) {
             self.stopped = true;
             return false;
         }
@@ -2347,7 +2347,7 @@ mod tests {
                 }
             }
 
-            idx.flush_page(None, usize::MAX).unwrap();
+            check_after_step(&idx, &key);
             if step % 97 == 0 {
                 check_front_coded(&idx, &reference);
                 assert_eq!(idx.len(), reference.len());
@@ -2658,7 +2658,7 @@ mod tests {
             0..=9 => {
                 let e = rich_entry(step);
                 idx.put(&key, e);
-                reference.insert(key, e);
+                reference.insert(key.clone(), e);
             }
             10..=12 => {
                 assert_eq!(idx.remove(&key), reference.remove(&key), "remove {key:?}");
@@ -2688,7 +2688,23 @@ mod tests {
                 assert_eq!(idx.get(&key), reference.get(&key).copied(), "get {key:?}");
             }
         }
-        idx.flush_page(None, usize::MAX).unwrap();
+        check_after_step(idx, &key);
+    }
+
+    fn full_lane() -> bool {
+        std::env::var_os("VALS_TEST_FULL").is_some_and(|v| v != "0")
+    }
+
+    fn check_after_step(idx: &FrontCodedIndex, key: &[u8]) {
+        if full_lane() {
+            idx.flush_page(None, usize::MAX).unwrap();
+            return;
+        }
+        let below = idx.blocks.range::<[u8], _>((Bound::Unbounded, Bound::Included(key))).rev().take(2);
+        let above = idx.blocks.range::<[u8], _>((Bound::Excluded(key), Bound::Unbounded)).take(1);
+        for (first, block) in below.chain(above) {
+            assert!(block.checked_pairs(first).is_some(), "block {first:?} fails its integrity check after a step on {key:?}");
+        }
     }
 
     #[test]

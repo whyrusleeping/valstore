@@ -928,12 +928,10 @@ struct MergeKindCounters {
 
 const MERGE_KINDS: usize = vals_store::MergeKind::ALL.len();
 
-const MERGE_KIND_COUNTER: Counter = Counter::new();
-
 static MERGE_KIND_COUNTERS: MergeKindCounters = MergeKindCounters {
-    merges: [MERGE_KIND_COUNTER; MERGE_KINDS],
-    input_bytes: [MERGE_KIND_COUNTER; MERGE_KINDS],
-    output_bytes: [MERGE_KIND_COUNTER; MERGE_KINDS],
+    merges: [const { Counter::new() }; MERGE_KINDS],
+    input_bytes: [const { Counter::new() }; MERGE_KINDS],
+    output_bytes: [const { Counter::new() }; MERGE_KINDS],
 };
 
 pub fn record_merge_kind(kind: vals_store::MergeKind, input_bytes: u64, output_bytes: u64) {
@@ -966,7 +964,7 @@ pub fn merge_kind_metrics() -> Vec<(&'static str, u64, u64)> {
 
 const CORRUPT_READ_KINDS: usize = vals_store::vlog::CORRUPT_READ_KINDS.len();
 
-static CORRUPT_READS: [Counter; CORRUPT_READ_KINDS] = [MERGE_KIND_COUNTER; CORRUPT_READ_KINDS];
+static CORRUPT_READS: [Counter; CORRUPT_READ_KINDS] = [const { Counter::new() }; CORRUPT_READ_KINDS];
 
 pub const CORRUPT_READS_HELP: &str = "Served value reads (get, scan, mixed batch, AE sync values) that failed record validation against the index entry, by kind: magic, kind, length, crc, key, version, other. Counted once per failed reply after the storage generation was confirmed unchanged; retried races are excluded.";
 

@@ -136,13 +136,14 @@ impl<D: BlockDevice> Engine<D> {
                 version: entry.version,
                 tombstone: entry.tombstone,
             });
-            let directory = self.winner_directory.as_mut().unwrap();
-            match replacement {
-                Some(entry) => {
-                    directory.insert(key, entry);
-                }
-                None => {
-                    directory.remove(key);
+            if let Some(directory) = self.winner_directory.as_mut() {
+                match replacement {
+                    Some(entry) => {
+                        directory.insert(key, entry);
+                    }
+                    None => {
+                        directory.remove(key);
+                    }
                 }
             }
         }

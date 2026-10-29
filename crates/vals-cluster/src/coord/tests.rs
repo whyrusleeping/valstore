@@ -1383,7 +1383,7 @@ fn majority_reads_see_majority_writes_in_zones_of_every_rf() {
 
         let got = run(c.read_in(zone, &key)).unwrap().expect("one holder answers");
         assert_eq!(got.version, v, "zone {zone} rf {rf}");
-        let many = run(c.read_many_in(zone, &[key.clone()])).unwrap();
+        let many = run(c.read_many_in(zone, std::slice::from_ref(&key))).unwrap();
         assert_eq!(many[0].as_ref().unwrap().as_ref().unwrap().version, v, "zone {zone} read_many");
         if sorted {
             let rows = run(c.scan_in(zone, None, None, ReadConcern::Majority, None)).unwrap();

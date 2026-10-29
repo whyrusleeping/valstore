@@ -2073,7 +2073,7 @@ fn expired_digest_pages_resume(version: u16) {
     };
     for run_version in 1..=5u128 {
         let first = 300 * run_version as u32;
-        for i in (first..5_000u32).filter(|i| (i + run_version as u32) % 4 != 0) {
+        for i in (first..5_000u32).filter(|i| !(i + run_version as u32).is_multiple_of(4)) {
             e.put(&key(i), b"v", run_version).unwrap();
         }
         e.flush(opts).unwrap();
@@ -2086,7 +2086,7 @@ fn expired_digest_pages_resume(version: u16) {
     for (modulus, max_bytes) in [(2_500, usize::MAX), (2_500, 1024), (37, usize::MAX), (37, 4096)] {
         let sparse = move |k: &[u8]| -> u32 {
             let id: u32 = std::str::from_utf8(&k[10..18]).unwrap().parse().unwrap();
-            u32::from(id % modulus == 0)
+            u32::from(id.is_multiple_of(modulus))
         };
         let (expected, more) = e.version_digest_page(&want, sparse, None, usize::MAX, 0).unwrap();
         assert!(!more);

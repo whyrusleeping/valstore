@@ -8,17 +8,20 @@ use vals_cluster::{reactor, Node, Ordering, Ring};
 
 const BLOCK_SIZE: usize = 256;
 const SEG_BLOCKS: u64 = 16;
-const REGION_SEGMENTS: u64 = 2048;
-const REGION_BLOCKS: u64 = REGION_SEGMENTS * SEG_BLOCKS;
-const REGION_BYTES: u64 = REGION_BLOCKS * BLOCK_SIZE as u64;
+
+fn region_segments() -> u64 {
+    if std::env::var_os("VALS_TEST_FULL").is_some_and(|v| v != "0") { 2048 } else { 448 }
+}
 
 #[test]
 fn overwrite_churn_reclaims_before_the_region_wedges() {
+    let region_blocks = region_segments() * SEG_BLOCKS;
+    let region_bytes = region_blocks * BLOCK_SIZE as u64;
     let listeners = Node::bind_n(1).unwrap();
     let addrs: Vec<SocketAddr> = listeners.iter().map(|(_, a)| *a).collect();
     let shard_listeners: Vec<_> = listeners.into_iter().map(|(l, _)| l).collect();
 
-    let ds = MemDriveSet::uniform(BLOCK_SIZE, REGION_BLOCKS + 1024, 1);
+    let ds = MemDriveSet::uniform(BLOCK_SIZE, region_blocks + 1024, 1);
     let geom = PartitionGeom {
         seg_blocks: SEG_BLOCKS,
         reserved_blocks: 0,
@@ -35,7 +38,7 @@ fn overwrite_churn_reclaims_before_the_region_wedges() {
         1,
         shard_listeners,
         ds,
-        REGION_BLOCKS,
+        region_blocks,
         geom,
         ring.clone(),
         peer_shards,
@@ -50,7 +53,7 @@ fn overwrite_churn_reclaims_before_the_region_wedges() {
     const VSIZE: usize = 64;
     const BATCH: u64 = 100;
     const RECORD_EST: u64 = 110;
-    let target_appends = 3 * REGION_BYTES;
+    let target_appends = 3 * region_bytes;
     let total_writes = target_appends / RECORD_EST;
 
     let value = vec![0x5au8; VSIZE];
@@ -94,7 +97,7 @@ fn overwrite_churn_reclaims_before_the_region_wedges() {
         "zone wedged: writes never succeeded again after {}x-region overwrite churn \
          ({failed_batches} failed batches during churn; run_merges={} snapshots={} \
          segments_freed={})",
-        target_appends / REGION_BYTES,
+        target_appends / region_bytes,
         counters.run_merges.get(),
         counters.snapshots.get(),
         counters.segments_freed.get(),

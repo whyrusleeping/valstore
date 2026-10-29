@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[derive(Default)]
 #[repr(align(64))]
 pub struct Counter(AtomicU64);
 

@@ -3905,7 +3905,7 @@ mod tests {
         ) -> Result<crate::replica::DigestCursorPage, TransportError> {
             let call = self.calls.get();
             self.calls.set(call + 1);
-            if call % 2 == 0 {
+            if call.is_multiple_of(2) {
                 let mut resume = after.map_or_else(Vec::new, <[u8]>::to_vec);
                 resume.push(0);
                 self.empty.set(self.empty.get() + 1);

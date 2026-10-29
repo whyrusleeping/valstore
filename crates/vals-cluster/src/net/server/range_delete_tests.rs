@@ -117,7 +117,7 @@ fn fence_refuses_the_whole_request_when_any_slice_meets_a_foreign_range() {
     assert!(foreign.zone_store(7).unwrap().borrow().engine().range_tombstones().is_empty());
 
     let unsorted = rt_shared(1, Ring::from_members(1, 64, [1]), crate::zone::Ordering::Unsorted, None);
-    assert!(matches!(fence_range_delete(&unsorted, 7, &[mine.clone()]), Err(Response::Err(_))));
+    assert!(matches!(fence_range_delete(&unsorted, 7, std::slice::from_ref(&mine)), Err(Response::Err(_))));
     assert!(matches!(fence_range_delete(&unsorted, 8, &[mine]), Err(Response::Err(_))));
     let sorted = rt_shared(1, Ring::from_members(1, 64, [1]), crate::zone::Ordering::Sorted, None);
     assert!(matches!(

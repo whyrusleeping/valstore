@@ -600,8 +600,8 @@
         assert_eq!(load_merge_ceiling(0), u64::MAX);
         assert_eq!(load_merge_ceiling(100), 50);
         assert!(49 < load_merge_ceiling(100));
-        assert!(!(50 < load_merge_ceiling(100)));
-        assert!(!(80 < load_merge_ceiling(100)));
+        assert!(50 >= load_merge_ceiling(100));
+        assert!(80 >= load_merge_ceiling(100));
     }
 
     #[test]
@@ -1364,10 +1364,10 @@
         stale.zone_epoch += 1;
         assert_eq!(validate_balance_snapshot(&stale, ring_cfg, &proposal), Err(BalanceStaleReason::Catalog));
         let mut stale = snap.clone();
-        stale.zones.get(proposal.zone_id).cloned().map(|mut cfg| {
+        if let Some(mut cfg) = stale.zones.get(proposal.zone_id).cloned() {
             cfg.rf = 1;
             stale.zones.insert(proposal.zone_id, cfg);
-        });
+        }
         assert_eq!(validate_balance_snapshot(&stale, ring_cfg, &proposal), Err(BalanceStaleReason::Catalog));
         let mut stale = snap.clone();
         stale.range_map_epoch += 1;
@@ -1478,7 +1478,7 @@
     #[test]
     fn balance_planner_is_repeatable_for_three_four_and_five_nodes() {
         for nodes in 3..=5 {
-            let shard_counts: Vec<u32> = (1..=nodes).map(|n| n).collect();
+            let shard_counts: Vec<u32> = (1..=nodes).collect();
             let weights: Vec<u32> = (1..=nodes).map(|n| if n == nodes { 2 } else { 1 }).collect();
             let (snap, ring, endpoints, targets, agg) = balance_fixture(
                 nodes, &shard_counts, &weights, None
@@ -1944,7 +1944,7 @@
             let (tx, rx) = mpsc::channel();
             let before = crate::observe::counters().pd_rehome_debt_deferred_balanced.get();
             range_stats_poll(
-                &[(1, vec![addr, addr])], &snap, &tx, &mut HashMap::new(),
+                &[(1, vec![addr, addr])], snap, &tx, &mut HashMap::new(),
                 &HashMap::new(), true, false, RingConfig { vnodes: 64, rf: 1 },
                 &mut HashMap::new(), &mut HashMap::new(),
                 &mut BalanceExecutorState::default(),

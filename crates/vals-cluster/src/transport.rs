@@ -255,8 +255,7 @@ mod tests {
 
     #[test]
     fn configure_rejects_partially_unbounded_public_limits() {
-        let mut invalid = TransportLimits::default();
-        invalid.idle_timeout = None;
+        let invalid = TransportLimits { idle_timeout: None, ..TransportLimits::default() };
         assert!(invalid.validate().is_err());
     }
 }

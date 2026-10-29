@@ -209,7 +209,7 @@ pub(super) fn workload_netload(
     let verify_ranges = if write_secs > 0.0 && do_write {
         agg.w_verify_ranges.clone()
     } else {
-        vec![0..n]
+        std::iter::once(0..n).collect()
     };
     for i in netwrite_verify_indexes(&verify_ranges, 1000) {
         let key = format!("{key_prefix}-{i:012}").into_bytes();

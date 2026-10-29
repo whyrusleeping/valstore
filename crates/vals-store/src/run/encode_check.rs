@@ -1132,7 +1132,6 @@ mod tests {
                 Some(v) => v.into_iter().for_each(|e| push(e, &mut cur, &mut bloom)),
                 None => src.iter().for_each(|e| push(e.clone(), &mut cur, &mut bloom)),
             }
-            drop(push);
             close(&mut cur, &mut hashes, &mut sink, &mut bloom);
             std::hint::black_box(bloom.encode().len()) + sink.position() as usize
         };

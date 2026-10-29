@@ -68,10 +68,10 @@ cp "$log_dir/00-provenance.log" "$log_dir/provenance.txt"
 run_step 01-build cargo build --locked --workspace
 run_step 02-test cargo test --locked --workspace --no-fail-fast
 run_step 03-python python_tests
-run_step 04-clippy cargo clippy --locked --workspace --all-targets
-# Informational only: default warning-level lints do not fail the lane.
+run_step 04-clippy cargo clippy --locked --workspace --all-targets -- -D warnings
 warning_count=$(grep -c '^warning' "$log_dir/04-clippy.log" || true)
-printf 'Clippy warning lines (informational): %s\n' "$warning_count" | tee -a "$log_dir/04-clippy.log" "$summary"
+printf 'Clippy warning lines (warnings denied; see exit code): %s\n' "$warning_count" | tee -a "$log_dir/04-clippy.log" "$summary"
+run_step 05-doc env RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 printf '\nSummary (%s):\n' "$summary"
 cat "$summary"
 exit "$failed"

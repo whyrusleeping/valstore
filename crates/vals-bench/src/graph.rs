@@ -313,7 +313,7 @@ fn short_scan_probe(g: &Graph, edges: &[Edge], n: usize, seed: u64, cap: usize, 
 }
 
 fn drive(g: Graph, n: usize, vsize: usize, batch: usize, runs: impl Fn()->String) {
-    assert!(vsize>=100 && vsize<=300 && batch>0);
+    assert!((100..=300).contains(&vsize) && batch>0);
     let seed=env_u64("VALS_GRAPH_SEED",481);
     let mean=env_u64("VALS_GRAPH_MEAN",16) as usize;
     let queries=env_u64("VALS_GRAPH_QUERIES",2000) as usize;

@@ -98,7 +98,7 @@ impl ZonePlacement {
             for node in map.replicas_for_key_while_rehoming(&self.ring, self.zone_id, key, self.rf, self.scope.as_ref()) {
                 for place in [token, target] {
                     let owner = shard(node, place);
-                    if !(current.contains(&node) && place == token) && !pending.contains(&owner) {
+                    if !(current.contains(&node) && place == token || pending.contains(&owner)) {
                         pending.push(owner);
                     }
                 }

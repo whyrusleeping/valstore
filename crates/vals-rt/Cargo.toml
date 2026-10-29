@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lints]
+workspace = true
+
 # Minimal thread-per-core async runtime. std-only, single-threaded by design
 # (one executor pinned per core in the shared-nothing model), so it uses Rc/RefCell
 # and never requires Send/Sync on tasks.

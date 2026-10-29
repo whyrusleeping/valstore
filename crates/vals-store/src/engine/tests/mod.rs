@@ -1400,7 +1400,7 @@ use super::*;
                 let val = r.val.clone();
                 r.e.put(&key, &val, r.ver).unwrap();
                 r.puts += 1;
-                if r.puts % 64 == 0 {
+                if r.puts.is_multiple_of(64) {
                     r.maintain(true).unwrap();
                 }
             }
@@ -1445,15 +1445,15 @@ use super::*;
                     }
                 }
             }
-            if r.puts % 64 == 0 || stalled > 0 {
+            if r.puts.is_multiple_of(64) || stalled > 0 {
                 if let Err(err) = r.maintain(true) {
                     println!("maintenance error at puts={}: {err:?}", r.puts);
                 }
             }
-            if r.puts % 5_000 == 0 {
+            if r.puts.is_multiple_of(5_000) {
                 max_true_dead = max_true_dead.max(r.true_dead());
             }
-            if r.puts % 100_000 == 0 && stalled == 0 {
+            if r.puts.is_multiple_of(100_000) && stalled == 0 {
                 r.report("progress");
             }
             if r.puts - overwrite_start >= 500_000 {

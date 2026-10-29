@@ -723,7 +723,7 @@ fn winner_count_page_paginates_distinct_winners_with_tombstones() {
     let (rest, _, more) = e.winner_count_page(Some(b"k999"), None, 1000, past).unwrap();
     assert_eq!((rest, more), (0, false));
     let hint = e.range_size_hint(None, None, 4);
-    assert!(hint >= 70 && hint <= 70 + 4, "runs by block window plus a capped memtable page: {hint}");
+    assert!((70..=70 + 4).contains(&hint), "runs by block window plus a capped memtable page: {hint}");
     assert_eq!(e.range_size_hint(Some(&key(50)), Some(&key(10)), 4), 0);
     let mut mem = Engine::create_prewiped(MemBlockDevice::new(BS, 4096), cfg);
     for i in 0..5 {
@@ -1511,7 +1511,7 @@ fn compact_step_gc_matches_full_pass_and_survives_reopen() {
         e.put(b"keep", b"v1", 0).unwrap();
         e.put(b"aged", b"tomb", 0).unwrap();
         for i in 0..80u32 {
-            e.put(b"churn", &vec![7u8; 180], i as u128).unwrap();
+            e.put(b"churn", &[7u8; 180], i as u128).unwrap();
         }
         e.sync().unwrap();
     };
@@ -2028,18 +2028,13 @@ fn recurring_merge_cumulative_input_bounded_per_ingested_byte() {
         }
         run_flush(&mut e, opts);
         ingested += e.runs.last().unwrap().meta.handle.len;
-        loop {
-            match e.compact_plan(opts, None).unwrap() {
-                Some(plan) => {
-                    merge_input +=
-                        plan.merged_inputs.iter().map(|m| m.handle.len).sum::<u64>();
-                    let wdev = Arc::new(e.device().sibling().unwrap());
-                    let written =
-                        vals_rt::block_on(compact_and_write(plan, wdev), || {}).unwrap();
-                    e.compact_commit(written).unwrap();
-                }
-                None => break,
-            }
+        while let Some(plan) = e.compact_plan(opts, None).unwrap() {
+            merge_input +=
+                plan.merged_inputs.iter().map(|m| m.handle.len).sum::<u64>();
+            let wdev = Arc::new(e.device().sibling().unwrap());
+            let written =
+                vals_rt::block_on(compact_and_write(plan, wdev), || {}).unwrap();
+            e.compact_commit(written).unwrap();
         }
         max_runs = max_runs.max(e.run_count());
     }

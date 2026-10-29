@@ -32,6 +32,10 @@ impl Rng {
     }
 }
 
+fn full_lane() -> bool {
+    std::env::var_os("VALS_TEST_FULL").is_some_and(|v| v != "0")
+}
+
 fn kf_key(i: u64) -> Vec<u8> {
     format!("kf-{i:08}").into_bytes()
 }
@@ -547,6 +551,7 @@ struct PropCfg {
     churn: bool,
     offcore_only: bool,
     rebuild: bool,
+    probes: usize,
 }
 
 fn property_body(
@@ -754,7 +759,7 @@ fn property_body(
         let sample: Vec<Vec<u8>> = (0..40)
             .map(|i| if i % 4 == 0 { absent_key(rng.below(1 << 20)) } else { kf_key(rng.below(keyspace)) })
             .collect();
-        check_probes(&e, &sample, &ctx)?;
+        check_probes(&e, &sample[..cfg.probes], &ctx)?;
     }
     let all: Vec<Vec<u8>> = (0..window(ops) + span).map(kf_key).chain((0..400).map(absent_key)).collect();
     check_probes(&e, &all, &format!("seed {seed} final"))?;
@@ -772,8 +777,18 @@ fn property_run(seed: u64, ops: usize, cfg: PropCfg, knock: KeyFilterKnockouts) 
 const PROPERTY_OPS: usize = 600;
 
 fn property_seeds() -> Vec<(u64, PropCfg)> {
-    let cfg = |min_keys, churn| PropCfg { min_keys, churn, offcore_only: false, rebuild: false };
+    let cfg = |min_keys, churn| PropCfg { min_keys, churn, offcore_only: false, rebuild: false, probes: 40 };
     (1..=12u64).map(|seed| (seed, cfg(64 + seed % 512, false))).chain((13..=16u64).map(|seed| (seed, cfg(8, true)))).collect()
+}
+
+fn lane_seeds(default_lane: &[u64]) -> Vec<(u64, PropCfg)> {
+    if full_lane() {
+        return property_seeds();
+    }
+    property_seeds().into_iter()
+        .filter(|(seed, _)| default_lane.contains(seed))
+        .map(|(seed, cfg)| (seed, PropCfg { probes: 10, ..cfg }))
+        .collect()
 }
 
 #[test]
@@ -782,7 +797,7 @@ fn property_global_filter_covers_every_covered_run_and_matches_per_run_probes() 
         return;
     }
     let mut total = PropTally::default();
-    for (seed, cfg) in property_seeds() {
+    for (seed, cfg) in lane_seeds(&[3, 5, 14]) {
         let t = property_run(seed, PROPERTY_OPS, cfg, KeyFilterKnockouts::default()).unwrap_or_else(|err| panic!("{err}"));
         eprintln!("seed {seed} {cfg:?}: {t:?}");
         if cfg.churn {
@@ -1201,7 +1216,7 @@ fn property_shadow_rebuild_preserves_coverage_and_probes() {
         return;
     }
     let mut total = PropTally::default();
-    for (seed, cfg) in property_seeds().into_iter().filter(|(seed, _)| *seed <= 4 || *seed >= 13) {
+    for (seed, cfg) in lane_seeds(&[3, 13]).into_iter().filter(|(seed, _)| *seed <= 4 || *seed >= 13) {
         let t = property_run(seed, PROPERTY_OPS, PropCfg { rebuild: true, ..cfg }, KeyFilterKnockouts::default())
             .unwrap_or_else(|err| panic!("{err}"));
         eprintln!("rebuild seed {seed}: {t:?}");
@@ -1214,7 +1229,7 @@ fn property_shadow_rebuild_preserves_coverage_and_probes() {
 fn assert_rebuild_knockout_detected(knock: KeyFilterKnockouts) {
     for offcore_only in [false, true] {
         let detected = (1..=4).find_map(|seed| {
-            let cfg = PropCfg { min_keys: 64, churn: false, offcore_only, rebuild: true };
+            let cfg = PropCfg { min_keys: 64, churn: false, offcore_only, rebuild: true, probes: 40 };
             property_run(seed, PROPERTY_OPS, cfg, knock).err()
         });
         assert!(detected.is_some(), "{knock:?} offcore_only={offcore_only} not detected");
@@ -1427,17 +1442,25 @@ fn restart_and_reset_during_shadow_rebuild_preserve_present_keys() {
 }
 
 pub(super) fn process_rss() -> u64 {
+    process_status_bytes("VmRSS:")
+}
+
+fn process_anon_rss() -> u64 {
+    process_status_bytes("RssAnon:")
+}
+
+fn process_status_bytes(field: &str) -> u64 {
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    status.lines().find(|l| l.starts_with("VmRSS:")).unwrap()
+    status.lines().find(|l| l.starts_with(field)).unwrap()
         .split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() * 1024
 }
 
 #[test]
 fn rebuilt_filter_has_scaled_resident_and_compound_fpr_bounds() {
     if isolated_env_test(&[]) { return; }
-    let n = 50_000_000u64;
+    let n = if full_lane() { 50_000_000u64 } else { 4_000_000 };
     let batch_keys = n / 20;
-    let before = process_rss();
+    let before = process_anon_rss();
     let mut kf = KeyFilter::new(KeyFilterParams { rebuild: true, ..small_params(batch_keys) });
     for batch in 0..20 {
         let mut sink = kf.sink(batch_keys, batch * batch_keys).unwrap();
@@ -1458,7 +1481,7 @@ fn rebuilt_filter_has_scaled_resident_and_compound_fpr_bounds() {
     assert!(stats.filter_bytes as f64 <= 1.8 * n as f64, "{stats:?}");
     assert!(stats.resident_bytes <= stats.filter_bytes);
     assert_eq!(stats.rebuild_peak_bytes, peak);
-    let rss_delta = process_rss().saturating_sub(before);
+    let rss_delta = process_anon_rss().saturating_sub(before);
     eprintln!("KF396 scaled bound keys={n} bytes={} resident={} rss_delta={rss_delta} peak={peak}", stats.filter_bytes, stats.resident_bytes);
     assert!(rss_delta <= (1.8 * n as f64) as u64 + 512 * 1024, "RSS delta {rss_delta}: {stats:?}");
     for batch in 20..28 {

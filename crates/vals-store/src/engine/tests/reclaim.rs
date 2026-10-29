@@ -1557,7 +1557,7 @@ fn recurring_merge_is_index_only_preserves_ptrs_and_leaves_vlog_untouched() {
     assert!(plan.paced, "an unforced recurring merge is paced");
     let n_inputs = plan.merged_inputs.len();
     assert!(
-        n_inputs >= 2 && n_inputs <= 6,
+        (2..=6).contains(&n_inputs),
         "folds a subset, got {n_inputs}"
     );
     let wdev = Arc::new(e.device().sibling().unwrap());
@@ -2609,7 +2609,7 @@ fn frozen_runs_keep_overwrite_and_delete_garbage_bounded() {
             r.e.put(&key, &val, r.ver).unwrap();
             live.insert(key);
             r.puts += 1;
-            if r.puts % 64 == 0 {
+            if r.puts.is_multiple_of(64) {
                 r.maintain(true).unwrap();
             }
         }
@@ -2657,7 +2657,7 @@ fn frozen_runs_keep_overwrite_and_delete_garbage_bounded() {
             Ok(_) => r.puts += 1,
             Err(_) => rejections += 1,
         }
-        if r.puts % 64 == 0 {
+        if r.puts.is_multiple_of(64) {
             r.maintain(true).unwrap();
             while r.e.recurring_merge_selectable() {
                 if run_compact_once(&mut r.e, false).unwrap().is_none() {

@@ -570,16 +570,16 @@ pub(crate) fn range_stats_apply(
                     let delay = Duration::from_secs(60u64 << (attempts - 1).min(6));
                     rehome_backoff.insert((*zone_id, lower.clone()), (now + delay, attempts));
                 }
-            } else if range_maps_acked && current_ok && copied {
-                if cmd.send(PdCmd::CommitRehome(*zone_id, lower.clone())).is_ok() {
-                    rehome_backoff.remove(&(*zone_id, lower.clone()));
-                    crate::observe::counters().pd_rehomes_completed.inc();
-                    log::info!(
-                        "pd: rehome commit zone {zone_id} range {:016x} at epoch {}",
-                        range_log_id(*zone_id, &lower),
-                        snap.range_map_epoch
-                    );
-                }
+            } else if range_maps_acked && current_ok && copied
+                && cmd.send(PdCmd::CommitRehome(*zone_id, lower.clone())).is_ok()
+            {
+                rehome_backoff.remove(&(*zone_id, lower.clone()));
+                crate::observe::counters().pd_rehomes_completed.inc();
+                log::info!(
+                    "pd: rehome commit zone {zone_id} range {:016x} at epoch {}",
+                    range_log_id(*zone_id, &lower),
+                    snap.range_map_epoch
+                );
             }
         }
     }
@@ -799,7 +799,7 @@ pub(crate) fn range_stats_apply(
                 }
             } else {
                 candidates.retain(|(hot, _, _, _)| *hot);
-                candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                candidates.sort_unstable_by_key(|b| std::cmp::Reverse(b.1));
                 for (_, entries, zone_id, lower) in candidates {
                     if slots == 0 || actioned.contains(&zone_id) {
                         break;

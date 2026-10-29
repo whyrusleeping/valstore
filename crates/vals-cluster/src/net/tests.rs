@@ -130,7 +130,7 @@ fn scan_gate_sheds_at_limit_and_releases_on_all_exits() {
     }
     let before = crate::observe::counters().scan_admission_busy.get();
     assert!(shared.try_scan().is_none());
-    assert!(crate::observe::counters().scan_admission_busy.get() >= before + 1);
+    assert!(crate::observe::counters().scan_admission_busy.get() > before);
     drop(permits.pop());
     let permit = shared.try_scan().expect("success releases scan capacity");
     drop(permit);
@@ -186,7 +186,7 @@ fn scan_dispatch_replies_busy_at_limit_then_serves_after_release() {
     assert!(driver.dispatch_frame(&request(DEFAULT_ZONE)));
     ex.run(reactor::poll_io);
     assert!(matches!(reply(), Response::Busy));
-    assert!(crate::observe::counters().scan_admission_busy.get() >= before + 1);
+    assert!(crate::observe::counters().scan_admission_busy.get() > before);
     out.buf.borrow_mut().clear();
     drop(permits);
     assert!(driver.dispatch_frame(&request(12345)));
@@ -2781,7 +2781,7 @@ fn rehome_real_transport_copy_mirror_cutover_is_zero_gap() {
         while let Ok((key, value)) = acked_rx.try_recv() {
             acked.insert(key, value);
         }
-        if passes % 3 == 0 {
+        if passes.is_multiple_of(3) {
             for key in acked.keys().take(8) {
                 let got = run(coordinator.read_in(zone_id, key)).unwrap().unwrap();
                 assert!(got.value.is_some(), "acked key {key:?} returned not-found");

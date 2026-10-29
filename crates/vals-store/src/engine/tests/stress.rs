@@ -34,7 +34,7 @@ impl StressDev {
     }
 
     fn range(&self, lba: u64, len: usize) -> std::ops::Range<usize> {
-        assert!(len % SBS == 0 && lba + (len / SBS) as u64 <= self.blocks, "out of region: lba {lba} len {len}");
+        assert!(len.is_multiple_of(SBS) && lba + (len / SBS) as u64 <= self.blocks, "out of region: lba {lba} len {len}");
         let off = ((self.base + lba) as usize) * SBS;
         off..off + len
     }
@@ -53,7 +53,7 @@ impl StressDev {
         let mut done = 0;
         let mut i = 0;
         while i < pending.len() {
-            if self.next() % 3 == 0 {
+            if self.next().is_multiple_of(3) {
                 let j = (self.next() as usize) % pending.len();
                 let (lba, buf, state) = pending.swap_remove(j);
                 let range = self.range(lba, buf.len());
@@ -284,7 +284,7 @@ pub(super) fn run_stress(seed: u64, cfg: &StressConfig) -> StressStats {
     });
     let mut engines: Vec<Engine<StressDev>> = (0..cfg.engines)
         .map(|i| {
-            let dev = StressDev::region(&disk, i as u64 * cfg.region_blocks, cfg.region_blocks, cfg.deferred, seed ^ (i as u64 + 1) * 0x9e37);
+            let dev = StressDev::region(&disk, i as u64 * cfg.region_blocks, cfg.region_blocks, cfg.deferred, seed ^ ((i as u64 + 1) * 0x9e37));
             let mut e = Engine::create_prewiped(
                 dev,
                 Config { seg_blocks: cfg.seg_blocks, reserved_blocks: 0, ordering: if i % 2 == 0 { Ordering::Sorted } else { Ordering::Unsorted } },
@@ -437,7 +437,7 @@ pub(super) fn run_stress(seed: u64, cfg: &StressConfig) -> StressStats {
                 }
             }
         }
-        if op % 2_000 == 0 {
+        if op.is_multiple_of(2_000) {
             for (j, e) in engines.iter().enumerate() {
                 crc_scan_runs(e, &format!("seed {seed} engine {j} op {op}"));
                 stats.crc_scans += e.run_count() as u64;

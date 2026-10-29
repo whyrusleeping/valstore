@@ -486,7 +486,7 @@ impl<D: BlockDevice + AsyncRead + 'static> ConnDriver<D> {
             Ok(OwnedRequest::MultiScan { epoch, zone_id, keys_only, start, scans, reverse }) => {
                 let required = crate::proto::FEATURE_MULTI_SCAN
                     | if reverse { crate::proto::FEATURE_REVERSE_SCAN } else { 0 };
-                if !self.negotiated.is_some_and(|n| n.features & required == required) {
+                if self.negotiated.is_none_or(|n| n.features & required != required) {
                     self.out.push_resp(reqid, &Response::Err("MultiScan direction feature not negotiated".into()));
                     return true;
                 }

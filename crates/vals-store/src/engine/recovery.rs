@@ -306,7 +306,7 @@ impl<D: BlockDevice> Engine<D> {
         let mut mutable_tombstones: Option<(u128, u64)> = None;
         for (key, (seq, kind, tombstone, ptr, version)) in winners {
             if kind == RecordKind::Put
-                && !flushed_through_seq.is_some_and(|c| seq <= c)
+                && flushed_through_seq.is_none_or(|c| seq > c)
                 && !replay_cover.as_ref().is_some_and(|c| range_delete::is_covered(c.cover(&key), version))
             {
                 if tombstone {

@@ -162,54 +162,56 @@ async fn mirror_rehome_range_delete<D: BlockDevice>(
     sync: bool,
     slices: &[&wire::OwnedSlice],
 ) -> MirrorOutcome {
-    let maps = shared.range_maps.borrow();
-    let Some(map) = maps.get(&zone_id) else {
-        return MirrorOutcome::Mirrored;
+    let (ring, epoch, batches) = {
+        let maps = shared.range_maps.borrow();
+        let Some(map) = maps.get(&zone_id) else {
+            return MirrorOutcome::Mirrored;
+        };
+        let pieces: Vec<crate::partition::RangeSlice> = slices
+            .iter()
+            .flat_map(|(lo, hi)| map.ranges_overlapping(lo.as_deref(), hi.as_deref()))
+            .collect();
+        bump_range_write_marks(shared, zone_id, map, pieces.iter().map(|piece| piece.index));
+        if map.active_rehomes() == 0 {
+            return MirrorOutcome::Mirrored;
+        }
+        let Some(cfg) = shared.zone_config(zone_id) else {
+            return MirrorOutcome::Failed;
+        };
+        let ring = shared.ring.borrow().clone();
+        let epoch = shared.range_map_epoch();
+        let (shard_index, shard_count) = shared.shard();
+        let shard_of = |token: &[u8]| (crate::ring::hash64(token) % shard_count as u64) as usize;
+        let mut groups: std::collections::BTreeMap<(usize, NodeId), Vec<wire::OwnedSlice>> =
+            std::collections::BTreeMap::new();
+        for piece in pieces {
+            let Some(pending) = map.pending_of(piece.index) else { continue };
+            let current = map.replicas_of_range(&ring, zone_id, piece.index, cfg.rf, cfg.scope.as_ref());
+            let current_shard = shard_of(map.token_of(piece.index));
+            if !current.contains(&shared.node_id) || shard_index != current_shard {
+                continue;
+            }
+            let pending_shard = shard_of(pending);
+            for target in ring
+                .replicas_in_zone(zone_id, pending, cfg.rf, cfg.scope.as_ref())
+                .into_iter()
+                .filter(|n| !current.contains(n) || current_shard != pending_shard)
+            {
+                groups
+                    .entry((piece.index, target))
+                    .or_default()
+                    .push((piece.lo.clone(), piece.hi.clone()));
+            }
+        }
+        let mut batches = Vec::new();
+        for ((index, target), slices) in groups {
+            let lower = map.range_bounds(index).0.unwrap_or_default().to_vec();
+            for chunk in slices.chunks(wire::MAX_RANGE_DELETE_SLICES) {
+                batches.push(RangeDeleteMirror { lower: lower.clone(), target, slices: chunk.to_vec() });
+            }
+        }
+        (ring, epoch, batches)
     };
-    let pieces: Vec<crate::partition::RangeSlice> = slices
-        .iter()
-        .flat_map(|(lo, hi)| map.ranges_overlapping(lo.as_deref(), hi.as_deref()))
-        .collect();
-    bump_range_write_marks(shared, zone_id, map, pieces.iter().map(|piece| piece.index));
-    if map.active_rehomes() == 0 {
-        return MirrorOutcome::Mirrored;
-    }
-    let Some(cfg) = shared.zone_config(zone_id) else {
-        return MirrorOutcome::Failed;
-    };
-    let ring = shared.ring.borrow().clone();
-    let epoch = shared.range_map_epoch();
-    let (shard_index, shard_count) = shared.shard();
-    let shard_of = |token: &[u8]| (crate::ring::hash64(token) % shard_count as u64) as usize;
-    let mut groups: std::collections::BTreeMap<(usize, NodeId), Vec<wire::OwnedSlice>> =
-        std::collections::BTreeMap::new();
-    for piece in pieces {
-        let Some(pending) = map.pending_of(piece.index) else { continue };
-        let current = map.replicas_of_range(&ring, zone_id, piece.index, cfg.rf, cfg.scope.as_ref());
-        let current_shard = shard_of(map.token_of(piece.index));
-        if !current.contains(&shared.node_id) || shard_index != current_shard {
-            continue;
-        }
-        let pending_shard = shard_of(pending);
-        for target in ring
-            .replicas_in_zone(zone_id, pending, cfg.rf, cfg.scope.as_ref())
-            .into_iter()
-            .filter(|n| !current.contains(n) || current_shard != pending_shard)
-        {
-            groups
-                .entry((piece.index, target))
-                .or_default()
-                .push((piece.lo.clone(), piece.hi.clone()));
-        }
-    }
-    let mut batches = Vec::new();
-    for ((index, target), slices) in groups {
-        let lower = map.range_bounds(index).0.unwrap_or_default().to_vec();
-        for chunk in slices.chunks(wire::MAX_RANGE_DELETE_SLICES) {
-            batches.push(RangeDeleteMirror { lower: lower.clone(), target, slices: chunk.to_vec() });
-        }
-    }
-    drop(maps);
     if batches.is_empty() {
         return MirrorOutcome::Mirrored;
     }

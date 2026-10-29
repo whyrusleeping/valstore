@@ -72,7 +72,7 @@ impl AePeer for Peer<'_> {
         requester: Option<NodeId>,
     ) -> Result<Vec<(u32, u64)>, TransportError> {
         let s = self.store.borrow();
-        LocalPeer(&s).tree(zone_id, level, scope_g, scope, requester).await
+        block_on(LocalPeer(&s).tree(zone_id, level, scope_g, scope, requester))
     }
 
     async fn bucket_digests(
@@ -83,12 +83,12 @@ impl AePeer for Peer<'_> {
         after: Option<&[u8]>,
     ) -> Result<crate::replica::DigestCursorPage, TransportError> {
         let s = self.store.borrow();
-        LocalPeer(&s).bucket_digests(zone_id, num_buckets, ids, after).await
+        block_on(LocalPeer(&s).bucket_digests(zone_id, num_buckets, ids, after))
     }
 
     async fn values(&self, zone_id: ZoneId, keys: &[Vec<u8>]) -> Result<crate::replica::EntryPage, TransportError> {
         let s = self.store.borrow();
-        LocalPeer(&s).values(zone_id, keys).await
+        block_on(LocalPeer(&s).values(zone_id, keys))
     }
 
     async fn range_tombstones(
@@ -339,7 +339,7 @@ fn exchange_scopes_fragments_to_ranges_both_nodes_replicate_and_pages_them() {
 fn exchange_pages_large_fragments_by_bytes_until_the_whole_set_converges() {
     let cfg = Config { seg_blocks: 64, reserved_blocks: 0, ordering: Ordering::Sorted };
     let big = |node| {
-        let s = Store::new(Engine::create_prewiped(MemBlockDevice::new(4096, 1 << 14), cfg.clone()), node)
+        let s = Store::new(Engine::create_prewiped(MemBlockDevice::new(4096, 1 << 14), cfg), node)
             .unwrap()
             .with_max_skew_ms(0);
         s.prepare_zone_seed((1, 1, 1), &ring(), ZONE, Some(zone()), Some(map()));

@@ -127,7 +127,7 @@ pub(super) fn workload_rtqueue(backend: &str, dir: &str, vsize: usize) {
             bump(&write_errors);
         }
         *seq += 1;
-        if every > 0 && *seq % every == 0 && *seq > backlog {
+        if every > 0 && (*seq).is_multiple_of(every) && *seq > backlog {
             let hi = key(*seq - backlog);
             match vals_rt::block_on(coord.delete_range_in(zone_id, Some(b"q"), Some(&hi), WriteConcern::Quorum(2)), reactor::poll_io) {
                 Ok(_) => bump(&deletes),

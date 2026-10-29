@@ -158,7 +158,7 @@ use super::*;
 
         let quorum = Coordinator::new(9, ring.clone(), 2, RecordingReads::default())
             .with_read_fanout(ReadFanout::Quorum);
-        assert_eq!(run_ready(quorum.read_many(&[key.clone()])).unwrap(), vec![Ok(None)]);
+        assert_eq!(run_ready(quorum.read_many(std::slice::from_ref(&key))).unwrap(), vec![Ok(None)]);
         let mut quorum_nodes = quorum.transport().nodes.borrow().clone();
         quorum_nodes.sort_unstable();
         let mut expected_quorum = replicas[..2].to_vec();

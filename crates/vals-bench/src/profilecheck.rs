@@ -30,7 +30,7 @@ impl Model {
     }
 
     fn cycle(&self, round: usize) -> usize {
-        if self.workload_keys == 0 { round } else { round / self.workload_keys }
+        round.checked_div(self.workload_keys).unwrap_or(round)
     }
 
     fn winner_is_tombstone(&self, round: usize, domain: usize) -> bool {
@@ -953,11 +953,11 @@ fn clean_state_header(
 }
 
 fn profile_client_config() -> vals_cluster::ClientConfig {
-    let mut config = vals_cluster::ClientConfig::default();
-    config.connect_deadline =
-        Some(Duration::from_secs(env_u64("VALS_PROFILECHECK_CONNECT_DEADLINE_SECS", 5).max(1)));
-    config.rpc_deadline =
-        Some(Duration::from_secs(env_u64("VALS_PROFILECHECK_RPC_DEADLINE_SECS", 15).max(1)));
+    let config = vals_cluster::ClientConfig {
+        connect_deadline: Some(Duration::from_secs(env_u64("VALS_PROFILECHECK_CONNECT_DEADLINE_SECS", 5).max(1))),
+        rpc_deadline: Some(Duration::from_secs(env_u64("VALS_PROFILECHECK_RPC_DEADLINE_SECS", 15).max(1))),
+        ..vals_cluster::ClientConfig::default()
+    };
     config.validate().expect("bounded profilecheck client config")
 }
 
@@ -1198,7 +1198,7 @@ pub(super) fn workload_profilecheck(peers_arg: &str, rounds: usize, expected_sec
     let node_sample_keys = env_u64("VALS_PROFILECHECK_NODE_SAMPLE_KEYS", 16) as usize;
     let sample_every = (env_u64("VALS_PROFILECHECK_SAMPLE_EVERY", 32) as usize).max(1);
     let checkpoint_period = Duration::from_secs(env_u64("VALS_PROFILECHECK_CHECKPOINT_SECS", 900).max(1));
-    let seed_batch = (env_u64("VALS_PROFILECHECK_SEED_BATCH", 256) as usize).max(1).min(4096);
+    let seed_batch = (env_u64("VALS_PROFILECHECK_SEED_BATCH", 256) as usize).clamp(1, 4096);
     let max_model_rss_kib = env_u64("VALS_PROFILECHECK_MAX_MODEL_RSS_MIB", 4096).saturating_mul(1024);
     let max_pending_keys = env_u64("VALS_PROFILECHECK_MAX_PENDING_KEYS", 256) as usize;
     let gc_probe_period = Some(env_u64("VALS_PROFILECHECK_GC_PROBE_SECS", 0)).filter(|s| *s > 0).map(Duration::from_secs);
@@ -1938,8 +1938,8 @@ pub(super) fn workload_profilecheck(peers_arg: &str, rounds: usize, expected_sec
                     pending_omissions.iter().map(|(key, debt)| (key.clone(), debt.clone())).collect();
                 for ((node, key), (_, version, value)) in omissions {
                     let expected = (version, value);
-                    match profile_node_read_retry(&transport, node, zone_id, &key, direct_retry).await {
-                        Ok(got) => match check_expected(Api::Replica, &key, &expected, got.as_ref(), now_ms, &model) {
+                    if let Ok(got) = profile_node_read_retry(&transport, node, zone_id, &key, direct_retry).await {
+                        match check_expected(Api::Replica, &key, &expected, got.as_ref(), now_ms, &model) {
                             Ok(_) => {
                                 healed_live_cold_seed += 1;
                                 pending_omissions.remove(&(node, key));
@@ -1948,8 +1948,7 @@ pub(super) fn workload_profilecheck(peers_arg: &str, rounds: usize, expected_sec
                                 "PROFILECHECK CORRECTNESS final omission readback node={node}: {reason}"
                             ),
                             Err(Divergence::Soft(_)) => {}
-                        },
-                        Err(_) => {}
+                        }
                     }
                 }
                 if clean_finalization_allowed(&pending, &pending_omissions) {

@@ -203,12 +203,9 @@ fn flush_daemon_path(store: &mut vals_cluster::VersionedStore<FileBlockDevice>) 
     )
     .unwrap_or_else(|(_, error)| panic!("capacity flush write: {error}"));
     let mut commit = store.flush_commit_start(written).expect("capacity flush commit start");
-    loop {
-        match store.flush_commit_step(&mut commit, vals_store::FLUSH_SLICE_ENTRIES) {
-            vals_store::FlushCommitStep::Pending => {}
-            vals_store::FlushCommitStep::Ready(_) => break,
-        }
-    }
+    while let vals_store::FlushCommitStep::Pending =
+        store.flush_commit_step(&mut commit, vals_store::FLUSH_SLICE_ENTRIES)
+    {}
 }
 
 fn evict_file(path: &str) {
@@ -518,8 +515,7 @@ pub(super) fn workload_capacity(backend: &str, path: &str, n: usize, vsize: usiz
     let seed_io1 = proc_io();
     let seed_after = vals_cluster::observe::snapshot();
     println!(
-        "CAPACITY SEED mode={} interference={} steps={} wall_s={:.6} cpu_s={:.6} read_bytes={} seeded={} restarts={} fallbacks={}",
-        "stream",
+        "CAPACITY SEED mode=stream interference={} steps={} wall_s={:.6} cpu_s={:.6} read_bytes={} seeded={} restarts={} fallbacks={}",
         interference,
         seed_steps,
         seed_started.elapsed().as_secs_f64(),

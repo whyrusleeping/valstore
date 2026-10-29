@@ -232,6 +232,7 @@ pub struct MaintHandle<D: BlockDevice> {
     wake: Arc<Notify>,
 }
 
+#[allow(clippy::result_large_err)]
 fn submit_owned<D: BlockDevice>(
     owner: usize,
     jobs_flush: &mpsc::Sender<OwnedJob<D>>,

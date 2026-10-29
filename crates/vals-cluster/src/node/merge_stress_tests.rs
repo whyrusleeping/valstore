@@ -38,7 +38,7 @@ impl RegionDev {
     }
 
     fn range(&self, lba: u64, len: usize) -> std::ops::Range<usize> {
-        assert!(len % RBS == 0 && lba + (len / RBS) as u64 <= self.blocks, "out of region: lba {lba} len {len}");
+        assert!(len.is_multiple_of(RBS) && lba + (len / RBS) as u64 <= self.blocks, "out of region: lba {lba} len {len}");
         let off = ((self.base + lba) as usize) * RBS;
         off..off + len
     }
@@ -57,7 +57,7 @@ impl RegionDev {
         let mut done = 0;
         let mut i = 0;
         while i < pending.len() {
-            if self.next() % 3 == 0 {
+            if self.next().is_multiple_of(3) {
                 let j = (self.next() as usize) % pending.len();
                 let (lba, buf, state) = pending.swap_remove(j);
                 let range = self.range(lba, buf.len());
@@ -178,9 +178,9 @@ fn node_stress(seed: u64, zones: usize, ops: u64, deferred: bool) -> NodeStressS
         let cfg = Config {
             seg_blocks: 16,
             reserved_blocks: 0,
-            ordering: if z % 2 == 0 { SOrdering::Sorted } else { SOrdering::Unsorted },
+            ordering: if z.is_multiple_of(2) { SOrdering::Sorted } else { SOrdering::Unsorted },
         };
-        let dev = RegionDev::new(&disk, z as u64 * REGION, REGION, deferred, seed ^ (z as u64 + 1) * 0x9e37_79b9);
+        let dev = RegionDev::new(&disk, z as u64 * REGION, REGION, deferred, seed ^ ((z as u64 + 1) * 0x9e37_79b9));
         let mut store = VersionedStore::new(Engine::create_prewiped(dev, cfg), 1).unwrap();
         store.engine_mut().set_maint_reserve_enabled(true);
         store.engine_mut().set_device_dealloc(true);
@@ -204,7 +204,6 @@ fn node_stress(seed: u64, zones: usize, ops: u64, deferred: bool) -> NodeStressS
     let (orch_stores, orch_models, orch_stats) = (stores.clone(), models.clone(), stats.clone());
     run_loops(&shared, async move {
         let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
-        let mut hlc = 0u64;
         let mut until_yield = 0u64;
         let mut burst = (0usize, 0u64);
         for op in 1..=ops {
@@ -218,7 +217,7 @@ fn node_stress(seed: u64, zones: usize, ops: u64, deferred: bool) -> NodeStressS
                 rng.below(zones as u64) as usize
             };
             let key = rng.below(KEYS) as u32;
-            hlc += 1;
+            let hlc = op;
             let tomb = rng.below(10) == 0 && orch_models.borrow()[z].contains_key(&key);
             let value: Option<Vec<u8>> = (!tomb).then(|| {
                 let tag = format!("z{z}/k{key}/h{hlc}/");

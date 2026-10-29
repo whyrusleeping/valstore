@@ -249,7 +249,7 @@ mod tests {
                 _ => "200",
             };
             assert!(overrides.resolve(|name| (name == alias).then(|| value.into())).unwrap().1.is_empty());
-            assert_eq!(NodeSettingsOverrides::default().resolve(|name| (name == alias).then(|| value.into())).unwrap().1, [alias.clone()]);
+            assert_eq!(NodeSettingsOverrides::default().resolve(|name| (name == alias).then(|| value.into())).unwrap().1, std::slice::from_ref(&alias));
             assert!(overrides.resolve(|name| (name == alias).then(|| "201".into())).is_err());
             assert!(overrides.resolve(|name| (name == alias).then(|| "bad".into())).unwrap_err().contains(&alias));
             assert!(overrides.set(key, "-1").is_err());

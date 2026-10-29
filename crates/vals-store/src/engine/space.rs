@@ -533,11 +533,10 @@ impl<D: BlockDevice> Engine<D> {
                 else if removed_newer { reset.insert(*id); }
             }
             for (i, or) in self.runs.iter().enumerate() {
-                if !c.samples.contains_key(&or.id) {
+                c.samples.entry(or.id).or_insert_with(|| {
                     reset.insert(or.id);
-                    let sample = self.sample_shadow_run(i);
-                    c.samples.insert(or.id, sample);
-                }
+                    self.sample_shadow_run(i)
+                });
             }
             let accounted = self.rt_accounted_set();
             let mut pass = vec![1.0f64; self.runs.len() + 1];

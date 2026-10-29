@@ -707,7 +707,7 @@ fn seed_starts_reconcile_with_every_end_and_reap_frees_are_counted() {
     let (mut s, fault) = faulty_store();
     base(&mut s);
     prepare(&s);
-    let seg_bytes = s.engine_config().seg_blocks as u64 * 256;
+    let seg_bytes = s.engine_config().seg_blocks * 256;
 
     start_seed(&s);
     let epoch = s.engine().runs_removed_epoch();

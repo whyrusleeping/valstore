@@ -857,7 +857,7 @@
                 Some(b"value"),
                 crate::hlc::Version { hlc: 1, node: 1 },
             ),
-            || reactor::poll_io(),
+            reactor::poll_io,
         );
         assert!(matches!(repair, Err(TransportError::Overloaded)));
         assert_eq!(transport.transport_credit_stats().unwrap().waiters, 0);
@@ -915,7 +915,7 @@
             addrs: Vec::new(),
         });
         let transport = NetTransport::connect_with_config(&[(1, addr)], config).unwrap();
-        let members = vals_rt::block_on(transport.members(1), || reactor::poll_io());
+        let members = vals_rt::block_on(transport.members(1), reactor::poll_io);
         assert!(matches!(members, Err(TransportError::Overloaded)));
         assert!(transport.transport_credit_stats().unwrap().in_flight_bytes <= 2000);
         drop(transport);

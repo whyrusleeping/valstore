@@ -44,8 +44,7 @@ tests up to full-scale hardware runs.
   new dependency needs a strong case.
 - **Regression tests should fail without the fix.** When you fix a bug, check
   that the new test fails with the fix reverted.
-- **Clippy** runs in CI with default lint levels; please don't add new
-  warnings.
+- **Clippy** runs in CI with `-- -D warnings`; warnings fail the lane.
 
 ## Design docs and project records
 

@@ -197,7 +197,7 @@ fn measure_key(id: u64, replay: bool, buffer: &mut [u8; 192]) -> &[u8] {
     }
     use std::io::Write;
     let mut out = buffer.as_mut_slice();
-    if id % 2 == 0 {
+    if id.is_multiple_of(2) {
         write!(out, "app.bsky.graph.follow/did:plc:{:024x}/{id:013x}", id / 1000).unwrap();
     } else {
         write!(out, "at://did:plc:{:024x}/app.bsky.feed.post/{:013x}\0at://did:plc:{:024x}/app.bsky.feed.like/{id:013x}\0subject.uri", id / 1000, id / 1000, id / 1000 + 1).unwrap();
@@ -209,7 +209,7 @@ fn measure_key(id: u64, replay: bool, buffer: &mut [u8; 192]) -> &[u8] {
 fn measure_value(id: u64, replay: bool, updated: bool) -> &'static [u8] {
     if replay {
         let value = if updated { &[b'u'; 64] } else { &[b'v'; 64] };
-        &value[..if id % 2 == 0 { 64 } else { 8 }]
+        &value[..if id.is_multiple_of(2) { 64 } else { 8 }]
     } else if updated { b"updated" } else { b"value" }
 }
 
@@ -364,11 +364,11 @@ fn rss_remainder_file_ingest_measurement() {
             let k = measure_key(id, replay, &mut buffer);
             let updated = round + 1 < rounds && i % 100 == 0;
             let tombstone = updated && i % 1000 == 0;
-            let StagedGet::Runs { probes, .. } = e.probe_get(&k) else { panic!("expected settled run lookup"); };
-            let entry = vals_rt::block_on(resolve_run_probe(&k, &probes, e.device()), || {}).unwrap().unwrap();
+            let StagedGet::Runs { probes, .. } = e.probe_get(k) else { panic!("expected settled run lookup"); };
+            let entry = vals_rt::block_on(resolve_run_probe(k, &probes, e.device()), || {}).unwrap().unwrap();
             assert_eq!(entry.tombstone, tombstone);
             assert_eq!(entry.version, (round + 1 + u64::from(updated)) as u128);
-            let value = e.get(&k).unwrap();
+            let value = e.get(k).unwrap();
             assert_eq!(value.as_deref(), Some(measure_value(id, replay, updated)));
         }
     }

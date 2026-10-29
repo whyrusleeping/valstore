@@ -11,6 +11,11 @@ members = [
     "crates/vals-server",
 ]
 
+[workspace.lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"
+large_enum_variant = "allow"
+
 [workspace.package]
 version = "0.0.1"
 edition = "2021"

@@ -4,20 +4,25 @@ From the repository root, run `scripts/ci.sh`. It needs rustup with the
 toolchain pinned in `rust-toolchain.toml` and Python 3.10 or newer, and nothing
 else: no SPDK, no hardware, no other repositories. GitHub Actions runs the same
 script on push, pull request and manual dispatch with the pinned toolchain.
+After installing that toolchain, Actions uses `Swatinem/rust-cache@v2` to cache
+Cargo downloads and build artifacts.
 
-The script runs, in order:
+After recording and checking toolchain provenance, the script runs, in order:
 
 1. `cargo build --locked --workspace`
 2. `cargo test --locked --workspace --no-fail-fast`
 3. `python3 -m unittest discover -s scripts -p 'test_*.py' -v` (a missing test
    file fails the step)
-4. `cargo clippy --locked --workspace --all-targets`
+4. `cargo clippy --locked --workspace --all-targets -- -D warnings`
+5. `RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps`
 
-There are no retries; each command's exit code is its result. Clippy uses the
-default lint levels: deny-level lints and compile errors fail, while warn-level
-warnings are printed and counted but do not fail. `cargo fmt --check` is
-deliberately not run: the tree is not rustfmt-clean, and this lane does not
-reformat it.
+There are no retries; each command's exit code is its result. The script runs
+all steps even if an earlier one fails, then fails if any step failed. Clippy
+and rustdoc warnings fail the lane. The workspace allows only Clippy's
+`type_complexity`, `too_many_arguments` (established internal API shapes), and
+`large_enum_variant` (avoiding extra allocations in flush and scan paths).
+`cargo fmt --check` is deliberately not run: the tree is not rustfmt-clean,
+and this lane does not reformat it.
 
 Each run recreates `${VALS_CI_LOG_DIR:-target/ci-logs}`. The full console
 output of each step is saved in a numbered log; `summary.txt` records exit

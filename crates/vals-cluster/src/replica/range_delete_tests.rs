@@ -801,7 +801,7 @@ impl Rng {
 }
 
 fn fold_turn(s: &mut Store, turn: usize) -> RecountStep {
-    fold_turn_with(s, turn % 2 == 0)
+    fold_turn_with(s, turn.is_multiple_of(2))
 }
 
 fn fold_turn_with(s: &mut Store, prefetch: bool) -> RecountStep {

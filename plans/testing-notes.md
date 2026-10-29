@@ -34,6 +34,21 @@ common when devbox's load average is high (about 50 or more, from other sessions
   `knockout_whole_engine_invalidation_reseeds_peers_on_a_rehome` (timed out waiting for the
   re-home).
 
+## Long tests and `VALS_TEST_FULL`
+
+- `VALS_TEST_FULL=1` (any value but `0`) runs the long tests at their original size (0537).
+  By default the keyfilter property tests run a few seeds and check 10 of the 40 sampled keys
+  per step; `rebuilt_filter_has_scaled_resident_and_compound_fpr_bounds` uses 4M keys, not 50M
+  (and measures `RssAnon`); the FrontCodedIndex model tests check only the blocks each step
+  touches, with a whole-index check every 211 (or 97) steps; `churn_reclaim` uses a
+  448-segment region, not 2048 (below about 384 segments many batches fail during churn).
+- Full lane, debug: about 112 s for the keyfilter property test, 72 s for rebuilt_filter, 37 s
+  for the index remove_if_eq test, 64 s for churn_reclaim. Use it after changing the key
+  filter, the front-coded index or reclaim, e.g. `VALS_TEST_FULL=1 cargo test -p vals-store --lib keyfilter::`.
+- The vals-store lib binary went from 111 s to 29 s; its slowest tests are now runformat
+  oversized-block tests, `stress::concurrent_in_place_forced_windows_never_corrupt_merge_outputs`
+  and `scan_rev::reverse_memtable_refill_crosses_4096_…` (roughly 20–27 s each in a parallel run).
+
 ## Crash-point harness (0532)
 
 - `engine::tests::crash_points` (vals-store lib) runs a seeded engine workload on

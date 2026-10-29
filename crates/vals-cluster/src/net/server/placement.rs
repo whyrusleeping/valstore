@@ -419,50 +419,52 @@ where
     D: BlockDevice,
     I: IntoIterator<Item = &'a wire::OwnedWrite>,
 {
-    let maps = shared.range_maps.borrow();
-    let single;
-    let map = match maps.get(&zone_id) {
-        Some(map) => map,
-        None => {
-            single = RangeMap::single();
-            &single
+    let (ring, epoch, batches) = {
+        let maps = shared.range_maps.borrow();
+        let single;
+        let map = match maps.get(&zone_id) {
+            Some(map) => map,
+            None => {
+                single = RangeMap::single();
+                &single
+            }
+        };
+        let tracked = shared
+            .range_write_marks
+            .borrow()
+            .get(&zone_id)
+            .is_some_and(|zone| !zone.marks.is_empty());
+        let active_rehomes = map.active_rehomes();
+        if !tracked && active_rehomes == 0 {
+            return MirrorOutcome::Mirrored;
         }
-    };
-    let tracked = shared
-        .range_write_marks
-        .borrow()
-        .get(&zone_id)
-        .is_some_and(|zone| !zone.marks.is_empty());
-    let active_rehomes = map.active_rehomes();
-    if !tracked && active_rehomes == 0 {
-        return MirrorOutcome::Mirrored;
-    }
-    let writes: Vec<&wire::OwnedWrite> = writes.into_iter().collect();
-    if tracked {
-        bump_range_write_marks(
+        let writes: Vec<&wire::OwnedWrite> = writes.into_iter().collect();
+        if tracked {
+            bump_range_write_marks(
+                shared,
+                zone_id,
+                map,
+                writes.iter().map(|(key, _, _)| map.range_index(key)),
+            );
+        }
+        if active_rehomes == 0 {
+            return MirrorOutcome::Mirrored;
+        }
+        let Some(cfg) = shared.zone_config(zone_id) else {
+            return MirrorOutcome::Failed;
+        };
+        let ring = shared.ring.borrow().clone();
+        let epoch = shared.range_map_epoch();
+        let batches = plan_mirror_batches(
             shared,
             zone_id,
             map,
-            writes.iter().map(|(key, _, _)| map.range_index(key)),
+            &cfg,
+            &ring,
+            writes.iter().copied(),
         );
-    }
-    if active_rehomes == 0 {
-        return MirrorOutcome::Mirrored;
-    }
-    let Some(cfg) = shared.zone_config(zone_id) else {
-        return MirrorOutcome::Failed;
+        (ring, epoch, batches)
     };
-    let ring = shared.ring.borrow().clone();
-    let epoch = shared.range_map_epoch();
-    let batches = plan_mirror_batches(
-        shared,
-        zone_id,
-        map,
-        &cfg,
-        &ring,
-        writes.iter().copied(),
-    );
-    drop(maps);
     if batches.is_empty() {
         return MirrorOutcome::Mirrored;
     }

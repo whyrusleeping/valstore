@@ -460,7 +460,7 @@ impl Bloom {
         if words > (available / 8) as u64 {
             return Err("truncated");
         }
-        if words < (available / 8) as u64 || available % 8 != 0 {
+        if words < (available / 8) as u64 || !available.is_multiple_of(8) {
             return Err("trailing bytes");
         }
         let mut bits = Vec::with_capacity(words as usize);
@@ -598,7 +598,7 @@ impl BlockedBloom {
         if words > (available / 8) as u64 {
             return Err("truncated");
         }
-        if words < (available / 8) as u64 || available % 8 != 0 {
+        if words < (available / 8) as u64 || !available.is_multiple_of(8) {
             return Err("trailing bytes");
         }
         let mut bits = Vec::with_capacity(words as usize);
@@ -2256,6 +2256,10 @@ impl RangeLocator {
 
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 }
 
@@ -5483,7 +5487,7 @@ mod tests {
                 assert_eq!(filter.contains_hashed(&hk), filter.contains(&e.key));
                 hits += filter.contains(&e.key) as usize;
             }
-            assert!(hits >= 1500 && hits < 3000);
+            assert!((1500..3000).contains(&hits));
         }
     }
 
@@ -6956,7 +6960,7 @@ mod tests {
                 .collect();
             let block = encode_block(&entries);
             for _ in 0..12 {
-                let lo = if rng.next() % 5 == 0 {
+                let lo = if rng.next().is_multiple_of(5) {
                     None
                 } else if !keys.is_empty() && rng.next() & 1 == 0 {
                     Some(keys[rng.range(0, keys.len() as u64 - 1) as usize].clone())

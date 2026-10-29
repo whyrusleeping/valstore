@@ -3198,8 +3198,8 @@
         assert!(vals_store::vlog::vlog_write_bytes() > bytes_before);
         assert!(crate::observe::counters().synced_writes.get() >= synced_before + 6);
         for ((shared, _), (writes, ops)) in shards.iter().zip(shard_before) {
-            assert!(shared.shard_write_counters.writes.get() >= writes + 1);
-            assert!(shared.shard_write_counters.ops.get() >= ops + 1);
+            assert!(shared.shard_write_counters.writes.get() > writes);
+            assert!(shared.shard_write_counters.ops.get() > ops);
         }
     }
 

@@ -2872,7 +2872,7 @@
         for i in 0..2_000u64 {
             s.apply_at(
                 format!("k{i:05}").as_bytes(),
-                Some(&vec![7; 200]),
+                Some(&[7; 200]),
                 vp(100 + i, 1),
                 100 + i,
             )

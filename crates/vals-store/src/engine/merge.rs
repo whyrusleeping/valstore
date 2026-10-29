@@ -1933,10 +1933,7 @@ impl<D: BlockDevice> Engine<D> {
         } = assembly;
         let start = selection.start;
         let whole = start == 0 && selection.end == self.runs.len();
-        let shadow = match selection.fold {
-            Some(_) => Some(self.shadow_sources(&selection, gc_collect_before)),
-            None => None,
-        };
+        let shadow = selection.fold.map(|_| self.shadow_sources(&selection, gc_collect_before));
         let run_version = run::merge_write_version(merged_inputs.iter().filter_map(|m| {
             self.runs.iter().find(|or| or.meta.handle == m.handle).map(|or| or.run.format_version())
         }));

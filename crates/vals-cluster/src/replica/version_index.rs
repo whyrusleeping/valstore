@@ -219,8 +219,8 @@ pub(super) struct SeedProgress {
 impl SeedProgress {
     pub(super) fn group_bytes(group: &[NodeId], leaves: &[u64]) -> u64 {
         (std::mem::size_of::<(Box<[NodeId]>, Box<[u64]>)>()
-            + group.len() * std::mem::size_of::<NodeId>()
-            + leaves.len() * std::mem::size_of::<u64>()) as u64
+            + std::mem::size_of_val(group)
+            + std::mem::size_of_val(leaves)) as u64
     }
 
     pub(super) fn try_adjust_estimate(&mut self, old: u64, new: u64) -> bool {
