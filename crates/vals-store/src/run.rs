@@ -2792,6 +2792,10 @@ impl BlockVersionCursor {
         self.walker.has_key.then_some(self.walker.key.as_slice())
     }
 
+    pub(crate) fn current_block(&self) -> usize {
+        self.walker.cur_block
+    }
+
     pub fn resident_bound_bytes(&self) -> usize {
         SIDECAR_CURSOR_WINDOW.max(self.max_block).saturating_mul(2).saturating_add(self.max_block)
     }

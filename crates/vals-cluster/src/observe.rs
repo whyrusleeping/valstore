@@ -636,6 +636,8 @@ counters! {
     ae_digest_serve_rejections,
     /// Bucket-digest pages cut short by the per-request serve time budget and returned with a resume key.
     ae_digest_serve_time_truncations,
+    /// Bucket-digest pages refused with an error because a run block or sidecar failed validation (checksum or decode) while the zone's storage was unchanged; races with run retirement are retried and not counted. Each refusal is logged (rate-limited) with zone, shard, run and block.
+    ae_digest_serve_corrupt_refusals,
     /// Connections closed before completing their initial protocol frame deadline.
     transport_initial_timeouts,
     /// Connections closed after stalling partway through a declared frame.

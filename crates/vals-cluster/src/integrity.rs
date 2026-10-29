@@ -231,6 +231,42 @@ fn corrupt_record(
     reason: &str,
 ) {
     crate::observe::record_corrupt_read(vals_store::vlog::corrupt_read_kind(reason));
+    rate_limited_error(|suppressed| {
+        let shown = &key[..key.len().min(CORRUPT_READ_KEY_HEX_BYTES)];
+        format!(
+            "corrupt value read: zone {} shard {} {path} key {}{} ({} bytes) segment {} offset {} len {}: {reason}; \
+             {outcome} ({suppressed} more on this thread suppressed since the previous line, at most one per {}s)",
+            site.zone,
+            site.shard,
+            crate::keyscan::hex(shown),
+            if shown.len() < key.len() { "…" } else { "" },
+            key.len(),
+            ptr.segment.0,
+            ptr.offset,
+            ptr.len,
+            CORRUPT_READ_LOG_EVERY.as_secs(),
+        )
+    });
+}
+
+pub(crate) fn corrupt_run_block(site: ReadSite, path: &str, outcome: &str, error: &vals_store::EngineError) -> bool {
+    let Some((run, block, reason)) = error.corrupt_run_block() else {
+        return false;
+    };
+    rate_limited_error(|suppressed| {
+        let block = block.map_or_else(|| "sidecar".to_string(), |block| format!("block {block}"));
+        format!(
+            "corrupt run read: zone {} shard {} {path} run {run} {block}: {reason}; \
+             {outcome} ({suppressed} more on this thread suppressed since the previous line, at most one per {}s)",
+            site.zone,
+            site.shard,
+            CORRUPT_READ_LOG_EVERY.as_secs(),
+        )
+    });
+    true
+}
+
+fn rate_limited_error(line: impl FnOnce(u64) -> String) {
     let now = Instant::now();
     let (last, suppressed) = CORRUPT_READ_LOG.with(std::cell::Cell::get);
     if last.is_some_and(|last| now.saturating_duration_since(last) < CORRUPT_READ_LOG_EVERY) {
@@ -238,20 +274,7 @@ fn corrupt_record(
         return;
     }
     CORRUPT_READ_LOG.with(|l| l.set((Some(now), 0)));
-    let shown = &key[..key.len().min(CORRUPT_READ_KEY_HEX_BYTES)];
-    let line = format!(
-        "corrupt value read: zone {} shard {} {path} key {}{} ({} bytes) segment {} offset {} len {}: {reason}; \
-         {outcome} ({suppressed} more on this thread suppressed since the previous line, at most one per {}s)",
-        site.zone,
-        site.shard,
-        crate::keyscan::hex(shown),
-        if shown.len() < key.len() { "…" } else { "" },
-        key.len(),
-        ptr.segment.0,
-        ptr.offset,
-        ptr.len,
-        CORRUPT_READ_LOG_EVERY.as_secs(),
-    );
+    let line = line(suppressed);
     log::error!("{line}");
     #[cfg(test)]
     CORRUPT_READ_LINES.with(|l| l.borrow_mut().push(line));

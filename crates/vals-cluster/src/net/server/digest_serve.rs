@@ -6,6 +6,8 @@ use vals_store::{Config, Engine, Ordering as SOrdering};
 
 const BUCKETS: u32 = crate::antientropy::DEFAULT_BUCKETS;
 
+const SITE: crate::integrity::ReadSite = crate::integrity::ReadSite { zone: 3, shard: 5 };
+
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
@@ -56,7 +58,7 @@ fn expired_bucket_digest_serves_resume_to_the_unbounded_page() {
     let (mut got, mut after, mut pages, mut resumed) = (Vec::new(), None::<Vec<u8>>, 0usize, 0usize);
     loop {
         let response = vals_rt::block_on(
-            serve_bucket_digests_inner(&store, &*dev, &gate, BUCKETS, &ids, after.as_deref(), Some(Instant::now())),
+            serve_bucket_digests_inner(&store, &*dev, &gate, BUCKETS, &ids, after.as_deref(), Some(Instant::now()), SITE),
             || {},
         );
         pages += 1;
@@ -79,7 +81,7 @@ fn expired_bucket_digest_serves_resume_to_the_unbounded_page() {
     }
     assert_eq!(got, expected);
     let legacy = vals_rt::block_on(
-        serve_bucket_digests_inner(&store, &*dev, &gate, BUCKETS, &ids, None, None),
+        serve_bucket_digests_inner(&store, &*dev, &gate, BUCKETS, &ids, None, None, SITE),
         || {},
     );
     assert_eq!(
@@ -130,7 +132,7 @@ fn bucket_digest_pages_end_at_the_hold_slice_while_the_deadline_is_far() {
         loop {
             let deadline = Some(Instant::now() + Duration::from_secs(3_600));
             let response = vals_rt::block_on(
-                serve_bucket_digests_inner(&store, &*dev, &gate, BUCKETS, &ids, after.as_deref(), deadline),
+                serve_bucket_digests_inner(&store, &*dev, &gate, BUCKETS, &ids, after.as_deref(), deadline, SITE),
                 || {},
             );
             pages += 1;
@@ -197,7 +199,7 @@ fn served_bucket_digests_exclude_accounted_covered_winners() {
         loop {
             let deadline = resumable.then(Instant::now);
             let response = vals_rt::block_on(
-                serve_bucket_digests_inner(&store, &*dev, &gate, BUCKETS, &ids, after.as_deref(), deadline),
+                serve_bucket_digests_inner(&store, &*dev, &gate, BUCKETS, &ids, after.as_deref(), deadline, SITE),
                 || {},
             );
             let Response::BucketDigests { digests, more, resume } = response else {
@@ -243,7 +245,7 @@ fn tree_and_digest_requests_answer_busy_while_a_range_tombstone_fold_is_pending(
             serve_request_mode(&shared, sync_tree(), crate::replica::unconditional_apply_mode()),
             serve_request_mode(&shared, digests(), crate::replica::unconditional_apply_mode()),
             vals_rt::block_on(serve_sync_tree(store, 1, 1, &scope, None), || {}),
-            vals_rt::block_on(serve_bucket_digests_inner(store, &*dev, &gate, BUCKETS, &ids, None, None), || {}),
+            vals_rt::block_on(serve_bucket_digests_inner(store, &*dev, &gate, BUCKETS, &ids, None, None, SITE), || {}),
         )
     };
     let (tree, page, coop_tree, coop_page) = served(&store);
@@ -262,7 +264,7 @@ fn tree_and_digest_requests_answer_busy_while_a_range_tombstone_fold_is_pending(
     }
 
     let held = vals_rt::block_on(gate.acquire(), || {});
-    let mut waiting = Box::pin(serve_bucket_digests_inner(&store, &*dev, &gate, BUCKETS, &ids, None, None));
+    let mut waiting = Box::pin(serve_bucket_digests_inner(&store, &*dev, &gate, BUCKETS, &ids, None, None, SITE));
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     assert!(waiting.as_mut().poll(&mut cx).is_pending(), "test premise: the serve waits for the read gate");
     let rt = Version { hlc: 2_000, node: 1u32.into() };
@@ -274,6 +276,59 @@ fn tree_and_digest_requests_answer_busy_while_a_range_tombstone_fold_is_pending(
         }
     };
     assert!(matches!(response, Response::Busy), "a range tombstone applied during the gate wait: {response:?}");
+}
+
+#[test]
+fn a_corrupt_run_block_refuses_the_digest_page_and_is_counted_and_logged() {
+    crate::integrity::reset_corrupt_read_log();
+    let dev = MemBlockDevice::new(256, 1 << 14);
+    let raw = dev.share();
+    let engine = Engine::create_prewiped(
+        dev,
+        Config { seg_blocks: 64, reserved_blocks: 0, ordering: SOrdering::Unsorted },
+    );
+    let mut store = VersionedStore::new(engine, 1).unwrap();
+    for i in 0..2_000u64 {
+        store.apply(&bench_key(i), Some(b"value-08"), Version { hlc: i + 1, node: 1u32.into() }).unwrap();
+    }
+    store.flush().unwrap();
+    let handles = store.engine().run_handles();
+    assert_eq!(handles.len(), 1);
+    let lba = handles[0].segs[0].0 * 64;
+    let store = RefCell::new(store);
+    let dev = store.borrow().device_handle();
+    let gate = ReadGate::new();
+    let ids: Vec<u32> = (0..BUCKETS).collect();
+    let serve = || {
+        vals_rt::block_on(
+            serve_bucket_digests_inner(&store, &*dev, &gate, BUCKETS, &ids, None, Some(Instant::now() + Duration::from_secs(3_600)), SITE),
+            || {},
+        )
+    };
+    assert!(matches!(serve(), Response::BucketDigests { .. }), "test premise: the intact run serves");
+
+    let mut block = vec![0u8; 256];
+    raw.read_at(lba, &mut block).unwrap();
+    block[40] ^= 0x10;
+    raw.write_at(lba, &block).unwrap();
+    let refusals = crate::observe::counters().ae_digest_serve_corrupt_refusals.get();
+    let Response::Err(why) = serve() else { panic!("a corrupt run block must refuse the page") };
+    assert!(why.starts_with("corrupt snapshot: run block crc mismatch (run "), "{why}");
+    assert!(why.ends_with(" block 0)"), "{why}");
+    assert_eq!(crate::observe::counters().ae_digest_serve_corrupt_refusals.get(), refusals + 1);
+    let run = why.trim_start_matches("corrupt snapshot: run block crc mismatch (run ").trim_end_matches(" block 0)");
+    let lines = crate::integrity::CORRUPT_READ_LINES.with(|l| l.borrow().clone());
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let want = format!(
+        "corrupt run read: zone 3 shard 5 bucket digest page run {run} block 0: run block crc mismatch; refusing the page (0 more"
+    );
+    assert!(lines[0].starts_with(&want), "{} does not start with {want}", lines[0]);
+
+    assert!(matches!(serve(), Response::Err(_)), "the damage is persistent");
+    assert_eq!(crate::observe::counters().ae_digest_serve_corrupt_refusals.get(), refusals + 2);
+    assert_eq!(crate::integrity::CORRUPT_READ_LINES.with(|l| l.borrow().len()), 1, "the second refusal is rate-limited");
+    crate::integrity::reset_corrupt_read_log();
+    assert_eq!(gate.inflight(), 0);
 }
 
 #[test]
@@ -322,7 +377,7 @@ fn bucket_digest_serve_duration_measurement() {
         loop {
             let one = Instant::now();
             let response = vals_rt::block_on(
-                serve_bucket_digests(&store, &*dev, &gate, BUCKETS, &ids, after.as_deref(), true),
+                serve_bucket_digests(&store, &*dev, &gate, BUCKETS, &ids, after.as_deref(), true, SITE),
                 || {},
             );
             longest = longest.max(one.elapsed());

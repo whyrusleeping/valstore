@@ -175,14 +175,14 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
         let mem_through = if resumable && mem_stop.is_some() { mem_through } else { None };
 
         let granularity = self.runs_bucket_granularity();
-        let mut sources: Vec<run::VersionSource> = Vec::with_capacity(self.runs.len());
+        let mut sources: Vec<(u64, run::VersionSource)> = Vec::with_capacity(self.runs.len());
         for or in &self.runs {
             if or.run.num_buckets() != granularity {
                 return Err(EngineError::Snapshot(SnapshotError::Corrupt(
                     "run bucket-digest granularity disagrees across runs",
                 )));
             }
-            sources.push(or.run.version_source(&self.alloc, after));
+            sources.push((or.id, or.run.version_source(&self.alloc, after)));
         }
         Ok(DigestPagePlan {
             mem,
@@ -246,22 +246,23 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
             "digest page executed with a different `after` than it was planned for"
         );
         let mut cursors = Vec::with_capacity(sources.len() + 1);
-        cursors.push(DigestSourceCursor::Materialized { entries: mem, pos: 0 });
-        for source in sources {
+        cursors.push(DigestSourceCursor::Materialized { entries: mem, pos: 0, run: None });
+        for (run_id, source) in sources {
             let (loc, version) = match source {
                 run::VersionSource::Blocks(cursor) => {
-                    cursors.push(DigestSourceCursor::Blocks(cursor));
+                    cursors.push(DigestSourceCursor::Blocks(cursor, run_id));
                     continue;
                 }
                 run::VersionSource::Sidecar { loc, version } => (loc, version),
             };
+            let in_run = |e: SnapshotError| locate_corrupt(e.into(), Some(run_id), None);
             if version >= 3 {
-                cursors.push(DigestSourceCursor::Streaming(run::SidecarCursor::new(loc)?));
+                cursors.push(DigestSourceCursor::Streaming(run::SidecarCursor::new(loc).map_err(in_run)?, run_id));
             } else {
                 let mut side = Vec::with_capacity(loc.len());
                 while side.len() < loc.len() {
                     let take = run::SIDECAR_CURSOR_WINDOW.min(loc.len() - side.len());
-                    let chunk = loc.read_range(dev, side.len(), take).await?;
+                    let chunk = loc.read_range(dev, side.len(), take).await.map_err(in_run)?;
                     side.extend_from_slice(&chunk);
                     if !checkpoint.checkpoint().await {
                         return Ok(None);
@@ -272,7 +273,8 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
                     version,
                     want,
                     &bucket_of,
-                )?
+                )
+                .map_err(in_run)?
                 .into_iter()
                 .filter(|(key, _)| {
                     want.contains(&bucket_of(key)) && after.is_none_or(|a| key.as_slice() > a)
@@ -281,7 +283,7 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
                     (key, u128::from_le_bytes(version.as_slice().try_into().unwrap_or([0; 16])))
                 })
                 .collect();
-                cursors.push(DigestSourceCursor::Materialized { entries, pos: 0 });
+                cursors.push(DigestSourceCursor::Materialized { entries, pos: 0, run: Some(run_id) });
             }
         }
         let mut heads: Vec<DigestHead> = cursors.iter().map(|_| DigestHead::Scanning(None)).collect();
@@ -481,7 +483,7 @@ async fn step_digest_head<D: AsyncRead + BlockDevice, C: DigestCheckpoint>(
     after: Option<&[u8]>,
     checkpoint: &mut C,
 ) -> Result<DigestStep, EngineError> {
-    match cursors[i].step(dev, want, bucket_of, after).await? {
+    match cursors[i].step(dev, want, bucket_of, after).await.map_err(|e| cursors[i].locate(e))? {
         run::SidecarCursorStep::Entry((key, version)) => {
             heads[i] = DigestHead::Ready(key, version);
             *unsettled -= 1;
@@ -531,7 +533,7 @@ pub struct DigestPagePlan {
     mem: Vec<(Vec<u8>, u128)>,
     mem_stop: Option<Vec<u8>>,
     mem_through: Option<Vec<u8>>,
-    sources: Vec<run::VersionSource>,
+    sources: Vec<(u64, run::VersionSource)>,
     after: Option<Vec<u8>>,
     cover: Option<std::sync::Arc<FragmentSet>>,
 }
@@ -550,7 +552,7 @@ impl DigestPagePlan {
         let sources = self
             .sources
             .iter()
-            .map(run::VersionSource::resident_bound_bytes)
+            .map(|(_, source)| source.resident_bound_bytes())
             .sum::<usize>();
         let after = self.after.as_ref().map_or(0, Vec::len);
         mem.saturating_add(sources)
@@ -565,9 +567,19 @@ enum DigestSourceCursor {
     Materialized {
         entries: Vec<(Vec<u8>, u128)>,
         pos: usize,
+        run: Option<u64>,
     },
-    Streaming(run::SidecarCursor),
-    Blocks(run::BlockVersionCursor),
+    Streaming(run::SidecarCursor, u64),
+    Blocks(run::BlockVersionCursor, u64),
+}
+
+fn locate_corrupt(e: EngineError, run: Option<u64>, block: Option<usize>) -> EngineError {
+    match (e, run) {
+        (EngineError::Snapshot(SnapshotError::Corrupt(reason)), Some(run)) => {
+            EngineError::CorruptRunBlock { run, block, reason }
+        }
+        (e, _) => e,
+    }
 }
 
 impl DigestSourceCursor {
@@ -579,27 +591,35 @@ impl DigestSourceCursor {
         after: Option<&[u8]>,
     ) -> Result<run::SidecarCursorStep, EngineError> {
         match self {
-            DigestSourceCursor::Materialized { entries, pos } => match entries.get(*pos) {
+            DigestSourceCursor::Materialized { entries, pos, .. } => match entries.get(*pos) {
                 Some(entry) => {
                     *pos += 1;
                     Ok(run::SidecarCursorStep::Entry(entry.clone()))
                 }
                 None => Ok(run::SidecarCursorStep::Done),
             },
-            DigestSourceCursor::Streaming(cursor) => {
+            DigestSourceCursor::Streaming(cursor, _) => {
                 Ok(cursor.next_matching_step(dev, want, bucket_of, after).await?)
             }
-            DigestSourceCursor::Blocks(cursor) => {
+            DigestSourceCursor::Blocks(cursor, _) => {
                 Ok(cursor.next_matching_step(dev, want, bucket_of, after).await?)
             }
+        }
+    }
+
+    fn locate(&self, e: EngineError) -> EngineError {
+        match self {
+            DigestSourceCursor::Materialized { run, .. } => locate_corrupt(e, *run, None),
+            DigestSourceCursor::Streaming(_, run) => locate_corrupt(e, Some(*run), None),
+            DigestSourceCursor::Blocks(cursor, run) => locate_corrupt(e, Some(*run), Some(cursor.current_block())),
         }
     }
 
     fn scanned_through(&self) -> Option<&[u8]> {
         match self {
             DigestSourceCursor::Materialized { .. } => None,
-            DigestSourceCursor::Streaming(cursor) => cursor.scanned_through(),
-            DigestSourceCursor::Blocks(cursor) => cursor.scanned_through(),
+            DigestSourceCursor::Streaming(cursor, _) => cursor.scanned_through(),
+            DigestSourceCursor::Blocks(cursor, _) => cursor.scanned_through(),
         }
     }
 }

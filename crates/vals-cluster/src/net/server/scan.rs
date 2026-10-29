@@ -123,17 +123,19 @@ pub(super) async fn serve_bucket_digests<D: BlockDevice + AsyncRead>(
     ids: &[u32],
     after: Option<&[u8]>,
     resumable: bool,
+    site: crate::integrity::ReadSite,
 ) -> Response {
     let started = std::time::Instant::now();
     let deadline = resumable.then(|| started + AE_DIGEST_SERVE_TIME_BUDGET);
     let response =
-        serve_bucket_digests_inner(store, dev, gate, num_buckets, ids, after, deadline).await;
+        serve_bucket_digests_inner(store, dev, gate, num_buckets, ids, after, deadline, site).await;
     crate::observe::histograms()
         .ae_digest_serve_duration_ms
         .observe_us(started.elapsed().as_millis() as u64);
     response
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn serve_bucket_digests_inner<D: BlockDevice + AsyncRead>(
     store: &RefCell<VersionedStore<D>>,
     dev: &D,
@@ -142,6 +144,7 @@ pub(super) async fn serve_bucket_digests_inner<D: BlockDevice + AsyncRead>(
     ids: &[u32],
     after: Option<&[u8]>,
     deadline: Option<std::time::Instant>,
+    site: crate::integrity::ReadSite,
 ) -> Response {
     let mut guard = gate.acquire().await;
     for _ in 0..3 {
@@ -206,7 +209,12 @@ pub(super) async fn serve_bucket_digests_inner<D: BlockDevice + AsyncRead>(
             }
             Ok(Some(_)) | Ok(None) => continue,
             Err(_) if store.borrow().aggregate_generation() != generation => continue,
-            Err(e) => return Response::Err(format!("{e}")),
+            Err(e) => {
+                if crate::integrity::corrupt_run_block(site, "bucket digest page", "refusing the page", &e) {
+                    crate::observe::counters().ae_digest_serve_corrupt_refusals.inc();
+                }
+                return Response::Err(format!("{e}"));
+            }
         }
     }
     Response::Busy

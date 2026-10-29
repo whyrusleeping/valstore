@@ -676,6 +676,7 @@ impl<D: BlockDevice + AsyncRead + 'static> ConnDriver<D> {
                                 &ids,
                                 after.as_deref(),
                                 resumable,
+                                shared.read_site(zone_id),
                             )
                             .await
                         }

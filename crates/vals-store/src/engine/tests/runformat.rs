@@ -365,7 +365,11 @@ fn corrupt_v5_block_fails_seed_stream_digests_and_cover_scan() {
         Engine::version_digest_page_from_plan(plan, &want, vdp_bucket, None, usize::MAX, 0, e.device()),
         || {},
     );
-    assert!(matches!(page, Err(EngineError::Snapshot(SnapshotError::Corrupt(_)))));
+    let run_id = e.runs[idx].id;
+    assert!(
+        matches!(page, Err(EngineError::CorruptRunBlock { run, block: Some(0), reason: "run block crc mismatch" }) if run == run_id),
+        "{page:?}"
+    );
     assert!(e.recovered_versions().is_err());
 
     e.key_filter.set_params(KeyFilterParams {

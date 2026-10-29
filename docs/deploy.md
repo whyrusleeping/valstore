@@ -1357,6 +1357,19 @@ self-consistent record holding another key's value:
   but that segment's space is not reclaimed. After a restart, the first GC merge
   that reaches it fails once and excludes it again.
 
+Anti-entropy bucket-digest pages read keys and versions straight from run
+blocks. If a run block (or an old-format run's sidecar) fails its checksum or
+decode while the zone's runs are unchanged, the node refuses the page with
+`corrupt snapshot: <reason> (run R block B)` (`(run R sidecar)` for a sidecar):
+
+- `vals_ae_digest_serve_corrupt_refusals` counts each refused page. A page that
+  raced with a flush or merge is retried and not counted.
+- It is logged under the same rate limit: `corrupt run read: zone Z shard S
+  bucket digest page run R block B: <reason>; refusing the page`.
+- The peer's next anti-entropy pass asks again. If the same run and block keep
+  failing, the damage is on the device; if a repeat succeeds, the bad bytes
+  came from a transient read or memory fault.
+
 ### Merge output verification
 
 Before a streamed merge output run is published, the whole run is read back

@@ -588,14 +588,14 @@
         let credit = crate::transport::acquire_queued_bytes(transport_bytes).unwrap();
         let rejections = crate::observe::counters().ae_digest_serve_rejections.get();
         let mut cx = Context::from_waker(Waker::noop());
-        let mut pending = Box::pin(serve_bucket_digests(&store, &*dev, &gate, BUCKETS, &ids, None, true));
+        let mut pending = Box::pin(serve_bucket_digests(&store, &*dev, &gate, BUCKETS, &ids, None, true, crate::integrity::ReadSite::default()));
         assert!(pending.as_mut().poll(&mut cx).is_pending());
         assert_eq!(crate::ram_broker::charged_for_test(), held);
         assert_eq!(crate::transport::usage().2, transport_bytes);
         assert_eq!(crate::observe::gauges().ae_digest_serve_bytes.get(), held);
         let reads = state.reads.load(Ordering::Relaxed);
         for _ in 0..128 {
-            let mut excess = Box::pin(serve_bucket_digests(&store, &*dev, &gate, BUCKETS, &ids, None, true));
+            let mut excess = Box::pin(serve_bucket_digests(&store, &*dev, &gate, BUCKETS, &ids, None, true, Default::default()));
             assert!(matches!(excess.as_mut().poll(&mut cx), Poll::Ready(Response::Busy)));
         }
         assert_eq!(state.reads.load(Ordering::Relaxed), reads);
@@ -610,7 +610,7 @@
         assert_eq!(gate.inflight(), 0);
         state.release();
         let response = vals_rt::block_on(
-            serve_bucket_digests(&store, &*dev, &gate, BUCKETS, &ids, None, true), || {});
+            serve_bucket_digests(&store, &*dev, &gate, BUCKETS, &ids, None, true, Default::default()), || {});
         match response {
             Response::BucketDigests { digests, more, .. } => {
                 assert!(!more);
@@ -635,7 +635,7 @@
         let ids: Vec<u32> = (0..BUCKETS).collect();
         let fired = std::cell::Cell::new(false);
         let response = vals_rt::block_on(
-            serve_bucket_digests(&store, &*dev, &gate, BUCKETS, &ids, None, true),
+            serve_bucket_digests(&store, &*dev, &gate, BUCKETS, &ids, None, true, Default::default()),
             || {
                 if state.started.load(Ordering::Acquire) != 0 && !fired.replace(true) {
                     state.panic_sync.store(false, Ordering::Release);

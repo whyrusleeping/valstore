@@ -291,6 +291,11 @@ pub enum EngineError {
         ptr: ValuePtr,
         reason: &'static str,
     },
+    CorruptRunBlock {
+        run: u64,
+        block: Option<usize>,
+        reason: &'static str,
+    },
     InvalidRange,
     RangeTombstonesUnsupported,
     RangeTombstoneCap(FragmentCapExceeded),
@@ -365,6 +370,12 @@ impl std::fmt::Display for EngineError {
                 ptr.len,
                 key.len()
             ),
+            EngineError::CorruptRunBlock { run, block: Some(block), reason } => {
+                write!(f, "corrupt snapshot: {reason} (run {run} block {block})")
+            }
+            EngineError::CorruptRunBlock { run, block: None, reason } => {
+                write!(f, "corrupt snapshot: {reason} (run {run} sidecar)")
+            }
         }
     }
 }
@@ -397,6 +408,13 @@ impl EngineError {
     pub fn corrupt_value_record(&self) -> Option<(&[u8], ValuePtr, &'static str)> {
         match self {
             EngineError::CorruptValueRecord { key, ptr, reason } => Some((key, *ptr, reason)),
+            _ => None,
+        }
+    }
+
+    pub fn corrupt_run_block(&self) -> Option<(u64, Option<usize>, &'static str)> {
+        match self {
+            EngineError::CorruptRunBlock { run, block, reason } => Some((*run, *block, reason)),
             _ => None,
         }
     }
