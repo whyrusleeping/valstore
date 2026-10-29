@@ -58,27 +58,35 @@ fn publish_push_state(
 pub(super) fn ensure_incarnation<D: BlockDevice>(
     pd: &mut PlacementDriver<D>,
     minted_through: &mut u64,
+    ring_rf: u32,
 ) {
-    if !pd.is_caught_up_leader() || pd.epoch() < *minted_through || pd.incarnation().is_some() {
+    if !pd.is_caught_up_leader() || pd.epoch() < *minted_through {
         return;
     }
-    let id = match fresh_incarnation() {
-        Ok(id) => id,
-        Err(e) => {
-            if incarnation_warn_due() {
-                log::error!("pd: cannot draw a random cluster incarnation id (retried): {e}");
+    let ring_rf = pd.ring_rf().is_none().then_some(ring_rf);
+    let incarnation = match pd.incarnation() {
+        Some(_) => None,
+        None => match fresh_incarnation() {
+            Ok(id) => Some(id),
+            Err(e) => {
+                if incarnation_warn_due() {
+                    log::error!("pd: cannot draw a random cluster incarnation id (retried): {e}");
+                }
+                return;
             }
-            return;
-        }
+        },
     };
-    match pd.mint_incarnation(id) {
+    if incarnation.is_none() && ring_rf.is_none() {
+        return;
+    }
+    match pd.mint_identity(incarnation, ring_rf) {
         Ok(index) => *minted_through = index,
         Err(e) => {
             crate::observe::counters().pd_propose_errors.inc();
             if incarnation_warn_due() {
                 log::warn!(
-                    "pd: cluster incarnation proposal failed (retried); no config is pushed \
-                     until it commits: {e}"
+                    "pd: cluster incarnation or ring rf proposal failed (retried); no config is \
+                     pushed until the incarnation commits: {e}"
                 );
             }
         }
@@ -1468,7 +1476,7 @@ impl PdDaemon {
                 }
                 drive_step(&mut pd, &mut last_tick);
                 settle_admin(&mut pd, &mut admin_waits, &mut reads, &mut pending_range_ops);
-                ensure_incarnation(&mut pd, &mut incarnation_minted_through);
+                ensure_incarnation(&mut pd, &mut incarnation_minted_through, ring.rf);
                 if pending_range_ops.is_empty()
                     && pd.epoch() >= balance_lock_clear_through
                     && pd.range_maps().values().all(|map| map.active_rehomes() == 0)
@@ -1824,7 +1832,7 @@ impl PdDaemon {
                 }
                 drive_step(&mut pd, &mut last_tick);
                 settle_admin(&mut pd, &mut admin_waits, &mut reads, &mut pending_range_ops);
-                ensure_incarnation(&mut pd, &mut incarnation_minted_through);
+                ensure_incarnation(&mut pd, &mut incarnation_minted_through, ring.rf);
                 confirm_restore_seed(&mut pd, &mut seed_confirmation);
                 if peer_conf_version != Some(pd.partition.conf_version()) {
                     peer_conf_version = Some(pd.partition.conf_version());

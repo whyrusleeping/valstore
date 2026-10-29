@@ -87,6 +87,13 @@ impl<D: BlockDevice> PlacementDriver<D> {
         if rf == 0 {
             return Err(Self::invariant("global RF must be >= 1"));
         }
+        if let Some(recorded) = self.ring_rf().filter(|&recorded| recorded as usize != rf) {
+            return Err(Self::invariant(format!(
+                "this PD's committed state records ring rf {recorded}, but its config sets rf = {rf}; \
+                 an existing cluster cannot change rf: set rf = {recorded} again \
+                 (docs/growing.md#replication-factor)"
+            )));
+        }
         if !self.validation_members.is_empty() && self.validation_members.len() < rf {
             return Err(Self::invariant(format!(
                 "global RF {rf} exceeds persisted membership of {}",
@@ -508,16 +515,32 @@ impl<D: BlockDevice> PlacementDriver<D> {
         entries
     }
 
-    pub(super) fn mint_incarnation(&mut self, id: u128) -> Result<u64, PartitionError> {
+    pub(super) fn ring_rf(&self) -> Option<u32> {
+        ring_rf_of(&|key| self.state_value(key))
+    }
+
+    pub(super) fn mint_identity(
+        &mut self,
+        incarnation: Option<u128>,
+        ring_rf: Option<u32>,
+    ) -> Result<u64, PartitionError> {
         self.prepare_authoritative_mutation()?;
-        if id == 0 {
+        if incarnation == Some(0) {
             return Err(Self::invariant("cluster incarnation must be non-zero"));
         }
-        let key = incarnation_key();
-        self.partition.propose_index(&Command::ConditionalWrite {
-            checks: vec![(key.clone(), None)],
-            key,
-            value: Some(encode_incarnation(id)),
+        if ring_rf == Some(0) {
+            return Err(Self::invariant("ring rf must be >= 1"));
+        }
+        let mut writes = Vec::new();
+        if let Some(id) = incarnation {
+            writes.push((incarnation_key(), Some(encode_incarnation(id))));
+        }
+        if let Some(rf) = ring_rf {
+            writes.push((ring_rf_key(), Some(encode_ring_rf(rf))));
+        }
+        self.partition.propose_index(&Command::ConditionalBatch {
+            checks: writes.iter().map(|(key, _)| (key.clone(), None)).collect(),
+            writes,
         })
     }
 
@@ -1009,6 +1032,10 @@ pub(super) fn incarnation_of(get: StateGet) -> Option<u128> {
     decode_incarnation(&get(&incarnation_key())?)
 }
 
+fn ring_rf_of(get: StateGet) -> Option<u32> {
+    decode_ring_rf(&get(&ring_rf_key())?)
+}
+
 pub(super) fn members_of(keys: &[Vec<u8>], get: StateGet) -> AddressedMembers {
     let mut members: AddressedMembers = keys
         .iter()
@@ -1243,6 +1270,26 @@ fn decode_incarnation(value: &[u8]) -> Option<u128> {
         return None;
     }
     Some(u128::from_le_bytes(value[1..17].try_into().ok()?)).filter(|&id| id != 0)
+}
+
+pub(super) fn ring_rf_key() -> Vec<u8> {
+    vec![b'G']
+}
+
+const RING_RF_VALUE_VERSION: u8 = 1;
+
+pub(super) fn encode_ring_rf(rf: u32) -> Vec<u8> {
+    let mut value = Vec::with_capacity(5);
+    value.push(RING_RF_VALUE_VERSION);
+    value.extend_from_slice(&rf.to_le_bytes());
+    value
+}
+
+fn decode_ring_rf(value: &[u8]) -> Option<u32> {
+    if value.len() != 5 || value[0] != RING_RF_VALUE_VERSION {
+        return None;
+    }
+    Some(u32::from_le_bytes(value[1..5].try_into().ok()?)).filter(|&rf| rf != 0)
 }
 
 pub(super) fn fresh_incarnation() -> io::Result<u128> {

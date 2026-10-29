@@ -3277,6 +3277,36 @@
     }
 
     #[test]
+    fn durable_pd_refuses_to_restart_with_a_changed_rf() {
+        let dir = std::env::temp_dir().join(format!("vals-pd-rf-change-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ring = RingConfig { vnodes: 8, rf: 1 };
+        let pd = PdDaemon::spawn_single_durable(1, engine(), ring, Vec::new(), &dir).unwrap();
+        bootstrap_daemon(&pd, &[10, 20, 30]);
+        incarnation_of(&pd);
+        pd.shutdown();
+
+        let changed = RingConfig { rf: 3, ..ring };
+        let refused = match PdDaemon::spawn_single_durable(1, engine(), changed, Vec::new(), &dir) {
+            Ok(_) => panic!("a PD with committed state started with a changed rf"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            refused.contains("ring rf 1") && refused.contains("rf = 3") && refused.contains("docs/growing.md"),
+            "{refused}"
+        );
+
+        let reopened = PdDaemon::spawn_single_durable(1, engine(), ring, Vec::new(), &dir).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while reopened.members() != [10, 20, 30] {
+            assert!(Instant::now() < deadline, "the PD did not reopen with its unchanged rf");
+            thread::sleep(Duration::from_millis(5));
+        }
+        reopened.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn durable_pd_restart_does_not_reuse_a_dropped_zone_id() {
         let dir = std::env::temp_dir().join(format!(
             "vals-pd-zone-id-restart-{}",
@@ -6272,7 +6302,7 @@
         ];
         pds[0].campaign().unwrap();
         settle_cluster(&mut pds);
-        pds[0].mint_incarnation(7).unwrap();
+        pds[0].mint_identity(Some(7), None).unwrap();
         settle_cluster(&mut pds);
         let (tx, rx) = mpsc::channel();
         let mut reads = Vec::new();
@@ -6353,7 +6383,7 @@
         settle(&mut pd);
         let index = pd.acquire_balance_intent(7).unwrap();
         settle_through(&mut pd, index);
-        let index = pd.mint_incarnation(5).unwrap();
+        let index = pd.mint_identity(Some(5), Some(1)).unwrap();
         settle_through(&mut pd, index);
         let mut entries = pd.state_entries();
         let mut legacy = RangeMap::single();
@@ -6386,6 +6416,7 @@
         assert!(!restored.iter().any(|(key, _)| pd_peer_id_of_key(key).is_some()),
             "the source PD group's replica records do not describe the restored group");
         assert_eq!(restore_seed_of(&restored), None, "the source group's restore seed records are dropped");
+        assert!(restored.contains(&(ring_rf_key(), encode_ring_rf(1))), "a restore keeps the recorded ring rf");
         assert!(restored.windows(2).all(|pair| pair[0].0 < pair[1].0));
 
         let wrong_weight = restored_state(&entries, &vec![(1, 1, vec![new])], 9, lineage).unwrap_err();

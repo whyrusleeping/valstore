@@ -298,11 +298,11 @@ refuses control pushes from the other's PD.
 ## Replication factor
 
 A zone's RF is fixed when the zone is created. No admin command changes it,
-and a restore keeps it. The default zone's RF is the PD's `rf` key. Do not
-change `rf` in the PD configs of an existing cluster: the PD pushes the new
-value to every node, but nothing tests that transition, and with tombstone
-GC on, data older than `gc_grace` would never reach the new replicas (the
-same limit as for a [restore](backup-restore.md#limits-and-evidence-1)).
+and a restore keeps it. The default zone's RF is the PD's `rf` key, and the
+PD records it in its committed state the first time it leads. A PD whose state
+records one `rf` refuses to start with another in its config: it exits with
+an error that names both values, and starts again once `rf` is set back.
+There is no in-place RF change for an existing cluster.
 
 To keep data at RF 3 once you have at least three data nodes, create new
 zones with RF 3 and copy your data into them in your application, by

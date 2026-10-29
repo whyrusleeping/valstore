@@ -932,6 +932,13 @@ The cluster incarnation is the PD raft key `I` (one byte), value
 requires the key to be absent. A missing key, wrong version or a zero id reads
 as "no incarnation yet".
 
+The ring RF is the PD raft key `G` (one byte), value `[u8 version=1][u32 rf]`.
+The leader writes it once, from its config `rf`, by a conditional write that
+requires the key to be absent (in the same batch as `I` when both are
+missing). A PD whose state holds `G` refuses to start with a different
+configured `rf`. A missing key, wrong version or a zero RF reads as "not
+recorded yet". A restore keeps `G`.
+
 Each PD replica added or removed by a PD membership change (task 0281) has a
 record under PD raft key `V` + u64 LE PD id (9 bytes), written atomically with
 the raft membership change (it is carried in that raft entry's context):
