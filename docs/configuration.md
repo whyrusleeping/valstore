@@ -389,7 +389,9 @@ sources, and they will not become daemon keys.
   `VALS_TEST_ABORT_CHILD`, `VALS_PROFILE_DEGRADE_TEST_CHILD`,
   `VALS_SEED_GROW_TEST_CHILD`, `VALS_FAIL_FAST_CHILD`, `VALS_HEAP_TEST_CHILD`.
   `VALS_SIM_SEED` selects a deterministic netsim seed, otherwise the test uses its
-  built-in default. Tests also use the real switches above in isolated subprocesses.
+  built-in default. `VALS_SIM_SEEDS` sets how many seeds the sorted-zone GC
+  simulation (`netsim_gc_tests`) runs (2 by default; raise it for a long sweep).
+  Tests also use the real switches above in isolated subprocesses.
 - Build inputs: `VALS_SPDK_LINK` (absent means no SPDK linking) and
   `VALS_SPDK_DIR` (the build script's default is `third_party/spdk`). They are
   not startup settings. C `VALS_*` defines are constants, not environment

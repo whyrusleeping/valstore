@@ -102,6 +102,8 @@ pub(crate) mod ram_broker;
 pub(crate) mod rt_sync;
 #[cfg(test)]
 mod rt_sync_tests;
+#[cfg(test)]
+mod netsim_gc_tests;
 
 #[cfg(test)]
 pub(crate) mod testutil;
