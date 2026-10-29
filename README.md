@@ -116,6 +116,7 @@ for i in 1 2 3; do $VALSD node -c node$i.conf 2> node$i.log & done
 $VALSD pd -c pd.conf 2> pd.log &
 sleep 2
 
+$VALSD admin -s pd.sock ping        # the PD is up
 $VALSD admin -s pd.sock members     # the three data nodes
 $VALSD admin -s pd.sock zones       # the sorted `events` zone
 ```
@@ -204,12 +205,16 @@ VALS_SPDK_LINK=1 cargo build --release -p vals-server --features spdk
 | [`vals-bench`](crates/vals-bench) | Benchmark and correctness harnesses for both the software and real-NVMe paths. |
 
 Outside `crates/`, `docs/` holds the design and reference docs and `scripts/`
-holds CI and provisioning helpers. The task tracker lives in `backlog/`, with
-an index in `backlog.md`, and planning notes live in `spec.md` and `plans/`.
-Those are kept by the AI-assisted workflow the project is developed with.
-They are public because they record why things are the way they are, but
-they are not user documentation. Some of them cite `bench/` experiment
-write-ups that are not part of this repository.
+holds CI and provisioning helpers. `spec.md`, `plans/` and the task files in
+`backlog/` (with an index in `backlog.md`) are the maintainer's internal
+planning notes, kept by the AI-assisted workflow the project is developed
+with. They are public because they record why things are the way they are,
+but they are not user documentation and not the issue tracker: bug reports
+and proposals from outside the project go to
+[GitHub Issues](https://github.com/whyrusleeping/valstore/issues), as
+[`CONTRIBUTING.md`](CONTRIBUTING.md) explains. The planning notes cite
+`bench/` experiment write-ups that are not part of this repository; the user
+documentation states the numbers it relies on inline.
 
 ## Documentation
 

@@ -1,10 +1,12 @@
 # Contributing to vals
 
 Thanks for your interest. vals is a young project with one maintainer, so
-please open an issue before starting anything large; it saves both of us
-from a pull request that doesn't fit. Bug reports with a reproduction are
-especially welcome. For security problems, see [`SECURITY.md`](SECURITY.md)
-instead of filing a public issue.
+please open a [GitHub issue](https://github.com/whyrusleeping/valstore/issues)
+before starting anything large; it saves both of us from a pull request that
+doesn't fit. GitHub Issues is the tracker for outside contributors: report
+bugs and propose work there, not in the `backlog/` files described below.
+Bug reports with a reproduction are especially welcome. For security
+problems, see [`SECURITY.md`](SECURITY.md) instead of filing a public issue.
 
 ## Building and testing
 
@@ -28,10 +30,12 @@ a heavily loaded machine. If a test fails in a full parallel run but passes
 on its own, mention it in your PR rather than changing the test.
 
 Changes to the hot path (storage engine, replica serving, transport) also
-need measurements on real NVMe before they are adopted. If you don't have
-suitable hardware, say so in the PR and the maintainer will run them.
-[`docs/validation.md`](docs/validation.md) describes the tiers, from local
-tests up to full-scale hardware runs.
+need measurements on real NVMe before they are adopted. What that means for
+you: run `scripts/ci.sh` before opening the PR; say in the PR description if
+your change touches the hot path, and what you measured, if anything; and
+expect the maintainer to run the hardware benchmarks and fault drills on the
+lab cluster, since they need SPDK, dedicated drives and multi-hour runs. You
+don't need that hardware to contribute.
 
 ## Code conventions
 
@@ -58,9 +62,11 @@ the relevant doc in the same PR. Byte layouts are in
 [`docs/algorithms.md`](docs/algorithms.md); both must stay exact.
 
 Most development happens with AI coding agents. `spec.md`, `plans/`, and the
-task tracker in `backlog/` (indexed in `backlog.md`) are their working files.
-You can read them for context on why something is the way it is, but you
-don't need to edit them in a PR.
+task tracker in `backlog/` (indexed in `backlog.md`) are the maintainer's
+internal planning notes and their working files. They are not the public
+issue tracker: you can read them for context on why something is the way it
+is, but you don't need to edit them in a PR, and new bugs and proposals go to
+GitHub Issues as described above.
 
 ## License
 

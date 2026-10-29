@@ -1,7 +1,7 @@
 ---
 id: "0538"
 title: 'Docs and repo hygiene: one quick start, external tracker, inline evidence, contributor validation text, monitoring guide, valsd --version/--help'
-status: in_review
+status: done
 priority: 2
 created: "2026-10-29"
 updated: "2026-10-29"
@@ -29,3 +29,4 @@ Acceptance: links resolve, no doc cites a gitignored path, the new valsd flags h
 ## Work log
 
 - 2026-10-29 (uncommitted, in the main worktree): README quick start is canonical (gained deploy's `ping` step); deploy.md "A local test cluster" points to it. CONTRIBUTING/README name GitHub Issues as the external tracker and label spec.md/plans/backlog as internal planning notes. Every `bench/…` evidence citation in README/ARCHITECTURE/docs replaced by the inline fact/date (docs/validation.md too, which also lost its dataset-path and memory-note references and is labelled the maintainer's hardware reference); CONTRIBUTING no longer links it. New deploy.md "Monitoring" section (signal table and 12 example Prometheus rules; every metric name checked against a running 3-node + PD cluster's /metrics; no leader/term metric exists, so it points at `valsd admin status`). ARCHITECTURE "Planned subsystems" → "Subsystems beyond the core data path"; EC and auto-eviction moved to Known limitations. valsd: `--version`/`version` (crate version, commit from build.rs, features) exit 0; `--help`/`-h`/`help` and `<subcommand> --help` exit 0; no args and unknown flags still exit 2; version logged at node/PD startup; admin `help` (one shared command list, also used by the unknown-command error); tests in crates/vals-server/tests/cli.rs; docs/evaluation.md updated. A markdown link/anchor check over README, CONTRIBUTING, ARCHITECTURE, SECURITY and docs/ found no problems.
+- 2026-10-29 review (opus, 2 rounds, approve): links (412) and anchors resolve; no gitignored or private references; sampled inline evidence matches its sources. Fixed from round 1: the hint metrics are client-side (always 0 on valsd), so the Monitoring table points at `vals_client::observe::snapshot()` and the hint alert is replaced by `ValsRegionExhausted` (`vals_region_exhausted_rejections`); `ValsPdStateNearCapacity` is guarded so it doesn't fire on data nodes; `vals_snapshot_errors` added to the durable-write alert; docs/ci.md, optional-feature-survey (private repo name), evaluation, deploy CLI line, the R17 review row and stale validation.md R3 text updated. build.rs no longer watches missing paths (a missing packed-refs relinked valsd on every build). `scripts/ci.sh` green.

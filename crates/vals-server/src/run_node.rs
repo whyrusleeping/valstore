@@ -18,6 +18,7 @@ pub fn resolve_settings(cfg: &NodeConfig) -> Result<(vals_cluster::node_settings
 }
 
 pub fn run_node(cfg: &NodeConfig, settings: vals_cluster::node_settings::NodeSettings) -> Result<NodeHandle, Error> {
+    log::info!("{}", crate::version_line());
     settings.configure_process()?;
     log::info!("effective node settings: {settings:?}");
     log::info!("effective transport limits: {:?}", settings.transport_limits());

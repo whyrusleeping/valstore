@@ -326,7 +326,7 @@ window remains unchanged.
 6. **Retired — default-on flag promotion.** Task 0194 instead productized two supported daemon
    profiles: default `capacity` keeps the lower-RAM resolving writer, while `latency` couples blind
    apply with the winner directory. The mixed-profile SPDK soak gate passed on 2026-10-22
-   (`bench/0194-profile-soak/FINDINGS.md`).
+   (task 0194: 2 h on three PDs and three SPDK nodes × 8 shards with a restart every 10 min).
 
 No on-disk run or value-log format change is required: both already store `Version`. Wire bytes are
 also unchanged initially. The semantic compatibility implication is real, however. Clients that
@@ -407,4 +407,4 @@ dirty backlog, run count, write amplification, and value-log space amplification
 
 Task 0167's write path and reader/recovery prerequisites are shipped. Task 0194 exposes it only
 through `profile = latency`; its mixed-profile SPDK soak gate passed on 2026-10-22
-(`bench/0194-profile-soak/FINDINGS.md`).
+(task 0194, the 2 h gate described above).

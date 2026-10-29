@@ -9,6 +9,9 @@ use vals_cluster::pd::{
 use vals_cluster::zone::{ZoneConfig, ZoneId};
 use vals_cluster::Ordering;
 
+pub(crate) const COMMANDS: &str = "ping status members zones ranges export-state add-node remove-node \
+     create-zone drop-zone split-zone merge-zone pd-add-learner pd-remove-learner pd-replace";
+
 struct AdminResponse {
     text: String,
     _byte_credit: vals_cluster::transport::ByteCredit,
@@ -166,6 +169,7 @@ fn try_handle(pd: &PdDaemon, line: &str) -> Result<String, String> {
         }
     }
     match parts.as_slice() {
+        ["help"] => Ok(format!("ok admin commands: help {COMMANDS}")),
         ["ping"] => Ok("ok".into()),
         ["status"] => {
             let s = pd.status().ok_or("pd status unavailable")?;
@@ -345,11 +349,7 @@ fn try_handle(pd: &PdDaemon, line: &str) -> Result<String, String> {
         }
 
         [] => Err("empty command".into()),
-        [cmd, ..] => Err(format!(
-            "unknown command {cmd:?} (ping|members|zones|add-node|remove-node|\
-             create-zone|drop-zone|split-zone|merge-zone|status|ranges|export-state|\
-             pd-add-learner|pd-remove-learner|pd-replace)"
-        )),
+        [cmd, ..] => Err(format!("unknown command {cmd:?} (admin commands: help {COMMANDS})")),
     }
 }
 
@@ -621,7 +621,7 @@ pub fn client(socket: &Path, cmd: &[String]) -> Result<u8, std::io::Error> {
             Ok(reply_exit(&reply))
         }
         Ok(_) | Err(_) if sent && !matches!(cmd.first().map(String::as_str),
-            Some("ping" | "status" | "members" | "zones" | "ranges" | "export-state")) => {
+            Some("help" | "ping" | "status" | "members" | "zones" | "ranges" | "export-state")) => {
             println!("unknown: no complete reply after sending command; inspect authoritative leader before retrying");
             Ok(3)
         }

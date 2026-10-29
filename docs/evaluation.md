@@ -29,8 +29,9 @@ vals-client = { git = "https://github.com/whyrusleeping/valstore", rev = "ba4694
 
 Later commits may fix or break things, and the evidence below was not
 repeated on them. Commits that change only documentation do not change what
-you are evaluating. `valsd` has no `--version` flag, so record the commit you
-built.
+you are evaluating. Record the output of `valsd --version` with your evaluation;
+it names the commit the binary was built from (`unknown` when built outside a
+git checkout; it does not detect local edits, so build from a clean checkout).
 
 ## What you can build and depend on
 

@@ -18,6 +18,7 @@ pub fn resolve_placement(
 }
 
 pub fn run_pd(cfg: &PdConfig) -> Result<(PdDaemon, mpsc::Receiver<AdminReq>), Error> {
+    log::info!("{}", crate::version_line());
     let (placement, legacy) = resolve_placement(cfg)?;
     log::info!("effective PD placement settings: {placement:?}");
     if !legacy.is_empty() {

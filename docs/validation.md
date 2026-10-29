@@ -1,5 +1,10 @@
 # Validation tiers (local-first)
 
+> This is the maintainer's hardware-validation reference: it names lab
+> corpora, lab scripts and owner decisions that only exist on the
+> maintainer's machines. Contributors need only the lane described in
+> [`CONTRIBUTING.md`](../CONTRIBUTING.md#building-and-testing).
+
 Hardware time on the lab fleet is the scarcest resource in the project. A full
 5B-event replay takes 5–10 h of ingest plus 1–4 h of checks, and the lab machines' non-ECC
 RAM aborts many attempts for reasons unrelated to the change under test. This
@@ -15,10 +20,10 @@ post-run checks.
 
 | Tier | What | Typical cost | Valid for |
 |---|---|---|---|
-| **L0** | Unit, property and fault-injection tests (`MemBlockDevice`/`FileBlockDevice`), plus analysis of results already collected under `/data/dataset/task*-results` or `bench/` | minutes | logic, policy, accounting, error paths, test gaps, projections from existing data |
-| **L1** | Local scale model: file-backed runs and benches at reduced scale, e.g. `crates/engine/tests/rss_bench.rs` (see the memory note on `VALS_RSS_ORDERING=sorted`), `plans/overwrite-cliff-local-repro.md`, `plans/capacity-local-baseline.sh` | minutes–1 h | per-key RAM, merge/space policy, CPU attribution with perf, local A/Bs of algorithmic changes |
+| **L0** | Unit, property and fault-injection tests (`MemBlockDevice`/`FileBlockDevice`), plus analysis of results already collected by earlier tasks (the maintainer keeps the raw result directories and write-ups outside this repository) | minutes | logic, policy, accounting, error paths, test gaps, projections from existing data |
+| **L1** | Local scale model: file-backed runs and benches at reduced scale, e.g. `crates/vals-store/src/engine/tests/rss_bench.rs` (run it with `VALS_RSS_ORDERING=sorted VALS_RSS_KEY_SHAPE=replay`: the replayed zones are sorted, front-coded engines, so the default unsorted 8-byte-key arm is not representative), `plans/overwrite-cliff-local-repro.md`, `plans/capacity-local-baseline.sh` | minutes–1 h | per-key RAM, merge/space policy, CPU attribution with perf, local A/Bs of algorithmic changes |
 | **L2a** | Hardware, starting from a **retained corpus** (0404): restart the fleet on data already on the drives, then run reads or a short continuation | 0.5–2 h | late-regime behaviour, post-drain or read-path issues, confirming a fix in the state where it was found |
-| **L2b** | Hardware **scaled-down profile** (0405, `run_full1.py run --attempt SCALED-k<k>`): caps and geometry ÷k, so disk, merge-policy and RAM walls arrive at ~1/k of the data | ~0.5–1 h (SCALED-k8: 24 min) | walls that scale with bytes per shard, keys per node or runs per engine. Calibrated against R3 at k=8 (`bench/0405-scaled-profile/CALIBRATION-K8.md`): mean-shard fill, run counts, RSS per key and shadow-fold size transfer. Not valid for worst-shard records fill (a prefix replay keeps the early placement skew, so the disk wall comes early), merge counts, f > 0.97, throughput, late decay, the drive write step, SLC cache or fixed per-node overheads |
+| **L2b** | Hardware **scaled-down profile** (0405, the maintainer's `run_full1.py run --attempt SCALED-k<k>`, kept with the local benchmark trees): caps and geometry ÷k, so disk, merge-policy and RAM walls arrive at ~1/k of the data | ~0.5–1 h (SCALED-k8: 24 min) | walls that scale with bytes per shard, keys per node or runs per engine. Calibrated against R3 at k=8 (task 0405's SCALED-k8 arm: 31 of 40 fill checks and 4 of 6 fold checks passed, so by the preregistered all-checks rule it is not a valid proxy overall): mean-shard fill, run counts, RSS per key and shadow-fold size transfer. Not valid for worst-shard records fill (a prefix replay keeps the early placement skew, so the disk wall comes early), merge counts, f > 0.97, throughput, late decay, the drive write step, SLC cache or fixed per-node overheads |
 | **L2c** | Short targeted hardware A/B (preregistered, ≤ ~1–2 h per arm, whole-arm distributions) | 2–4 h | SPDK async behaviour, real-NIC and 3-node interactions, early-regime throughput |
 | **L3** | Full replay of the sealed 5B cache end to end (0386-style) | 6–14 h | release gate only: end-to-end correctness at full scale, EOF disk/RAM, full-length decay |
 
@@ -95,9 +100,9 @@ task acceptance sections take precedence over historical run instructions.
 
 | Task | Cheapest valid tier | Smallest hardware step | Amend |
 |---|---|---|---|
-| 0328 scan under admission | L0 baseline from retained census logs → L1 client pacing → L2a | one census pass per arm on the R3 corpus (~1 h/arm) | done: the L2a census A/B ran on the K8 corpus instead of R3 (read-only reopen, four ~20 min `verify` arms, bench/0328-scan-pacing); shuffled order kept |
+| 0328 scan under admission | L0 baseline from retained census logs → L1 client pacing → L2a | one census pass per arm on the R3 corpus (~1 h/arm) | done: the L2a census A/B ran on the K8 corpus instead of R3 (read-only reopen, four ~20 min `verify` arms, 2026-10-12: shuffled window order with 24 workers gave 1.34× the keys/s of the 48-worker key-order census with about 2,500× fewer Busy retries, 14 against 34,184); shuffled order kept |
 | 0332 skew-gated rehome confirm | **L0**: retained PD metrics from SOAK5B/V2/V3-R2/V4/V5-R3 | none | answer from retained metrics; drop the F4 throughput criterion |
-| 0337 hugepage maps after exit | L0 (named `shm_id` disabled `--huge-unlink`; fixed in 0424) + L1 shim-only box check (bench/0337-hugepage-maps) + minimal valsd check | one box, scratch device, start/SIGTERM/kill-9, ~10 min | done: SIGTERM leg on 0418; crash / exit-75 restart legs taken from the 0386 R4 restarts instead of 0405 |
+| 0337 hugepage maps after exit | L0 (named `shm_id` disabled `--huge-unlink`; fixed in 0424) + L1 shim-only box check (lab-1, 2026-10-11: the old shim left 400–401 map files and ~400 hugepages allocated after every exit path, the fixed shim left 0 maps and all 4096 hugepages free after return, SIGTERM, `_exit(75)` and kill -9) + minimal valsd check | one box, scratch device, start/SIGTERM/kill-9, ~10 min | done: SIGTERM leg on 0418; crash / exit-75 restart legs taken from the 0386 R4 restarts instead of 0405 |
 | 0357 runtime-dealloc long arm | L3-class (drive physics) | piggyback only | re-run only if runtime dealloc is re-enabled by default, as a piggyback on the next L3 |
 | 0366 0364 follow-ups | L0; item 2 L1 (reopen a file-backed engine with a planted merge backlog) | none | item 2: local measurement; hardware restart optional |
 | 0369 0367/0368 follow-ups | L0; item 2 L2a idle restart; item 10 L1 | idle restart on a retained corpus, ≤15 min, read-only | item 2: idle restart, no ingest run |
@@ -128,7 +133,7 @@ task acceptance sections take precedence over historical run instructions.
 Open caveat: no one has yet checked whether R3's prom files carry every 0382/0389
 gauge. Check that before relying on L0 for 0391/0393.
 
-### The R3 corpus is the shared L2a asset
+### The R3 corpus as the shared L2a asset (historical; R3 is now discarded)
 
 The SOAK5B-V5-R3 corpus (10.17B ACK, drained, saved cursor 4,951,424,335) is
 used for 0401's completed confirmation and wanted by 0411, 0403's hardware check,
@@ -161,8 +166,10 @@ Discard-requiring arms (0405 calibration, a fresh 0383 L2b arm or fresh 0386)
 come after these users, or after an explicit corpus release. They do not override
 R3's reservation simply because their task is ready.
 
-R3 is registered as corpus `R3` (`bench/CORPORA.md`). Task 0418 consumed it on 2026-10-12, by
-reopening it, running the read-only checks and resuming to EOF
-(`bench/0363-compact-values/R3-SESSION-0418.md`). It stays `reserved` for 0432's digest-order
-diagnosis, and `dealloc.py` refuses to discard it meanwhile. Release it before 0405's calibration
-arm. Procedure: `plans/corpus-registry-runbook.md`.
+R3 is registered as corpus `R3` in the maintainer's corpus registry (cursor 4,951,424,335,
+10,171,922,090 cumulative acknowledged writes). Task 0418 consumed it on 2026-10-12, by
+reopening it, running the read-only checks and resuming to EOF in one 3 h 33 min session with no
+new crash, restart or integrity incident (0404 reopen, 0369 idle sweep and 0406 parallel Gets
+confirmed; the 0412 owned-aediag pass was inconclusive as preregistered, 60 of 72 comparisons in
+3,600 s). It has since been discarded, as have K8 and R4, so no retained corpus is
+available for L2a today. Procedure: `plans/corpus-registry-runbook.md`.

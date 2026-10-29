@@ -208,7 +208,8 @@ so values sit in page cache and the number is index-only, 1 M bsky-shaped 61 B s
   | worst case (unique DID/key, no author-level prefix sharing) | 195.8 B/key | 86.4 B/key | **2.27×** |
 
   The 3.44× on the realistic keyspace corroborates the 3.2× deterministic accounting for `records`
-  (`bench/prefix-index/measure.rs`, re-run and unchanged: records 149→47 = 3.19×, backlinks
+  (a standalone prefix-index measurement program over synthetic firehose-shaped keys, re-run and
+  unchanged: records 149→47 = 3.19×, backlinks
   210→51 = 4.08× at block=32). The `BTreeMap`-of-blocks top level costs only ~2–3 B/key amortized
   (1/32 of a block-index entry). As the design predicted, the floor is now **`IndexEntry`-dominated**
   (40 B {ValuePtr 16, seq 8, version 16} of the ~64 B/key), so squeezing further means shrinking
@@ -267,9 +268,9 @@ exercise the FrontCodedIndex — only B1's HashIndex `Box<[u8]>`/owned-key-diges
   Unsorted/HashIndex/AE path*, but the front-coded **sorted-insert throughput regresses ~1.55× on
   hardware** — the deliberate RAM-for-CPU trade (3.44× resident index RAM for ~35% sorted-insert
   throughput). This residual write-CPU cost warrants a tracked follow-up (the RAM win is banked;
-  the sorted-insert re-encode is the price). Full numbers + the box-recipe fixes needed to run the
-  valsd cluster back-to-back (SIGKILL-teardown DPDK residue + the single-drive `serve_spdk_zoned`
-  path ignoring `format=true` / spinning on the 1 TiB region) are in `bench/b1-box-ab-notes.md`.
+  the sorted-insert re-encode is the price). The box A/B ran on 2026-07-06 (task 0027); running
+  the valsd cluster back-to-back needed two box-recipe fixes (SIGKILL-teardown DPDK residue, and
+  the single-drive `serve_spdk_zoned` path ignoring `format=true` / spinning on the 1 TiB region).
 
 **B1 — insert-CPU residual MITIGATED (2026-07-07, task 0066).** The O(block≈32)
 re-encode-per-insert cost that drove the ~1.55× sorted-insert regression above was reclaimed with an
@@ -283,8 +284,7 @@ residual gap vs the pre-B1 `BTreeMap` baseline (~406 k) narrows **1.55× → ~1.
 full scans stay flat. The **RAM win is intact** — capacity is kept tight via `reserve_exact` on the
 splice plus a builder `shrink_to_fit`, so `bytes/key` is flat at ~75 (local `file memprof`:
 317 k → 452 k keys/s, ~1.43× insert CPU, bytes/key 75.0 → 75.1–75.2; the packed encoding format is
-unchanged, so `bench/prefix-index/measure.rs` accounting still holds). Full numbers in
-`bench/b1-box-ab-notes.md`.
+unchanged, so the prefix-index accounting above still holds).
 
 Historical note — the two integration options the design weighed (now moot):
   1. **Compress both indices together** — the front-coded store owns keys *and* versions. This is
@@ -386,8 +386,8 @@ is real but is plumbing, not the hard parts.
 
 ### Engine-wide key filter (0364)
 
-**Why.** Step 2 used to probe every resident run's filter. FULL1
-(`bench/0363-compact-values/FULL1-FINDINGS.md`) measured about 0.4 µs per extra run, and
+**Why.** Step 2 used to probe every resident run's filter. FULL1 (task 0363's
+whole-cache replay of 2026-10-02) measured about 0.4 µs per extra run, and
 shard µs/write rose 4.37 → 7.19 as runs/engine rose 2.9 → 10.1. The merge input cap keeps
 run count O(data). Since 0381 runs too large for a capped merge are frozen, so run count
 grows ~linearly with data ÷ cap: about 100 runs/engine at 160 GB of run index. That is
@@ -428,8 +428,12 @@ give 99.6%. Growing such a filter needs the keys again.
   sinks or the floor. If a permit is unavailable the chain keeps growing and retries later.
   Legacy mode (`VALS_KEY_FILTER_REBUILD=0`) retains the former geometric growth schedule
   (`VALS_KEY_FILTER_GROWTH_PCT=200`): the scaled 400k-key/5k-floor test measures seven
-  sub-filters, 2.48% FPR and 2.38 B/key. Local measurements and reproduction commands are
-  in `bench/0396-key-filter-rebuild/REPORT.md`; hardware confirmation remains task 0398.
+  sub-filters, 2.48% FPR and 2.38 B/key. In task 0396's local 100M-key file-backed
+  measurement (the ignored `keyfilter_file_ingest_measurement` harness in
+  `crates/vals-store/src/engine/tests/keyfilter_bench.rs`, run with
+  `VALS_KEY_FILTER_REBUILD=1` and `=0`), the shadow rebuild settled at 1.62 B per
+  live key against 2.38 for legacy growth (−32%), with a maximum checkpoint FPR of
+  0.78% against 1.42%; hardware confirmation remains task 0398.
 - **Sizing under concurrency.** Each sink reserves its expected key count on its sub-filter
   until the keys are counted, so concurrent flush/merge/cover-scan sinks cannot overfill one
   sub-filter. Each requested merge lane reserves the sum of **all** input entry counts,
@@ -455,7 +459,7 @@ give 99.6%. Growing such a filter needs the keys again.
   at 2 MiB granularity. With THP disabled (`never`) the kernel ignores the advice and the
   pages stay 4 KiB; the estimate then overstates only a sparsely filled sub-filter, briefly.
   In the L1 model this cut page-walk cycles inside `excludes` by 92% and its cycles by 25–30%
-  (`bench/0414-shard-growth/FINDINGS.md`).
+  (task 0414, 2026-10-13).
 - **Latency profile.** With the winner directory enabled the filter is off: no inserts, no
   cover-scans, no RAM. Its writes and reads use the directory instead.
 
@@ -503,7 +507,7 @@ shard thread in the same step that publishes the run:
     chunk between flush-commit steps too, so a long flush commit does not hold it. In the L1
     restart model (one shard, one lane, 62 GB of runs) this covers every reopened run in
     ~10 min instead of ~40 and cuts first-hour shard CPU per write by 12%
-    (`bench/0421-cover-restart/FINDINGS.md`).
+    (task 0421, 2026-10-13).
 
 **Shadow coverage and swap (0396).** Each run also has a RAM-only `rebuild_covered` flag:
 all of its keys must be in the current shadow generation before this is set. During a

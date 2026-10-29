@@ -3,7 +3,8 @@
 This is the operator guide for `valsd`, the vals server daemon. It covers
 building it, a local test cluster, every config key, the PD (control plane)
 and how to keep it available, storage profiles and sizing, SPDK provisioning,
-day-to-day administration, systemd, and the failure modes an operator sees.
+day-to-day administration, systemd, [monitoring](#monitoring), and the
+failure modes an operator sees.
 
 Which revision to run, what it was tested on and its known limits are in
 [`evaluation.md`](evaluation.md); before exposing any port, work through the
@@ -29,7 +30,8 @@ keys and their legacy environment aliases is in
 | `valsd dump -c <config> (--zone <name> \| --zone-id <id>) --out <path> [--skip-tombstones] [--parallel <N>]` | Export one zone's value log from a stopped (or file-backed) node. |
 | `valsd keyscan -c <config> --zone-id <id> --out-dir <dir> [--want-ids <file>] [--partition <N>]` | Offline diagnostic key listing; SPDK multi-drive layouts only. |
 
-Running `valsd` with no arguments prints the exact usage of each.
+`valsd --help` (or `valsd <subcommand> --help`) prints the exact usage of each,
+and `valsd --version` prints the version and the commit it was built from.
 
 **Signals.** `SIGTERM` and `SIGINT` shut a daemon down gracefully: it drains
 reads, flushes connections, syncs every engine, and persists the liveness
@@ -51,55 +53,16 @@ VALS_SPDK_LINK=1 cargo build --release -p vals-server --features spdk   # raw NV
 The SPDK build needs SPDK v24.09, hugepages and dedicated drives; see
 [`SPDK.md`](SPDK.md).
 
-## A three-node cluster in five minutes
+## A local test cluster
 
-This starts three data nodes and one PD on one machine with file-backed
-storage, the same shape the end-to-end test deploys. It is a development and
-test setup only: a single PD is not highly available, and changing the
-addresses to spread the data nodes over machines does not change that. Real
-deployments run three PDs ([PD config reference](#pd-config-reference)). For
-a minimal single-node deployment and how to grow it, see
-[`growing.md`](growing.md).
-
-```sh
-cargo build --release -p vals-server
-VALSD=$PWD/target/release/valsd
-
-mkdir -p /tmp/vals && cd /tmp/vals
-echo "demo-secret" > secret
-
-for i in 1 2 3; do
-  cat > node$i.conf <<EOF
-node_id  = $i
-listen   = 127.0.0.1:700$i
-data_dir = node$i
-$(for p in 1 2 3; do [ $p != $i ] && echo "peer = $p @ 127.0.0.1:700$p"; done)
-secret_file = secret
-EOF
-done
-
-cat > pd.conf <<EOF
-pd_id     = 1
-data_dir  = pd
-data_node = 1 @ 127.0.0.1:7001
-data_node = 2 @ 127.0.0.1:7002
-data_node = 3 @ 127.0.0.1:7003
-rf        = 3
-zone      = events 3 sorted
-admin_socket = pd.sock
-secret_file  = secret
-EOF
-
-for i in 1 2 3; do $VALSD node -c node$i.conf 2> node$i.log & done
-$VALSD pd -c pd.conf 2> pd.log &
-sleep 2
-
-$VALSD admin -s pd.sock ping
-$VALSD admin -s pd.sock members     # the three data nodes
-$VALSD admin -s pd.sock zones       # the sorted `events` zone
-```
-
-Stop everything with `pkill -x valsd` (SIGTERM). Clients connect with a
+The [README quick start](../README.md#run-it-a-local-three-node-cluster)
+starts three file-backed data nodes and one PD on one machine, the same shape
+the end-to-end test deploys, and sends traffic with the `kv` example client.
+That is a development and test setup only: a single PD is not highly
+available, and changing the addresses to spread the data nodes over machines
+does not change that. Real deployments run three PDs ([PD config
+reference](#pd-config-reference)). For a minimal single-node deployment and
+how to grow it, see [`growing.md`](growing.md). Applications connect with a
 `Coordinator` over `NetTransport`, as shown in
 [`getting-started.md`](getting-started.md#clients).
 
@@ -1409,7 +1372,121 @@ the footer, filter and index from the device before the manifest write.
   process-wide counters as Prometheus text over HTTP; every counter is exported
   as `vals_<name>` with its description as `# HELP`. The endpoint has no
   authentication, so bind it to a private address. Inside a process,
-  `observe::snapshot()` gives the same counters programmatically.
+  `observe::snapshot()` gives the same counters programmatically. What to
+  graph and alert on is in [Monitoring](#monitoring).
+
+## Monitoring
+
+Scrape every data node and every PD (`metrics = <addr>` in each config).
+Each process exports the whole counter set, so a PD shows node counters at
+zero and a node shows PD counters at zero; filter by job. Most counters do
+not carry a `_total` suffix, but they are Prometheus counters all the same,
+and gauges that summarize the engines (`vals_free_segments`,
+`vals_live_keys`, `vals_resident_runs`, `vals_engine_*`) refresh on the
+sweep cadence (`sweep`, 5 s by default). A scrape only sees a process that
+is up, so pair the alerts below with the scraper's own `up` and with
+systemd's view of the unit.
+
+What to watch, in rough order of urgency:
+
+| Signal | Metrics | Healthy |
+|---|---|---|
+| Restarts and integrity exits | process restarts (`up`, counter resets); `vals_integrity_fail_fast_total` is incremented only during the short shutdown before exit 75, so the authoritative record is the unit's `status=75` in the journal | no unplanned restarts |
+| In-RAM integrity failures (fail fast on repeat) | `vals_memtable_integrity_failures_total`, `vals_encode_integrity_failures_total{path="flush"\|"merge"}` | 0 |
+| Persisted damage (kept as evidence, reads fail) | `vals_store_corrupt_reads_total{kind=...}`, `vals_run_build_verify_failures_total` | 0 |
+| Durable-state write failures | `vals_watermark_persist_errors`, `vals_snapshot_errors`, `vals_compaction_errors` | 0 |
+| Writes refused with `Busy` | `vals_busy_rejections` (reserve floor; `vals_admit_shed_rejections` is the pre-floor share of it), `vals_ram_busy_rejections` (RAM budget), `vals_batch_apply_gate_busy`, `vals_scan_admission_busy`, `vals_transport_request_rejections` | near 0 outside bursts |
+| Request errors | `vals_server_errors` (in-band `Err` replies); quorum failures are decided by the client, so also watch your application's write and read error rate | low and flat |
+| Disk and segment headroom | `vals_region_exhausted_rejections` (writes refused with an error because a zone's region is full, not just `Busy`), `vals_min_zone_free_segments` (the zone closest to its maintenance floor), `vals_free_segments`, `vals_used_segments`, `vals_engine_free_fraction_ppm{engine="shard/zone"}`, `vals_compaction_plan_failures` | exhausted rejections 0; minimum well above the reserve; plan failures 0 |
+| Anti-entropy health | `vals_sweep_pass_age_seconds` (a frozen sweep), `vals_ae_dirty_buckets` and `vals_ae_dirty_oldest_ms` (repair backlog), `vals_ae_sync_errors` and `vals_ae_tree_token_exhaustions` (reconciles that gave up this pass), `vals_sweep_sorted_zones_held` (passes that skipped sorted zones waiting for a range-map push) | age ≈ `sweep`; dirty age bounded; held passes stop growing after boot |
+| Hinted handoff | Kept by the client's coordinator, not by `valsd`, so the `vals_hint*` series a node exports stay 0. Export `hints_recorded` (writes that missed a replica) and `hints_dropped` (queue full: anti-entropy, not a hint, heals that write) from your application via `vals_client::observe::snapshot()` | drops 0; recorded rate falls back to 0 after an outage |
+| Memory | `vals_process_resident_bytes`, `vals_process_swap_bytes`, `vals_ram_headroom_bytes` (0 means at or over the RAM budget and shedding writes, or that RAM admission is off: `vals_ram_budget_bytes` is 0 then) | headroom > 0 |
+| PD control plane | `vals_pd_push_failures`, `vals_pd_repushes`, `vals_pd_drive_errors`, `vals_pd_propose_errors`, `vals_pd_raft_send_drops`, `vals_pd_recovery_down_nodes`, `vals_pd_range_map_last_confirmed_age_seconds{endpoint=...}`, `vals_pd_state_headroom_bytes` | drive errors 0; down nodes 0; headroom > 0 |
+| Cluster identity | `vals_control_incarnation_rejected` (a node is being pushed by a PD it does not belong to) | 0 |
+
+There is no leader or term metric. Leader and term changes are visible in
+`valsd admin -s <pd.sock> status` on each replica (`leader=`, `term=`,
+`role=`), so sample that from a script or a textfile exporter if you want to
+alert on elections; a term that keeps rising means repeated elections, and
+`role=pre-candidate` with `leader=unknown` means that replica has no quorum
+([PD availability and recovery](#pd-availability-and-recovery)). Only the
+leader pushes config and polls nodes, so the push, repush, recovery and
+range-map-age metrics move only on the leader; `vals_pd_drive_errors` and
+`vals_pd_raft_send_drops` can rise on any replica.
+
+Example Prometheus rules. Adjust the windows and thresholds to your scrape
+interval and workload; the zero-tolerance ones are the important ones.
+
+```yaml
+groups:
+- name: vals
+  rules:
+  - alert: ValsIntegrityFailure
+    expr: |
+      increase(vals_memtable_integrity_failures_total[10m]) > 0
+        or increase(vals_encode_integrity_failures_total[10m]) > 0
+        or increase(vals_store_corrupt_reads_total[10m]) > 0
+        or increase(vals_run_build_verify_failures_total[10m]) > 0
+    labels: {severity: critical}
+    annotations: {summary: "vals integrity check failed on {{ $labels.instance }}"}
+  - alert: ValsNodeRestarted
+    expr: resets(vals_sweep_passes[1h]) > 0
+    labels: {severity: warning}
+    annotations: {summary: "vals node restarted on {{ $labels.instance }}; check the journal for status=75"}
+  - alert: ValsDurableWriteErrors
+    expr: |
+      increase(vals_watermark_persist_errors[10m]) > 0
+        or increase(vals_snapshot_errors[10m]) > 0
+        or increase(vals_compaction_errors[10m]) > 0
+    labels: {severity: critical}
+  - alert: ValsBusyRejections
+    expr: |
+      sum by (instance) (rate(vals_busy_rejections[5m]) + rate(vals_ram_busy_rejections[5m])
+        + rate(vals_batch_apply_gate_busy[5m]) + rate(vals_transport_request_rejections[5m])) > 1
+    for: 10m
+    labels: {severity: warning}
+    annotations: {summary: "{{ $labels.instance }} is refusing writes with Busy"}
+  - alert: ValsZoneNearFull
+    expr: vals_engine_free_fraction_ppm < 150000
+    for: 15m
+    labels: {severity: warning}
+    annotations: {summary: "engine {{ $labels.engine }} on {{ $labels.instance }} has under 15% free segments"}
+  - alert: ValsSweepStalled
+    expr: vals_sweep_pass_age_seconds > 60
+    for: 5m
+    labels: {severity: warning}
+  - alert: ValsRepairBacklog
+    expr: vals_ae_dirty_oldest_ms > 600000
+    for: 10m
+    labels: {severity: warning}
+    annotations: {summary: "a dirty anti-entropy bucket on {{ $labels.instance }} has waited over 10 min"}
+  - alert: ValsRegionExhausted
+    expr: increase(vals_region_exhausted_rejections[10m]) > 0
+    labels: {severity: critical}
+    annotations: {summary: "a zone region on {{ $labels.instance }} is full and refusing writes"}
+  - alert: ValsRamBudgetExhausted
+    expr: vals_ram_budget_bytes > 0 and vals_ram_headroom_bytes == 0
+    for: 5m
+    labels: {severity: warning}
+  - alert: ValsPdDataNodeDown
+    expr: vals_pd_recovery_down_nodes > 0
+    for: 2m
+    labels: {severity: warning}
+  - alert: ValsPdErrors
+    expr: |
+      increase(vals_pd_drive_errors[10m]) > 0
+        or increase(vals_pd_push_failures[10m]) > 20
+        or increase(vals_control_incarnation_rejected[10m]) > 0
+    labels: {severity: critical}
+  - alert: ValsPdStateNearCapacity
+    expr: vals_pd_state_capacity_bytes > 0 and vals_pd_state_headroom_bytes < 16 * 1024 * 1024
+    labels: {severity: warning}
+```
+
+`ValsNodeRestarted` fires on a counter reset of `vals_sweep_passes`, which
+grows on every data node and on nothing else. A PD has no counter that grows
+while it is idle, so catch PD restarts with the scraper's `up` or with
+systemd. After a planned rolling restart, expect one firing per node.
 
 ## Security checklist
 

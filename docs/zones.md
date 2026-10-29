@@ -310,7 +310,9 @@ response epoch (V1/V2 reports carry no readiness and still count). A former owne
 not-yet-forgotten copy is not load on the current owner, and an unready shard's
 physical estimate still includes range-deleted entries awaiting a fold: on the 0477
 ring arm these transient estimates, not owner load, triggered most debt re-homes
-(bench/0485-rehome-decisions). It only moves debt ranges touching the hottest over-threshold
+(task 0485's analysis of 2026-10-19: unready replies were 2,223 of 17,256 endpoint
+replies and exceeded the lowest replica of the same shard by more than 0.5M entries
+in 1,651 cases, so a different engine looked hot about every 10 s). It only moves debt ranges touching the hottest over-threshold
 node or engine, largest first, with at most one active move per zone.
 `pd_node_load_skew_pct` and `pd_engine_load_skew_pct` show current skew;
 `pd_rehome_debt_deferred_balanced` counts polls with eligible debt and a free
@@ -438,18 +440,19 @@ and `rehome_copy_restarts` count the copier's work. In a sorted zone with range
 tombstones each page's fragments are applied before its entries, and the next page
 starts at the page's resume key when it has one (`docs/range-deletes.md` §5).
 
-The protocol was validated on hardware in 2026-08 (3-node RF=2 cluster, 20M-key
+The protocol was validated on hardware on 2026-08-08 (task 0151: 3-node RF=2
+SPDK cluster, 20M-key
 sorted zone grown from a single range: 46 inherited ranges converged to zero
 unrehomed with no operator intervention, exact key counts and zero consistency
-errors through a SIGKILL'd owner mid-copy and a PD restart mid-move —
-`bench/lab-rehome-20260808/FINDINGS.md`). The client-parity gate is satisfied
+errors through a SIGKILL'd owner mid-copy and a PD restart mid-move). The
+client-parity gate is satisfied
 by task 0144: the current Go client decodes map-v2/v3 replies and routes by committed
 range tokens; older Go clients must be upgraded. Data-path fencing for stale
 coordinators landed in task 0150.
 
-Task 0168 re-ran that hardware churn protocol after the task 0155 progress-aware
-deadline, validated-resume, and abort-attribution changes
-(`bench/lab-rehome-20260810/FINDINGS.md`). Safety and convergence passed again:
+Task 0168 re-ran that hardware churn protocol on 2026-08-10, after the task
+0155 progress-aware deadline, validated-resume, and abort-attribution changes.
+Safety and convergence passed again:
 35 ranges reached zero unrehomed, the count was exactly 20M, and the churn oracle
 saw no consistency errors through a 164-second node outage and PD restart. The
 new counters showed 0 report-gap and 0 copy-stall aborts, but exposed a remaining
@@ -463,8 +466,8 @@ genuine outages. The task 0120 balance planner was likewise gated on that result
 it would reuse this protocol and could not execute while ordinary healthy writes
 still poisoned most moves.
 
-Task 0176 isolated and removed that blocker
-(`bench/lab-rehome-20260811-0176/FINDINGS.md`). The old mirror transport
+Task 0176 isolated and removed that blocker (hardware arm of 2026-08-11). The
+old mirror transport
 collapsed its two-second RPC deadline with unreachable/remote failures, and the
 target queued `BatchApply` behind a full eight-entry staged-read gate; the first
 deadline permanently poisoned the range even if a later retry accepted the same
@@ -679,8 +682,8 @@ consistency checks survived a node-service outage and PD restart, but movement,
 move-time failure recovery, and hysteresis convergence were necessarily unrun.
 Do not interpret zero copy or abort counters as a safety pass. Resolve the
 current-owner estimate-coherence blocker and rerun the complete gate before any
-default-on reconsideration. The evidence and exact limitations are in
-`bench/lab-balance-20260907-0182/FINDINGS.md`; hash/default-zone placement and
+default-on reconsideration. That is the whole of the evidence from the
+2026-09-07 gate; hash/default-zone placement and
 `vnodes` behavior were unchanged.
 
 **Auto-merge (shrink-reclaim) is opt-in (`0` = off by default).** The inverse of

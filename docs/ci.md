@@ -52,6 +52,6 @@ and eventfd.
 A green software CI run covers the in-memory and file backends. It says
 nothing about SPDK-linked builds or behaviour on real NVMe; those are checked
 by hand on hardware, as described in [`SPDK.md`](SPDK.md).
-[`validation.md`](validation.md) describes the validation tiers, from local
-tests up to full-scale hardware runs. Use the cheapest tier that can answer the
-question; hardware is for confirmation, and the full replay is a release gate.
+The maintainer's own hardware-validation tiers, from local tests up to
+full-scale runs on the lab cluster, are in [`validation.md`](validation.md);
+contributors don't need them.

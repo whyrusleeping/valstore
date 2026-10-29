@@ -55,8 +55,7 @@ For storage in the application process instead, see the [embedding guide](embedd
 
 **Try it from the command line.** `vals-client` ships a small runnable
 client, the `kv` example. With the local cluster from the
-[README quick start](../README.md#run-it-a-local-three-node-cluster) (or
-[`deploy.md`](deploy.md#a-three-node-cluster-in-five-minutes)) listening on
+[README quick start](../README.md#run-it-a-local-three-node-cluster) listening on
 127.0.0.1:7001-7003, run it from the repository root:
 
 ```sh

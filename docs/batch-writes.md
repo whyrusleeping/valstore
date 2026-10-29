@@ -176,10 +176,10 @@ round (new prepare and a new flush claim). Orphaned in-flight flushes are
 tracked and reaped by the shard. `finalize_shutdown` drains them, bounded to
 5 s, before the devices are closed.
 
-Measured (task 0303 AB01, two-node RF2/W2 device-sync on a server-bound dual-link
-client): about 2.7× fewer device flushes for the same group-commit count,
-response-ready 25–27 → 19–22 ms, and +14.2 % ACK KV/s (1.35 M vs 1.19 M).
-Evidence is in `bench/0303-flush-domain-ab/`.
+Measured (task 0303 AB01, 2026-09-24, two-node RF2/W2 device-sync on a server-bound dual-link
+client, six attempts in GNNGGN order, all passing the correctness gates): about 2.7× fewer device
+flushes for the same group-commit count, response-ready 25–27 → 19–22 ms, and +14.2 % ACK KV/s
+(1.35 M vs 1.19 M).
 
 The SPDK regression arm pins breadth at `All` and reports buffered versus
 device persistence for single writes and batch sizes 8/32/128:
@@ -192,23 +192,28 @@ cargo run --release -p vals-bench --features spdk -- \
 The final argument is coordinator count. Run it only on six disposable namespaces:
 the benchmark creates stores on the supplied devices.
 
-The network width gate is `vals-bench netbatchwrite`; the reproducible width/value/persistence
-matrix, captures, and fail-closed analyzer are in
-`bench/task-0186-blind-batchapply/`. Width 1 uses the ordinary single-write API and widths
+The network width gate is `vals-bench netbatchwrite`; task 0186 retained the reproducible
+width/value/persistence matrix, its captures and a fail-closed analyzer. Width 1 uses the ordinary single-write API and widths
 8/32/128/512 use explicit `BatchApply`, all at the same logical concurrency. The gate uses both
 100-byte and 256-byte values and buffered/requested-device persistence at W=2. A one-host 10 Gb/s
 payload ceiling is not treated as a server ceiling; server-capacity claims require distributed
-client generation when the local link is limiting.
+client generation when the local link is limiting. The valid buffered medians at 100-byte values
+were 235,941 logical writes/s at width 1 and 986,448 at width 32 (4.18×), 668,816 at 128 and
+693,550 at 512; at 256-byte values width 32 reached 0.94× of width 1 (1,324,591 vs 1,407,957),
+so batching showed no win there.
 
 The retained task-0186 gate also evaluated transparent single-write combining. The matched hardware
-off/25/50/100-us sweep found that combining reduced request count and median latency, but did not
-improve throughput and materially worsened p99. The default-off experiment and its transport queues,
-workers, and configuration were therefore removed. The historical harness and findings remain in
-`bench/task-0186-blind-batchapply/` as decision evidence, not as a supported interface.
+off/25/50/100-us sweep found that combining reduced request count and median latency (p50 3.8 →
+2.2–2.4 ms, about 2.9× fewer requests), but did not improve throughput (190,581 logical writes/s
+off versus 161–191k with combining) and materially worsened p99 (391 → 695–777 ms). The default-off experiment and its
+transport queues, workers, and configuration were therefore removed. The historical harness and
+findings stay in the maintainer's task-0186 records as decision evidence, not as a supported
+interface.
 
 The 256-byte explicit matrix also did not improve. The fixed-concurrency and first attempted
-"lower-load" device-persistent matrices overloaded the server gate; see
-`bench/task-0186-blind-batchapply/FINDINGS.md`. The final serial `COORDS=1`, one-global-call sweep
+"lower-load" device-persistent matrices overloaded the server gate (a representative width-1
+device arm reported about 39.0M errors out of 39.03M logical attempts and 76.99M gate-busy
+responses, so those arms are invalid capacity results). The final serial `COORDS=1`, one-global-call sweep
 completed widths 1/8/32/128/512 with zero errors or Busy responses and synced writes covering every
 physical write. A second paced matrix held logical concurrency at 512 and offered 100 logical
 writes/s at every width, also without errors or Busy. These validate sync-before-ack and group-commit

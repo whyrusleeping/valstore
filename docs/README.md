@@ -95,11 +95,17 @@ These record investigations and reviews. They explain past decisions, but
 some details are out of date.
 
 Design notes and history docs often cite four-digit numbers such as `0439`.
-Those are task ids in [`../backlog/`](../backlog.md). Paths under `bench/`
-point to experiment write-ups that are not included in this repository.
+Those are task ids in [`../backlog/`](../backlog.md), the maintainer's
+internal planning notes. The measurements those docs rely on are stated
+inline (the number, the date and the setup); the raw experiment write-ups
+behind them live in a local `bench/` tree that is not part of this
+repository, so a task id is a pointer to the maintainer's records, not to a
+file you can open here. [`validation.md`](validation.md) is likewise the
+maintainer's hardware-validation reference, and some of the lab scripts it
+names exist only on the lab machines.
 
-- [`validation.md`](validation.md): how changes are validated, from local
-  tests up to full-scale hardware runs.
+- [`validation.md`](validation.md): how the maintainer validates changes,
+  from local tests up to full-scale hardware runs on the lab cluster.
 - [`production-readiness-review-2026-08.md`](production-readiness-review-2026-08.md):
   an external-style review from August 2026. Most of its findings have since
   been fixed, and some were declined (transport encryption, for example). Its

@@ -229,7 +229,7 @@ explicitly chosen mode. External Rust consumers must deliberately adopt the
 finite defaults, pass reviewed custom values, or opt out. Independent Go
 clients are unchanged and do not acquire these Rust limits. Task 0279 supplies
 the reviewed benchmark/probe prerequisite. The task 0287 SPDK RF2 hardware gate
-(findings in `bench/0287-hardware-20260909/FINDINGS.md`, "Disposition") is an
+(run 2026-09-09, reviewed 2026-09-29) is an
 executed no-go for performance adoption: it validated finite-client fault
 behavior, but finite defaults cost 4.59%/6.78% median width-32 Digest/Quorum
 read throughput versus explicit-unbounded, and hardware hedge-loser
@@ -318,8 +318,11 @@ One-shot synchronous fallback never waits for a permit. `ae_seed_active` counts
 held permits and `ae_seed_permit_deferrals` counts skipped starts. On glibc,
 completed or shed seeds schedule an off-core `malloc_trim(0)` after seed
 activity quiets, at most once per thirty seconds; `VALS_AE_SEED_TRIM=0`
-disables it. A file-backed mass-reseed A/B is recorded in
-`bench/0323-seed-permit/report.md`.
+disables it. In task 0323's local file-backed mass-reseed A/B (sixteen stores
+seeded at once under a 180 MiB budget), the unlimited arm peaked 16.8 MB over
+budget and shed and restarted its seeds 48 times without completing one in
+8 s, while a cap of 4 seeded all sixteen stores exactly once in 1.4–1.8 s,
+and the scheduled trim cut retained RSS after seeding from 123.6 to 65.9 MB.
 
 Seed isolation (0374, `ae_seed_isolation=1` by default) keeps post-restart
 seeding off the apply path. Each shard's logical-accounting task is the only
@@ -354,9 +357,10 @@ shortens the seed rather than lowering its per-second cost. The streaming seed
 merges run heads with a binary heap, reuses a key's replica group and logical
 range while consecutive keys stay inside one range of the placement map, and
 counts folds (`ae_seed_fold_ops`) at every step end, including window-read
-checkpoints. In the one-shard L1 restart A/B (`bench/0422-seed-merge/FINDINGS.md`)
+checkpoints. In the one-shard L1 restart A/B (task 0422, 8B-equivalent state)
 this halved seed cycles per key and finished the post-restart seed at R+31
-instead of R+51 minutes.
+instead of R+51 minutes, cutting first-hour shard CPU per write by 15%
+(5.75 → 4.87 µs).
 
 Under isolation each shard runs at most one seed at a time, so driver seeds do
 not take an `ae_seed_concurrency` permit; they still count in `ae_seed_active`
@@ -493,8 +497,7 @@ had pushed mirror RPCs past their two-second deadline). The limit was raised fro
 the old gate capped the whole cluster at about 8 in-flight `PutBatch`es and shed
 beyond (PRESSURE01-K8 collapse). With 32, client depths 8 and 16 run without sheds,
 and master plus this change alone reached 930k ACK KV/s on the realistic two-node
-RF2/W2 device-sync fixture (`bench/0297-ingest-1m/scale01/FINDINGS.md`, attempt
-SCALE01-Y5). Admitted staged work stays bounded at about 32 sub-batches per shard
+RF2/W2 device-sync fixture (task 0297, SCALE01 attempt Y5, 2026-09-22). Admitted staged work stays bounded at about 32 sub-batches per shard
 (roughly 100 ms of serving-core work at 1,000 entries each), well below the 2 s
 mirror and 5 s client RPC deadlines. Depth 24 still shed against 32 (SCALE01-Y2).
 
@@ -514,8 +517,10 @@ one barrier, while buffered requests do not force one. A synchronized maintenanc
 burst (all shard engines flushing together under uniform load) inflates apply
 latency from hundreds of microseconds to several
 milliseconds and collapses intake for seconds at a time while the node sits
-otherwise idle (the task 0166 attribution,
-`bench/lab-bench-20260810-0166/notes.md`). Three mechanisms bound that
+otherwise idle (the task 0166 attribution of 2026-08-10 on a three-node SPDK
+cluster: four engines per node flushing ~116 MB run builds at once took server
+ops from the usual rate to 14–72k/s and apply latency from 250 µs to 4–11 ms,
+with node CPU near idle). Three mechanisms bound that
 interference. A process-wide duty-cycle pacer spreads maintenance device work
 over wall-clock time: each paced job charges its measured device work against
 a shared debt and sleeps the complementary share, so each maint worker (lane)
@@ -739,9 +744,11 @@ decoded one entry at a time) and merge heads, and materialized legacy sidecar ru
 the merge rather than retaining a canonical winner fold. An unpublished seed is
 discarded when RSS plus swap reaches the budget and restarted after headroom
 returns. Publication releases seed staging immediately; there is no separate
-published-winner disposal phase. The historical hardware evidence that motivated
-the RAM bounds is in
-`bench/replay-lab/run-20260807T195353Z-rambudget40g/FINDINGS.md`.
+published-winner disposal phase. The hardware evidence that motivated the RAM
+bounds is the task 0152 replay of 2026-08-07: a three-node RF2 SPDK cluster
+replaying 155M records under an explicit 40 GiB budget shed intake as designed,
+yet two of three nodes were OOM-killed at about 47 GiB because the growth was
+maintenance and anti-entropy working set, not intake.
 
 The responder side of anti-entropy bucket-digest paging is bounded to
 O(page) (task 0154): v3/v4 run sidecars are read through streaming cursors
@@ -754,11 +761,12 @@ thread yields between read windows. The `ae_digest_serve_bytes` gauge
 attributes the serving working set. Legacy v1/v2 sidecars still fully
 materialize. Before 0154 this path materialized O(keys × runs) per page,
 stayed admitted over the RAM budget (read-side), and OOM-killed a budgeted
-node in the 0152 run-2 replay
-(`bench/replay-lab/run-20260807T215938Z-rambudget40g-0153/FINDINGS.md`);
-the 0152 run-3 hardware validation confirmed the bound (digest serving peaked
-at tens of MB through replay and far-behind-peer healing, zero OOM kills:
-`bench/replay-lab/run-20260808T010817Z-rambudget40g-0154/FINDINGS.md`).
+node in the 0152 run-2 replay (2026-08-07: node 3 died at 48.97 GiB plus 8 GiB
+of swap under a 40 GiB budget); the 0152 run-3 hardware validation of
+2026-08-08 confirmed the bound (digest serving peaked at tens of MB through
+replay and far-behind-peer healing, node RSS peaked at 14.7 GiB, zero OOM
+kills, and a deliberately tight 8 GiB arm degraded to retryable `Busy` and
+recovered without a restart).
 
 ## Server-side availability under resource exhaustion
 

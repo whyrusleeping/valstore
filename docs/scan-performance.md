@@ -126,7 +126,7 @@ NetTransport hooks, and TCP tests for split/shard routing, limits, keys-only mod
 RT quorum pages, small budgets, re-home fences and old-peer rejection. Scalar
 reverse uses a one-query MultiScan; legacy ascending opcode 11 is unchanged.
 The batched transport/serving loops specialize by direction. The
-0484 aged-graph comparison (`bench/0484-reverse/FINDINGS.md`) verifies natural-time
+0484 aged-graph comparison (2026-10-17) verifies natural-time
 latest-N with exact values on file and SPDK backends. Versus inverted-time
 ascending scans, reverse latest-N costs 1.89× local / 1.67× SPDK median latency
 on this many-overlapping-run shape. Matched pre-reverse/candidate arms show no
@@ -243,12 +243,12 @@ reads at depth, so cutting device reads 64× barely moves the wall clock; the ~6
 file/page-cache figure above is the CPU-bound rate with *zero* device-read cost and
 does not hold as a wall-time ratio on NVMe. Raising the wall-clock rate is the domain
 of the scan-pipeline follow-ons (task 0049) and sharded sorted-zone serving (task
-0050, more cores across a range). Full numbers + serving-impact detail:
-`bench/cocompact-box-notes.md`. *(Post-script, task 0049: the scan-pipeline
+0050, more cores across a range). Serving impact during the 166 s off-core
+co-compaction on the box: reads kept being served at 5,719 → 5,010 ops/s, with
+p50 160 → 161 µs and p99 257 → 737 µs, never a stall. *(Post-script, task 0049: the scan-pipeline
 follow-ons were box-validated — they buy concurrent-scan throughput (2.09×) and
 serving-core availability, and prefetch buys 1.12× at R=2, but a single scan's
-per-core ceiling stands; per-range sharding (0050) remains the wall-clock lever.
-See `bench/scanab-box-notes.md`.)*
+per-core ceiling stands; per-range sharding (0050) remains the wall-clock lever.)*
 
 ## Remaining roadmap (backlog)
 
@@ -263,7 +263,7 @@ See `bench/scanab-box-notes.md`.)*
   shuffled corpus dropped from 184 to 10 device spans over 64-key scan pages (~18×
   fewer reads). Box/SPDK validation on an aged sorted zone (task **0042**): **64×
   fewer scan device reads** at 20 M keys, durable space reclaim, serving continuity —
-  see the co-compaction section above and `bench/cocompact-box-notes.md`.
+  see the co-compaction section above.
   - **Superseded as the *recurring* default by task 0069** (below): co-compaction's
     measured wall-time benefit is only ~1.61× (device-read reduction ≠ scan speedup on
     the CPU-bound decode path), so paying it O(N) times per value on every merge was
@@ -323,7 +323,7 @@ See `bench/scanab-box-notes.md`.)*
   full-scan keys/s at RF=3/R=2** on SPDK (144,996 vs 128,903 at 10 M keys — the
   un-overlapped two-page LWW merge is pure serial time without prefetch), neutral
   (~0.98×) at RF=1/R=1 where the client merge is trivial; results byte-identical
-  on vs off in both topologies. See `bench/scanab-box-notes.md`. A `ScanStream`
+  on vs off in both topologies. A `ScanStream`
   push op (server pushes successive budgeted pages behind a PROTO feature bit —
   option (a), which would also remove the per-page request decode) remains a
   possible future step.

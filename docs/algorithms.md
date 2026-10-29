@@ -444,8 +444,8 @@ none alone estimates time saved. Two 900-second pairs, including reversed order,
 measured pooled acknowledged KV throughput 57.613→72.872k/s (+26.5%) and source
 throughput 28.465→35.949k/s (+26.3%), with common-progress fold/projection work
 about 56% lower. RF2/W2 device-sync and rehome/split/AE/compaction stayed active;
-balance execution stayed off. Evidence and per-arm tail/debt caveats are in
-`bench/0294-ingest-optimization/phase6/20260913T052004Z/FINDINGS.md`.
+balance execution stayed off. The per-arm tail and debt caveats are in the
+task 0294 phase-6 checkpoint of 2026-09-13.
 Late slowdown remains; 200 Scan/Get samples per arm are not a full payload,
 version, or tombstone oracle. Direct readiness/debt proof and the final sustained
 one-hour gate remain in 0294; this checkpoint does not clear 0248.
@@ -487,8 +487,8 @@ Two structural extensions, no flag:
   strictly newer nonzero epoch; see the next subsection. Other boundary changes
   still invalidate counts and refold once.
 
-Measured on the two-node RF2/W2 device-sync realistic fixture
-(`bench/0297-ingest-1m/rangemap01/FINDINGS.md`): with the accepted one-lane client
+Measured on the two-node RF2/W2 device-sync realistic fixture (task 0297,
+RANGEMAP01, 2026-09-22): with the accepted one-lane client
 the change removed the work (seed starts 24→16, folds −37%) at +0.3% throughput,
 because shard threads were mostly idle; with a depth-4 pipelined client it gave
 +8.3% and +14.9% whole-write ACK KV/s in two matched pairs (post-first-split +18%
@@ -661,7 +661,8 @@ request-time range-token algorithm. Splits compare with raw byte ordering (`<=` 
 `&[u8]`). A map with more than 16 splits answers `range_index` from a lazily built
 16-way search tree of 8-byte key heads, which every split or merge drops. It returns
 the same count, and at R3's range counts it cuts the cost of the write path's two
-per-key searches by 58–72% (`bench/0442-range-index`).
+per-key searches by 58–72% (task 0442, three-node SPDK A/B at 17,000 ranges,
+2026-10-15: shard CPU per synced write fell 7.0%, 3.089 → 2.873 µs).
 
 ## 3. Per-node shard routing
 
@@ -885,8 +886,11 @@ in f that may hold a newer entry in O(log blocks). A page stops after
 filtered winner) with a resume key just above the last filtered key. Once the
 range tombstone's fold has completed, a scan that starts at the head of a deleted
 queue costs the same whatever the deleted span's length; before it, covered
-entries are filtered one by one in budget-cut pages
-(bench/0449-rt-hot-path/FINDINGS.md §3).
+entries are filtered one by one in budget-cut pages (measured in task 0449's
+`coord::range_delete_scan_cost_tests`: after the fold a 10k-entry and a
+200k-entry deleted span both cost one round, one block read and 500 filtered
+entries per replica, while before the fold the 200k span took 5 pages per
+replica).
 
 A client `limit` flows into the per-page `max` (the *remaining* need each
 round), so a small limit over a huge range pulls a few entries rather than the

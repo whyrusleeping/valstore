@@ -14,8 +14,8 @@ benches attach K controllers and spread partitions across them — 8 drives reac
 `Vec<(TcpListener, VersionedStore<D>)>`, i.e. each shard supplies its own engine
 over its own `BlockDevice`.
 
-**Status: built; named-zone SPDK JBOD path box-verified 2026-07-07 (task 0047,
-`bench/zoned-multidrive-box-notes.md`)** — format/boot, `zone_region_mib` sizing +
+**Status: built; named-zone SPDK JBOD path box-verified 2026-07-07 (task 0047)**
+— format/boot, `zone_region_mib` sizing +
 config validation, unsorted/sorted/default zones, both-drive shard spread, cross-node
 AE heal, device-driven zone reopen on `format=false` restart, zone drop→region
 reuse→no-resurrection, blank/pre-zoned reopen refusal, and per-partition watermark
@@ -231,12 +231,12 @@ Capacity plans must still leave 20–30% maintenance/free headroom in each targe
 zone and include observed worst-shard placement skew. Overrides remove reserved
 empty-slab tax; they do not permit one live engine to grow into a neighbor.
 
-The fresh three-node task-0202 hardware gate measured 39,729 physical writes/s
-with equal slabs and 40,101/s with variable extents over the same 3,291-second
-real-corpus window (+0.94%), with zero replay-window errors. A changed-config
-reopen preserved all persisted lengths and byte-identical target-zone scans; an
-oversized fourth zone failed without materializing or affecting existing scans.
-See `bench/task-0202-zone-geometry/FINDINGS.md` and its retained raw evidence.
+The fresh three-node task-0202 hardware gate (2026-08-14) measured 39,729
+physical writes/s with equal slabs and 40,101/s with variable extents over the
+same 3,291-second real-corpus window (+0.94%), with zero replay-window errors. A
+changed-config reopen preserved all persisted lengths and byte-identical
+target-zone scans; an oversized fourth zone failed without materializing or
+affecting existing scans.
 
 For direct per-engine measurements, the node admin socket accepts `zone-stats`.
 It returns CSV rows with `shard,zone_id,used_segments,free_segments,live_keys` and

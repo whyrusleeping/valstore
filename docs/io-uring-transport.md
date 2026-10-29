@@ -161,7 +161,8 @@ on a real NIC. Re-measure cross-box when a second box is available.
 
 ### 2026-06-19 — Phase 0 results + DECISION: do not implement io_uring
 
-**Bench artifact:** `bench/uring-ceiling/` (standalone crate, own `[workspace]`).
+**Bench artifact:** a standalone `uring-ceiling` crate (its own `[workspace]`,
+kept with the maintainer's local benchmark trees, not in this repository).
 Modes: `epoll` (ET readiness baseline), `uring` (single-shot Recv re-arm + Send),
 `uring-ms` (multishot Recv + provided buffers). Server pinned to 1 core, client on
 a disjoint core set. Box: `oldbox`, 48-core EPYC 9454P, kernel 6.8.
@@ -255,8 +256,9 @@ read-drain counts; `vals-bench netload` prints their aggregate when
 **How to reproduce:** bench runner `/tmp/run-ceiling.sh` (modes × pipeline sweep);
 syscall split `/tmp/perf-split.sh` (brings up the SPDK cluster via
 `spdk-cluster.sh start` as root with `SPDK_MEM_MB=2048`, loads 5M keys, backgrounds
-reads, runs `perf trace -s` + `perf record` on node1). Bench source is in-repo at
-`bench/uring-ceiling/`. Cluster start needs **root** on this box (DPDK can't use
+reads, runs `perf trace -s` + `perf record` on node1). The bench source is the
+standalone `uring-ceiling` crate named above, which is not in this repository.
+Cluster start needs **root** on this box (DPDK can't use
 IOVA=PA as non-root) and the `.spdk-cluster/` dir must not be left root-owned from
 a prior run.
 </content>

@@ -11,8 +11,12 @@ and mirror (0463), the cleanup handoff (0464), the AE `Busy` measurement with th
 inline fold turn (0465), backup VREC v2 and `VDUMP\x02` (0448), and the
 validation and docs slice (0449). Where the build differs from the text below,
 the text says so. Measurements: the head-of-queue counters and the zero-RT
-hot-path A/B in `bench/0449-rt-hot-path/FINDINGS.md`, AE `Busy` under
-continuous deletes in `bench/0465-rt-ae-busy/FINDINGS.md`. Operator notes are in
+hot-path A/B are task 0449's (2026-10-15; results in §"Validation plan" below),
+and the AE `Busy` measurement under continuous deletes is task 0465's
+(2026-10-15: before the inline fold turn, a queue consuming 200 entries/s with
+one delete per entry lost about 39% of its anti-entropy reconcile slots to
+fold-pending `Busy`; after it, 4–13%, and none at 12 deletes/s). Operator
+notes are in
 `deploy.md` §Range deletes, the client API in `getting-started.md`, and byte
 layouts in `formats.md`.
 
@@ -761,8 +765,8 @@ measures right after the first RT's fold completes.
 A separate case covers the moment between the RT and its fold. Covered memtable
 entries are filtered, and the covered-work budget caps them per page.
 
-*Result* (`coord::range_delete_scan_cost_tests`, recorded in
-`bench/0449-rt-hot-path/FINDINGS.md` §3): after the fold, cold, and after
+*Result* (`coord::range_delete_scan_cost_tests`, recorded by task 0449 on
+2026-10-15): after the fold, cold, and after
 compaction, N = 10k and N = 200k give the same rounds (one per responder), block
 reads, filtered entries (500 per replica before compaction, 0 after) and reply
 bytes, with 5 more index probes per replica at 20× the entries. Before the fold
@@ -774,17 +778,16 @@ show it.
 
 **Hot-path neutrality (zero RTs).**
 
-- Local tier first (`validation.md`): the write-path A/B
-  (`bench/0420-rangemap-borrow/ab.py`) and the read A/B
-  (`bench/0339-read-identity-check/ab.py`), ABBA pairs, comparing shard µs/write
-  and µs/read.
+- Local tier first (`validation.md`): the write-path A/B harness from task
+  0420 and the read A/B harness from task 0339, ABBA pairs, comparing shard
+  µs/write and µs/read.
 - The apply, read and scan paths change, so a box confirmation follows on lab-1
-  (`bench/0435-range-residual/ab.py`), one ABBA pair. Pass bar: no regression
-  beyond noise (±1% shard µs/op).
+  with task 0435's range-residual harness, one ABBA pair. Pass bar: no
+  regression beyond noise (±1% shard µs/op).
 - v6 runs keep `max_hlc` resident (8 B per block). `vals_run_fence_resident_bytes`
   must grow by no more than that. Engines with no RTs build no max tree.
 
-*Result* (`bench/0449-rt-hot-path/FINDINGS.md`, pass): lab-1 write +0.23% shard
+*Result* (task 0449, 2026-10-15, pass): lab-1 write +0.23% shard
 µs/write (idle-subtracted 0.0%); devbox point reads +0.75%, scans −1.1%, writes
 inside the shared box's noise; fence bytes +8 B per block exactly; no max tree built.
 

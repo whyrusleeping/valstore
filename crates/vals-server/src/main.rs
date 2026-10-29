@@ -55,18 +55,64 @@ fn install_signal_handlers() {
     }
 }
 
-fn usage() -> ExitCode {
-    eprintln!(
+fn usage_text() -> String {
+    format!(
         "usage:\n  valsd node -c <config> [--check-config]\n  valsd provision -c <config> \
          --device <pci>=<serial>... --confirm-destroy node-<id>\n  valsd pd -c <config> \
          [--check-config]\n  valsd admin -s <socket> <command...>\n  {}\n  {}\n  {}\n  {}\n\nsee docs/deploy.md",
         dump::USAGE, keyscan::USAGE, reenrol::USAGE, backup::USAGE
-    );
+    )
+}
+
+fn usage() -> ExitCode {
+    eprintln!("{}", usage_text());
     ExitCode::from(2)
+}
+
+pub(crate) fn version_line() -> String {
+    let features = if cfg!(feature = "spdk") { "spdk" } else { "none" };
+    format!(
+        "valsd {} ({}) features: {features}",
+        env!("CARGO_PKG_VERSION"),
+        env!("VALS_GIT_COMMIT")
+    )
+}
+
+fn print_help(text: &str) -> ExitCode {
+    println!("{text}");
+    ExitCode::SUCCESS
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args == ["--help"] || args == ["-h"] || args == ["help"] {
+        return print_help(&usage_text());
+    }
+    if args == ["--version"] || args == ["version"] {
+        println!("{}", version_line());
+        return ExitCode::SUCCESS;
+    }
+    if args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h") {
+        let help = match args[0].as_str() {
+            "node" => Some("usage: valsd node -c <config> [--check-config]"),
+            "pd" => Some("usage: valsd pd -c <config> [--check-config]"),
+            "admin" => {
+                return print_help(&format!(
+                    "usage: valsd admin -s <socket> <command...>\nadmin commands: help {}",
+                    admin::COMMANDS
+                ))
+            }
+            "provision" => Some("usage: valsd provision -c <config> --device <pci>=<serial>... --confirm-destroy node-<id>"),
+            "dump" => Some(dump::USAGE),
+            "keyscan" => Some(keyscan::USAGE),
+            "reenrol" => Some(reenrol::USAGE),
+            "backup" => Some(backup::USAGE),
+            _ => None,
+        };
+        if let Some(help) = help {
+            return print_help(help);
+        }
+    }
     match args.split_first() {
         Some((cmd, rest)) if cmd == "node" => match daemon_args(rest) {
             Some((path, true)) => check_node_config(path),

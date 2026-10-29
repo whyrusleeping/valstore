@@ -21,8 +21,8 @@ capacity/latency profiles.
 
 This survey inventories current product-side feature gates, compatibility fallbacks, tuning knobs,
 and public opt-in subsystems. It cross-checks the implementation against canonical docs, completed
-backlog decisions, retained hardware findings, current deployment runbooks, nearby consumers
-(`vals-examples`, `bootes`, and `indigo`), and introducing commits.
+backlog decisions, retained hardware findings, current deployment runbooks, nearby downstream
+consumers, and introducing commits.
 
 At the pre-cleanup survey checkpoint, the tree read **67 named `VALS_*` runtime variables outside
 tests and `vals-bench`**. This is a historical snapshot, not the post-0188–0193 count. Many were
@@ -218,12 +218,13 @@ project still claims and tests the explicit availability mode.
 
 - Productized by task 0194 as daemon `profile = latency`; capacity remains the default.
 - Evidence: mature overwrite median improved **1.57×**, mean **1.70×**, write-path probes fell to zero,
-  read p99 did not regress, and short-run AE/space checks passed. See task 0175 and
-  `bench/lab-bench-20260811-0175/notes.md`.
+  read p99 did not regress, and short-run AE/space checks passed (task 0175, three-node SPDK A/B,
+  2026-08-11).
 - Caution: it changes unconditional `Applied::Won` semantics, and argmax reader/recovery/Merkle
   prerequisites cannot be rolled back after unresolved candidates exist.
 - Decision: retained in the named latency profile rather than promoted by default. The
-  mixed-profile SPDK soak gate passed on 2026-10-22 (task 0194, `bench/0194-profile-soak/FINDINGS.md`).
+  mixed-profile SPDK soak gate (task 0194: 2 h, three PDs, three SPDK nodes × 8 shards, a restart
+  every 10 min, every correctness check passing) passed on 2026-10-22.
   Legacy readers cannot be restored; only the resolving writer is optional.
 
 ### Compact winner directory — keep as an explicit memory/performance tier

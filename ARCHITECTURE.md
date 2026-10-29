@@ -1033,13 +1033,14 @@ collected under a **grace period (`gc_grace`)**:
 
 ---
 
-## Planned subsystems
+## Subsystems beyond the core data path
 
-Subsystems that were part of the target architecture beyond the core data
-path. Most are now **✅ built** and link to their design docs; the ones that are
-not say so plainly. **Erasure coding is out of scope** under the current
-placement model (see the bullet below). Open items are tracked in the backlog
-(`backlog.md`).
+These subsystems were part of the target architecture beyond the leaderless
+read/write path described above. All of them are built; each bullet says what
+it does and links to its design doc. What was deliberately left out (erasure
+coding, automatic eviction) is listed under [Known limitations and open
+problems](#known-limitations-and-open-problems), and the remaining work is
+tracked in the backlog (`backlog.md`).
 
 - **Zones** — ✅ built for unsorted/hash **and sorted** zones, see
   [`docs/zones.md`](docs/zones.md). A zone is a per-node engine (storage) + a
@@ -1130,17 +1131,6 @@ placement model (see the bullet below). Open items are tracked in the backlog
   input, so a client detects exactly which writes failed and whether a failure
   still reached quorum. The fire-now / `await_tier`-later handle is deferred (the
   tier is chosen at submit time today); the general streaming barrier stays deferred.
-- **Erasure coding — out of scope.** Placement is whole-value "next RF nodes,"
-  which is *not* erasure-coding-ready: EC needs per-shard-of-a-value placement.
-  The spec's earlier EC-ready aspiration is **withdrawn** (decision 2026-06-27);
-  EC stays out of scope unless placement is first redesigned around
-  per-shard metadata.
-- **Auto-eviction policy (detector → PD).** The failure detector itself is **built**
-  and routing-only (see [Failure detection](#failure-detection) above). What stays
-  open is letting a *durably* down node feed `PdDaemon::remove_node` so the ring
-  reshapes automatically — deliberately deferred (it needs a conservative timeout so
-  a transient blip doesn't trigger data movement); membership is explicit join/leave
-  through the PD until then.
 - **Client backpressure and liveness** — ✅ built (`ClientConfig`,
   `Coordinator::with_credits`, `Coordinator::with_node_credits`), see
   [`docs/backpressure.md`](docs/backpressure.md). A default network coordinator
@@ -1261,8 +1251,24 @@ guarantees. 100-byte values unless stated.
 - Backpressure is per coordinator. There is no cluster-wide admission control,
   so past the throughput peak adding coordinators degrades throughput gently
   rather than refusing load.
-- Membership changes are explicit PD operations; a durably dead node is routed
-  around but not evicted automatically. Sloppy quorum is default-zone only.
+- Membership changes are explicit PD operations. The failure detector is
+  built and routing-only ([Failure detection](#failure-detection)): a durably
+  dead node is routed around but not evicted automatically. Feeding the
+  detector into `PdDaemon::remove_node` so the ring reshapes on its own is
+  deliberately deferred, because it needs a conservative timeout so that a
+  transient blip does not trigger data movement. Sloppy quorum is
+  default-zone only.
+- Erasure coding is out of scope. Placement is whole-value "next RF nodes",
+  which is not erasure-coding-ready (EC needs per-shard-of-a-value
+  placement). The earlier EC-ready aspiration was withdrawn on 2026-06-27;
+  it stays out unless placement is first redesigned around per-shard
+  metadata.
+- The batch write API chooses the durability tier at submit time; a
+  fire-now / `await_tier`-later handle and the general streaming durability
+  barrier are deferred ([`docs/batch-writes.md`](docs/batch-writes.md)).
+- The balance executor for sorted zones is built but default-off: the
+  hardware A/B that would justify turning it on has not run
+  ([`docs/zones.md`](docs/zones.md)).
 - On-core compaction steps briefly pause read admission on the shard (bounded
   quiesce per step), and the zoned/JBOD daemon path has no online drive
   add/retire.
