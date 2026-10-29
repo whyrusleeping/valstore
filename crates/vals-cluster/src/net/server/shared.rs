@@ -68,6 +68,7 @@ impl<D: BlockDevice> ServerShared<D> {
             sync_groups: RefCell::new(FastMap::default()),
             device_waits: Cell::new(0),
             domain_flushes: RefCell::new(Vec::new()),
+            flush_interrupt: Arc::new(reactor::Notify::new()),
             sweep_notify: reactor::Notify::new(),
             logical_accounting_notify: reactor::Notify::new(),
             seed_driver: Cell::new(false),

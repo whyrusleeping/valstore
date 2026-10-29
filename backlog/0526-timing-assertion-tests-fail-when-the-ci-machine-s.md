@@ -1,7 +1,7 @@
 ---
 id: "0526"
 title: Timing-assertion tests fail when the CI machine's CPUs are saturated
-status: proposed
+status: in_review
 priority: 4
 created: "2026-10-29"
 updated: "2026-10-29"
@@ -17,3 +17,5 @@ Proposal: make these assertions robust to starvation (logical progress counts in
 ## Acceptance criteria
 
 ## Work log
+
+- 2026-10-29 (uncommitted, in the main worktree; accepted by the owner as part of "fix the identified test issues"): fixed the four tests above plus vals-server `daemon.rs` `three_node_cluster_with_pd_serves_zones_and_survives_restart` (node 1 `ops >= 100` now polled while reads are sent to node 1). Root causes and changes are in plans/testing-notes.md ("CPU saturation"); notably the rehome_regroup timeout was a port collision (node 2 and PD metrics), fixed by holding all port reservations while allocating. Kill-the-fix: each test fails with its guarded behaviour removed (scan-lane reservation 0; cleanup cutoff disabled / stop ignored; reconnect reset no-op; span regrouping instead of invalidation; server op counter no-op). Each target passed 5/5 beside `stress -c 160`; vals-cluster lib passed unloaded (1008 passed). Not yet done: the acceptance's three full `scripts/ci.sh` runs beside `stress -c 160` (deliberately not run on the shared devbox while other sessions build).

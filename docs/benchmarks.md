@@ -128,6 +128,32 @@ the median point read in the same phase.
 Each node process held 0.6–0.7 GiB of RSS, and each node host's CPUs were
 under 6% busy.
 
+### Device-durable phases after the off-thread sync (single host)
+
+The tables above were measured before task 0523. Since then, the file backend
+runs a device sync (`fdatasync`) on a helper thread, and the node keeps
+serving while it runs (see [below](#what-the-numbers-show)). These runs used
+the same host and recipe on 2026-10-29. Each arm loaded a fresh 4M-key dataset
+(1M keys for 64 in flight) and ran only `write-device` and then
+`mixed-device`. The "before" rows are the previous `valsd`, measured in the
+same session.
+
+| Phase | In flight | Load | Before: ops/s | Before: p50 / p95 / p99 (ms) | After: ops/s | After: p50 / p95 / p99 (ms) |
+|---|---:|---|---:|---|---:|---|
+| write-device | 256 | saturated | 2,604 | 65.9 / 283 / 435 | 11,085 | 24.4 / 27.3 / 28.0 |
+| write-device | 256 | moderate | 1,296 | 35.1 / 52.7 / 58.2 | 5,534 | 18.5 / 26.0 / 27.3 |
+| mixed-device | 256 | saturated | 10,681 | write 38.3 / 50.7 / 63.5<br>read 19.1 / 27.4 / 28.5 | 40,351 | write 21.9 / 27.2 / 28.6<br>read 1.11 / 2.62 / 3.78 |
+| mixed-device | 256 | moderate | 5,328 | write 40.2 / 52.6 / 55.9<br>read 25.9 / 40.3 / 49.6 | 18,899 | write 20.3 / 27.1 / 28.3<br>read 0.81 / 2.27 / 3.02 |
+| write-device | 64 | saturated | 1,497 | 40.9 / 57.7 / 67.8 | 2,684 | 25.3 / 28.3 / 29.0 |
+| mixed-device | 64 | saturated | 1,986 | write 40.6 / 55.6 / 57.9<br>read 28.8 / 43.4 / 51.6 | 10,208 | write 23.5 / 28.4 / 29.5<br>read 0.66 / 1.99 / 2.57 |
+
+Before the change, saturated runs at 256 in flight took 202k (`write-device`)
+and 3.7k (`mixed-device`) `Busy` retries. After it, no run took any. Every
+run finished with zero errors and a clean read-back. The moderate
+`mixed-device` run after the change reached 18,899 of its 20,175 ops/s target.
+At saturation the three nodes used 0.5 cores in all for `write-device` and
+1.8 for `mixed-device`.
+
 ## What the numbers show
 
 - **One serving thread per node sets the ceiling.** At saturation each
@@ -139,23 +165,32 @@ under 6% busy.
   last-writer-wins order, an overwrite of a key that is already on disk may
   first have to read the stored version from the run that holds it.
 - **Device-durable writes are bound by device syncs.** On the file backend a
-  device sync is an `fsync` of the zone file. It runs on the node's serving
-  thread. With three nodes sharing one drive, each sync took 2.5–25 ms, about
-  10 ms on average. Group commit lets concurrent
-  writes share one sync, but each node still completes only about 100 syncs
-  per second.
-  - Throughput tracks in-flight writes divided by latency (Little's law): 64
-    writes in flight gave 1.4k/s on one host and 2.7k/s on three.
-  - With 256 in flight, the nodes refused the excess with `Busy`.
-    Device-durable writes pass through `batch_apply_gate`, which allows 64
-    concurrent applies per shard by default. The
-    client's retries roughly doubled throughput, and p99 latency rose to
-    0.2–0.4 s.
-  - Reads on a node wait behind its syncs, which is why reads in
-    `mixed-device` had medians of 15–29 ms. If you need many device-durable writes per
-    second, raise `batch_apply_gate` (at most 256), keep in-flight
-    device-durable writes per node near the gate, and use drives with
-    power-loss protection, which sync faster.
+  device sync is a sync of the zone file. With three nodes sharing one drive,
+  each sync took 2.5–25 ms, about 11 ms on average, and each node completed
+  about 80–100 syncs per second. Group commit lets concurrent writes share one
+  sync, so throughput depends on how many writes each sync carries.
+  - In the main tables, the sync was an `fsync` on the node's single serving
+    thread, so the node served nothing else while it ran. Reads on a node
+    waited behind its syncs, which is why reads in `mixed-device` had medians
+    of 15–29 ms. Throughput tracked in-flight writes divided by latency
+    (Little's law): 64 writes in flight gave 1.4k/s on one host and 2.7k/s on
+    three. With 256 in flight, the nodes refused the excess with `Busy`,
+    because device-durable writes held a `batch_apply_gate` permit (64 per
+    shard by default) until acknowledged. The client's retries roughly
+    doubled throughput, and p99 latency rose to 0.2–0.4 s.
+  - Since task 0523, the sync is an `fdatasync` on a helper thread, and the
+    serving thread keeps serving reads and other writes while it runs. A
+    write waiting for the sync gives its gate permit back, so all the writes
+    that arrive during one sync join the next. On one host each sync carried
+    about 94 writes per node instead of 24, device-durable writes ran 1.8–4.3×
+    faster, and reads in `mixed-device` had medians of 0.7–1.1 ms
+    ([table](#device-durable-phases-after-the-off-thread-sync-single-host)).
+    Moving the sync off the thread without releasing the permit did not
+    help: `write-device` at 256 in flight then fell to 2.0k/s, because the
+    permits held by writes waiting for one sync left fewer for the next, and
+    the client took 520k `Busy` retries.
+  - For more device-durable writes per second, use drives with power-loss
+    protection, which sync faster.
 - **Independent disks help device durability most.** Moving from one host to
   three left buffered writes and warm reads within 25% of each other. With
   three hosts each node syncs its own drive, so device-durable writes and the

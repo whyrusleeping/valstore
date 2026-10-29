@@ -211,7 +211,11 @@ node settings and derived intervals are logged at startup.
 
 `batch_apply_gate` is startup-only. Size it for your client's batch-write
 depth, with headroom for shard fan-out and rehome mirrors: a client that keeps
-more batch applies in flight per shard than the gate allows gets `Busy`.
+more batch applies in flight per shard than the gate allows gets `Busy`. On
+the file backend, a device-durable request gives its permit back once its
+writes are applied, while it waits for the group commit's `fdatasync`, so the
+gate bounds applies in progress rather than writes waiting for the disk. On
+SPDK the request keeps its permit until it is acknowledged.
 
 ### Integrity fail-fast
 

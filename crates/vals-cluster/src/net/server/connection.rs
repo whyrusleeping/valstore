@@ -340,7 +340,7 @@ impl<D: BlockDevice + AsyncRead + 'static> ConnDriver<D> {
                 let inflight = InflightReadGuard::new(&out);
                 self.spawner.spawn(async move {
                     let _inflight = inflight;
-                    let Some(_batch_permit) = shared.batch_apply_gate.try_acquire() else {
+                    let Some(permit) = shared.batch_apply_gate.try_acquire() else {
                         crate::observe::counters().batch_apply_gate_busy.inc();
                         push_batch_apply_response(
                             &out,
@@ -350,6 +350,7 @@ impl<D: BlockDevice + AsyncRead + 'static> ConnDriver<D> {
                         );
                         return;
                     };
+                    let mut batch_permit = Some(permit);
                     let mode = unconditional_apply_mode();
                     #[cfg(test)]
                     let mode = if vals_store::winner_directory_operational() {
@@ -369,6 +370,7 @@ impl<D: BlockDevice + AsyncRead + 'static> ConnDriver<D> {
                         mode,
                         if fill { LiveFloor::Waive } else { LiveFloor::Enforce },
                         fenced.as_ref(),
+                        &mut batch_permit,
                     )
                     .await;
                     if matches!(resp, Response::Err(_)) {

@@ -28,6 +28,7 @@ pub struct WriteState {
     done: AtomicBool,
     err: AtomicBool,
     timing: Option<Box<WriteTiming>>,
+    waker: Option<Box<std::sync::Mutex<Option<std::task::Waker>>>>,
 }
 
 struct WriteTiming {
@@ -41,6 +42,19 @@ impl WriteState {
             done: AtomicBool::new(false),
             err: AtomicBool::new(false),
             timing: None,
+            waker: None,
+        })
+    }
+
+    /// A pending state that another thread completes on its own, without the
+    /// device being polled; a waiter registers a waker with
+    /// [`WriteHandle::register_waker`] instead of polling.
+    pub fn waking_pending() -> Arc<Self> {
+        Arc::new(WriteState {
+            done: AtomicBool::new(false),
+            err: AtomicBool::new(false),
+            timing: None,
+            waker: Some(Box::new(std::sync::Mutex::new(None))),
         })
     }
     pub fn timed_pending() -> Arc<Self> {
@@ -51,6 +65,7 @@ impl WriteState {
                 started: std::time::Instant::now(),
                 completion_ns: std::sync::atomic::AtomicU64::new(0),
             })),
+            waker: None,
         })
     }
     pub fn complete(&self, success: bool) {
@@ -59,7 +74,13 @@ impl WriteState {
             timing.completion_ns.store(ns + 1, AtomicOrdering::Release);
         }
         self.err.store(!success, AtomicOrdering::Relaxed);
-        self.done.store(true, AtomicOrdering::Relaxed);
+        self.done.store(true, AtomicOrdering::Release);
+        if let Some(slot) = &self.waker {
+            let waker = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
     }
 }
 
@@ -77,7 +98,18 @@ impl WriteHandle {
         WriteHandle { state }
     }
     pub fn is_done(&self) -> bool {
-        self.state.done.load(AtomicOrdering::Relaxed)
+        self.state.done.load(AtomicOrdering::Acquire)
+    }
+    /// Wakes `waker` when the handle completes. Returns `false` for a handle
+    /// that only completes while its device is polled (`poll_writes`). Check
+    /// [`is_done`](Self::is_done) after registering: a handle that completed
+    /// before the call does not wake.
+    pub fn register_waker(&self, waker: &std::task::Waker) -> bool {
+        let Some(slot) = &self.state.waker else {
+            return false;
+        };
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker.clone());
+        true
     }
     pub fn completed_at(&self) -> Option<std::time::Instant> {
         let timing = self.state.timing.as_ref()?;
@@ -295,6 +327,12 @@ pub trait BlockDevice: Send + Sync + 'static {
         None
     }
 
+    /// `true` when `submit_flush` handles complete on another thread and wake a
+    /// registered waker, so waiting for a flush needs no device polling.
+    fn flush_completes_off_thread(&self) -> bool {
+        false
+    }
+
     /// Identity of the durability domain one device cache flush covers: every
     /// handle returning the same key shares one namespace, so a flush submitted
     /// through any of them persists writes completed through all of them.
@@ -388,6 +426,9 @@ macro_rules! forward_block_device {
             }
             fn submit_flush(&self) -> Option<WriteHandle> {
                 (**self).submit_flush()
+            }
+            fn flush_completes_off_thread(&self) -> bool {
+                (**self).flush_completes_off_thread()
             }
             fn flush_domain(&self) -> Option<usize> {
                 (**self).flush_domain()
@@ -626,6 +667,32 @@ pub struct FileBlockDevice {
     num_blocks: u64,
     file: File,
     identity: Arc<u8>,
+    flusher: Arc<std::sync::OnceLock<Option<Flusher>>>,
+}
+
+struct Flusher {
+    jobs: std::sync::mpsc::Sender<Arc<WriteState>>,
+}
+
+impl Flusher {
+    fn spawn(file: &File) -> Option<Flusher> {
+        let file = file.try_clone().ok()?;
+        let (jobs, queued) = std::sync::mpsc::channel::<Arc<WriteState>>();
+        std::thread::Builder::new()
+            .name("vals-fsync".into())
+            .spawn(move || {
+                while let Ok(first) = queued.recv() {
+                    let mut batch = vec![first];
+                    batch.extend(queued.try_iter());
+                    let synced = file.sync_data().is_ok();
+                    for state in batch {
+                        state.complete(synced);
+                    }
+                }
+            })
+            .ok()?;
+        Some(Flusher { jobs })
+    }
 }
 
 impl FileBlockDevice {
@@ -643,6 +710,7 @@ impl FileBlockDevice {
             num_blocks,
             file,
             identity: Arc::new(0),
+            flusher: Arc::default(),
         })
     }
 
@@ -654,6 +722,7 @@ impl FileBlockDevice {
             num_blocks: len / block_size as u64,
             file,
             identity: Arc::new(0),
+            flusher: Arc::default(),
         })
     }
 }
@@ -690,8 +759,22 @@ impl BlockDevice for FileBlockDevice {
     }
 
     fn flush(&self) -> Result<()> {
-        self.file.sync_all()?;
+        self.file.sync_data()?;
         Ok(())
+    }
+
+    /// `fdatasync` on a helper thread shared by this device and its siblings.
+    /// It covers every write that returned before the call. Flushes queued
+    /// while one runs share the next `fdatasync`.
+    fn submit_flush(&self) -> Option<WriteHandle> {
+        let flusher = self.flusher.get_or_init(|| Flusher::spawn(&self.file)).as_ref()?;
+        let state = WriteState::waking_pending();
+        flusher.jobs.send(state.clone()).ok()?;
+        Some(WriteHandle::pending(state))
+    }
+
+    fn flush_completes_off_thread(&self) -> bool {
+        true
     }
 
     fn sibling(&self) -> Result<Self> {
@@ -700,6 +783,7 @@ impl BlockDevice for FileBlockDevice {
             num_blocks: self.num_blocks,
             file: self.file.try_clone()?,
             identity: self.identity.clone(),
+            flusher: self.flusher.clone(),
         })
     }
 }
@@ -800,6 +884,46 @@ mod tests {
         assert_eq!(r[0], 0);
         assert_eq!(r[1], 1);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn file_submit_flush_completes_off_thread_and_wakes_the_waiter() {
+        struct Wakes(std::sync::Mutex<Vec<String>>, std::sync::Condvar);
+        impl std::task::Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                let name = std::thread::current().name().unwrap_or_default().to_string();
+                self.0.lock().unwrap().push(name);
+                self.1.notify_all();
+            }
+        }
+        let path = temp_path("submit-flush");
+        let dev = FileBlockDevice::create(&path, BS, 4).unwrap();
+        let sibling = dev.sibling().unwrap();
+        assert!(Arc::ptr_eq(&dev.flusher, &sibling.flusher));
+        for round in 0..3u8 {
+            dev.write_at(u64::from(round), &vec![round + 1; BS]).unwrap();
+            let wakes = Arc::new(Wakes(std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new()));
+            let handle = if round == 1 { sibling.submit_flush() } else { dev.submit_flush() }.unwrap();
+            assert!(handle.register_waker(&std::task::Waker::from(wakes.clone())));
+            let mut woken = wakes.0.lock().unwrap();
+            while woken.is_empty() && !handle.is_done() {
+                woken = wakes.1.wait_timeout(woken, std::time::Duration::from_secs(10)).unwrap().0;
+            }
+            assert!(handle.is_done());
+            assert!(woken.iter().all(|name| name == "vals-fsync"), "{woken:?}");
+            drop(woken);
+            assert!(handle.into_result().is_ok());
+        }
+        assert!(!WriteHandle::ready(Ok(())).register_waker(std::task::Waker::noop()));
+        drop((dev, sibling));
+        let dev = FileBlockDevice::open(&path, BS).unwrap();
+        let mut read = vec![0; BS * 3];
+        dev.read_at(0, &mut read).unwrap();
+        assert!(read.chunks(BS).enumerate().all(|(i, block)| block.iter().all(|&b| b == i as u8 + 1)));
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

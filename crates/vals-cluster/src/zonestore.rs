@@ -1150,6 +1150,9 @@ impl<D: BlockDevice> BlockDevice for SubDev<D> {
     fn submit_flush(&self) -> Option<WriteHandle> {
         self.parent.submit_flush()
     }
+    fn flush_completes_off_thread(&self) -> bool {
+        self.parent.flush_completes_off_thread()
+    }
     fn flush_domain(&self) -> Option<usize> {
         self.parent.flush_domain()
     }

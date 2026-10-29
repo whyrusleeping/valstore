@@ -131,7 +131,7 @@ versioned put/delete semantics described in
 
 `put` returning successfully is not a device-durability barrier. Call
 `Engine::sync()` and check its result before promising durable completion.
-For `FileBlockDevice`, the flush reaches `File::sync_all`; the filesystem,
+For `FileBlockDevice`, the flush reaches `File::sync_data` (`fdatasync`); the filesystem,
 operating system, device, and power-loss behavior still determine the actual
 persistence guarantee. The example also syncs the new directory entry and its
 parent. Your application owns provisioning, directory durability, exclusive

@@ -393,6 +393,58 @@ impl<D: BlockDevice> Drop for FlushWait<'_, D> {
     }
 }
 
+struct FlushWake {
+    interrupt: std::sync::Weak<reactor::Notify>,
+    task: Mutex<Option<Waker>>,
+}
+
+impl std::task::Wake for FlushWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let task = self.task.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(task) = task {
+            task.wake();
+        }
+        if let Some(interrupt) = self.interrupt.upgrade() {
+            interrupt.signal();
+        }
+    }
+}
+
+async fn wait_for_woken_flush<D: BlockDevice>(
+    shared: &ServerShared<D>,
+    flush: &vals_spdk::WriteHandle,
+) -> bool {
+    let wake = Arc::new(FlushWake {
+        interrupt: Arc::downgrade(&shared.flush_interrupt),
+        task: Mutex::new(None),
+    });
+    if !flush.register_waker(&Waker::from(wake.clone())) {
+        return false;
+    }
+    std::future::poll_fn(|cx| {
+        *wake.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(cx.waker().clone());
+        if flush.is_done() {
+            return Poll::Ready(());
+        }
+        for _ in 0..2 {
+            if Pin::new(&mut shared.flush_interrupt.notified()).poll(cx).is_pending() {
+                break;
+            }
+        }
+        if flush.is_done() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    true
+}
+
 async fn sync_store<D: BlockDevice>(
     shared: &ServerShared<D>,
     store: &RefCell<VersionedStore<D>>,
@@ -420,6 +472,12 @@ async fn sync_store<D: BlockDevice>(
             Err(e) => classify(e),
         };
     };
+    if wait_for_woken_flush(shared, &flush).await {
+        return match flush.into_result() {
+            Ok(()) => SyncResult::Ok,
+            Err(e) => SyncResult::Err(format!("device flush failed: {e}")),
+        };
+    }
     let _wait = DeviceWait::new(&shared.device_waits);
     let mut flush = FlushWait {
         shared,
@@ -452,6 +510,7 @@ pub(super) fn note_single_apply_written(applied: Applied, value_bytes: usize) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn serve_mirrored_batch_apply<D: BlockDevice + AsyncRead>(
     shared: Rc<ServerShared<D>>,
     zone_id: ZoneId,
@@ -463,6 +522,7 @@ pub(super) async fn serve_mirrored_batch_apply<D: BlockDevice + AsyncRead>(
     mode: ApplyMode,
     floor: LiveFloor,
     fenced: Option<&FencedWrites>,
+    permit: &mut Option<super::read_gate::InflightGuard<'_>>,
 ) -> Response {
     let response = serve_batch_apply_with(
         Some(shared.as_ref()),
@@ -474,6 +534,7 @@ pub(super) async fn serve_mirrored_batch_apply<D: BlockDevice + AsyncRead>(
         sync,
         mode,
         floor,
+        permit,
     )
     .await;
     mirror_batch_response(shared, zone_id, writes, response, sync, fenced).await
@@ -490,7 +551,7 @@ pub(super) async fn serve_batch_apply<D: BlockDevice + AsyncRead>(
     sync: bool,
     mode: ApplyMode,
 ) -> Response {
-    serve_batch_apply_with(shared, zone_id, store, dev, gate, writes, sync, mode, LiveFloor::Enforce).await
+    serve_batch_apply_with(shared, zone_id, store, dev, gate, writes, sync, mode, LiveFloor::Enforce, &mut None).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -504,6 +565,7 @@ pub(super) async fn serve_batch_apply_with<D: BlockDevice + AsyncRead>(
     sync: bool,
     mode: ApplyMode,
     floor: LiveFloor,
+    permit: &mut Option<super::read_gate::InflightGuard<'_>>,
 ) -> Response {
     let started = std::time::Instant::now();
     let wall_ms = crate::hlc::physical_now_ms();
@@ -527,6 +589,9 @@ pub(super) async fn serve_batch_apply_with<D: BlockDevice + AsyncRead>(
             }
         }
         if sync {
+            if dev.flush_completes_off_thread() {
+                permit.take();
+            }
             let synced = match shared {
                 Some(shared) => group_commit(shared, zone_id, store).await,
                 None => match store.borrow_mut().sync() {
@@ -678,6 +743,9 @@ pub(super) async fn serve_batch_apply_with<D: BlockDevice + AsyncRead>(
     }
 
     if sync {
+        if dev.flush_completes_off_thread() {
+            permit.take();
+        }
         let synced = match shared {
             Some(shared) => group_commit(shared, zone_id, store).await,
             None => match store.borrow_mut().sync() {

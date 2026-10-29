@@ -803,6 +803,7 @@
         blocking: Arc<AtomicUsize>,
         allow_blocking: bool,
         no_async: bool,
+        waking: bool,
     }
 
     impl AsyncFlushDevice {
@@ -821,6 +822,7 @@
                 blocking: Arc::new(AtomicUsize::new(0)),
                 allow_blocking: false,
                 no_async: false,
+                waking: false,
             }
         }
 
@@ -829,6 +831,16 @@
             dev.domain = Some(key);
             dev.allow_blocking = true;
             dev
+        }
+
+        fn complete_woken_flushes(&self, ok: bool) -> usize {
+            let held = std::mem::take(&mut *self.pending.lock().unwrap());
+            for (state, _, submitted) in &held {
+                let completed = self.oracle.tick();
+                self.oracle.flushes.lock().unwrap().push((*submitted, completed, ok));
+                state.complete(ok);
+            }
+            held.len()
         }
     }
 
@@ -879,7 +891,11 @@
                 return None;
             }
             self.submitted.fetch_add(1, Ordering::Relaxed);
-            let state = vals_spdk::WriteState::timed_pending();
+            let state = if self.waking {
+                vals_spdk::WriteState::waking_pending()
+            } else {
+                vals_spdk::WriteState::timed_pending()
+            };
             self.pending
                 .lock()
                 .unwrap()
@@ -891,7 +907,14 @@
             self.domain
         }
 
+        fn flush_completes_off_thread(&self) -> bool {
+            self.waking
+        }
+
         fn poll_writes(&self) -> i32 {
+            if self.waking {
+                return 0;
+            }
             let fail = self.fail.load(Ordering::Relaxed);
             let mut pending = self.pending.lock().unwrap();
             let mut done = 0;
@@ -933,6 +956,7 @@
                 blocking: self.blocking.clone(),
                 allow_blocking: self.allow_blocking,
                 no_async: self.no_async,
+                waking: self.waking,
             })
         }
     }
@@ -2152,6 +2176,7 @@
                 ApplyMode::Legacy,
                 LiveFloor::Enforce,
                 None,
+                &mut None,
             ),
             crate::reactor::poll_io,
         );
@@ -2226,6 +2251,7 @@
                         ApplyMode::Blind,
                         LiveFloor::Enforce,
                         None,
+                        &mut None,
                     )
                     .await,
                 )
@@ -3310,6 +3336,114 @@
         shard.shared.publish_domain_flushes();
         assert!(shard.shared.domain_flushes.borrow().is_empty());
         assert!(shard.dev.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_woken_flush_keeps_the_shard_serving_and_acks_only_after_the_flush_completes() {
+        struct CountWakes(AtomicUsize);
+        impl std::task::Wake for CountWakes {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let mut dev = AsyncFlushDevice::new(0);
+        dev.waking = true;
+        let shard = TestShard::new(dev);
+        let buffered = |writes: &[crate::wire::OwnedWrite]| {
+            let mut fut = Box::pin(serve_batch_apply(
+                Some(&shard.shared),
+                DEFAULT_ZONE,
+                shard.store.as_ref(),
+                shard.dev.as_ref(),
+                &shard.gate,
+                writes,
+                false,
+                ApplyMode::Legacy,
+            ));
+            drive(fut.as_mut(), Duration::from_secs(5))
+        };
+        let early = one_write("woken-early", 9_500);
+        assert!(matches!(buffered(&early), Some(Response::Batch(_))));
+
+        let durable = one_write("woken-durable", 9_501);
+        let mut permit = shard.shared.batch_apply_gate.try_acquire();
+        assert_eq!(shard.shared.batch_apply_gate.inflight(), 1);
+        let mut d = Box::pin(serve_batch_apply_with(
+            Some(&shard.shared),
+            DEFAULT_ZONE,
+            shard.store.as_ref(),
+            shard.dev.as_ref(),
+            &shard.gate,
+            &durable,
+            true,
+            ApplyMode::Legacy,
+            LiveFloor::Enforce,
+            &mut permit,
+        ));
+        poll_until(d.as_mut(), || shard.dev.submitted.load(Ordering::Relaxed) == 1);
+        assert_eq!(shard.shared.batch_apply_gate.inflight(), 0, "a write waiting on a woken flush holds no permit");
+        let durable_written = shard.dev.last_write.load(Ordering::SeqCst);
+        assert_eq!(shard.shared.device_waits.get(), 0, "the shard may block in epoll while the flush runs");
+        assert!(shard.shared.domain_flushes.borrow().is_empty());
+
+        assert!(shard.store.borrow().get(b"woken-early").unwrap().is_some(), "reads are served mid-flush");
+        let late = one_write("woken-late", 9_502);
+        assert!(matches!(buffered(&late), Some(Response::Batch(_))), "a buffered write completes mid-flush");
+        let wakes = Arc::new(CountWakes(AtomicUsize::new(0)));
+        let waker = Waker::from(wakes.clone());
+        let mut wait_cx = Context::from_waker(&waker);
+        for _ in 0..100 {
+            assert!(d.as_mut().poll(&mut wait_cx).is_pending(), "acked before its flush completed");
+        }
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0, "a woken flush is not polled");
+
+        let completer = shard.dev.clone();
+        assert_eq!(std::thread::spawn(move || completer.complete_woken_flushes(true)).join().unwrap(), 1);
+        assert!(wakes.0.load(Ordering::Relaxed) >= 1, "the completing thread wakes the leader");
+        let Poll::Ready(acked) = d.as_mut().poll(&mut wait_cx) else {
+            panic!("the leader is not done after its flush completed");
+        };
+        let acked_at = shard.dev.oracle.tick();
+        assert!(matches!(acked, Response::Batch(ref results) if results.len() == 1), "{acked:?}");
+        assert!(shard.dev.oracle.covered(durable_written, acked_at), "the ack precedes the covering flush");
+
+        let doomed = one_write("woken-failed", 9_503);
+        let mut f = shard.commit(&doomed);
+        poll_until(f.as_mut(), || shard.dev.submitted.load(Ordering::Relaxed) == 2);
+        assert_eq!(shard.dev.complete_woken_flushes(false), 1);
+        let failed = drive(f.as_mut(), Duration::from_secs(5));
+        assert!(matches!(failed, Some(Response::Err(ref e)) if e.contains("device flush failed")), "{failed:?}");
+        assert_eq!(shard.dev.submitted.load(Ordering::Relaxed), 2);
+        assert_eq!(shard.dev.blocking.load(Ordering::Relaxed), 0);
+        assert_eq!(shard.shared.device_waits.get(), 0);
+    }
+
+    #[test]
+    fn a_polled_flush_keeps_the_batch_permit_until_the_ack() {
+        let shard = TestShard::new(AsyncFlushDevice::new(3));
+        let writes = one_write("polled-permit", 9_600);
+        let mut permit = shard.shared.batch_apply_gate.try_acquire();
+        let mut d = Box::pin(serve_batch_apply_with(
+            Some(&shard.shared),
+            DEFAULT_ZONE,
+            shard.store.as_ref(),
+            shard.dev.as_ref(),
+            &shard.gate,
+            &writes,
+            true,
+            ApplyMode::Legacy,
+            LiveFloor::Enforce,
+            &mut permit,
+        ));
+        poll_until(d.as_mut(), || shard.dev.submitted.load(Ordering::Relaxed) == 1);
+        assert_eq!(shard.shared.batch_apply_gate.inflight(), 1);
+        assert!(matches!(drive(d.as_mut(), Duration::from_secs(5)), Some(Response::Batch(_))));
+        drop(d);
+        assert!(permit.is_some());
     }
 
     #[test]

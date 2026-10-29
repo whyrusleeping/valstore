@@ -179,6 +179,7 @@ pub(crate) struct ServerShared<D: BlockDevice> {
     sync_groups: RefCell<FastMap<ZoneId, SyncGroup>>,
     device_waits: Cell<usize>,
     domain_flushes: RefCell<Vec<DomainFlush>>,
+    flush_interrupt: Arc<reactor::Notify>,
     sweep_notify: reactor::Notify,
     logical_accounting_notify: reactor::Notify,
     seed_driver: Cell<bool>,
