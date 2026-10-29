@@ -282,6 +282,13 @@ fn render() -> String {
     out.push_str("# HELP vals_vlog_stall_us_total Total microseconds value-log appends spent blocked on a full inflight-write queue (process-wide).\n");
     out.push_str("# TYPE vals_vlog_stall_us_total counter\n");
     out.push_str(&format!("vals_vlog_stall_us_total {vlog_stall_us}\n"));
+    let (replay_skips, replay_skipped_bytes) = vals_store::vlog_replay_skip_totals();
+    out.push_str("# HELP vals_vlog_replay_skips_total Damaged value-log regions that replay skipped because intact records of the same segment incarnation follow them: mid-segment corruption, or blocks a crash left unwritten after the last sync (process-wide, counted at open and by segment reclaim).\n");
+    out.push_str("# TYPE vals_vlog_replay_skips_total counter\n");
+    out.push_str(&format!("vals_vlog_replay_skips_total {replay_skips}\n"));
+    out.push_str("# HELP vals_vlog_replay_skipped_bytes_total Bytes in the damaged value-log regions counted by vals_vlog_replay_skips_total (process-wide).\n");
+    out.push_str("# TYPE vals_vlog_replay_skipped_bytes_total counter\n");
+    out.push_str(&format!("vals_vlog_replay_skipped_bytes_total {replay_skipped_bytes}\n"));
     let (drain_count, drain_us, tail_count, tail_us) = vals_store::vlog_sync_totals();
     let (verify_bytes, verify_failures) = vals_store::run::run_build_verify_totals();
     out.push_str(&format!(

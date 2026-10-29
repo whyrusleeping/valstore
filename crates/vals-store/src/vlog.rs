@@ -15,6 +15,15 @@ static VLOG_SYNC_DRAIN_US: AtomicU64 = AtomicU64::new(0);
 static VLOG_SYNC_TAIL_COUNT: AtomicU64 = AtomicU64::new(0);
 static VLOG_SYNC_TAIL_US: AtomicU64 = AtomicU64::new(0);
 static VLOG_TAIL_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+static VLOG_REPLAY_SKIPS: AtomicU64 = AtomicU64::new(0);
+static VLOG_REPLAY_SKIPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub fn vlog_replay_skip_totals() -> (u64, u64) {
+    (
+        VLOG_REPLAY_SKIPS.load(Ordering::Relaxed),
+        VLOG_REPLAY_SKIPPED_BYTES.load(Ordering::Relaxed),
+    )
+}
 
 pub fn vlog_write_bytes() -> u64 {
     crate::attribution::normal_vlog_bytes() + VLOG_TAIL_WRITE_BYTES.load(Ordering::Relaxed)
@@ -1329,32 +1338,55 @@ pub fn replay_segment(buf: &[u8]) -> Result<(SegHeader, Vec<(u32, Record)>), Log
     let hdr = decode_seg_header(buf)?;
     let mut out = Vec::new();
     let mut off = SEG_HEADER_LEN;
-    while off + HEADER_LEN <= buf.len() {
-        let magic = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-        if magic != REC_MAGIC {
-            break;
-        }
-        let key_len = u32::from_le_bytes(buf[off + 6..off + 10].try_into().unwrap()) as usize;
-        let val_len = u32::from_le_bytes(buf[off + 10..off + 14].try_into().unwrap()) as usize;
-        let total = HEADER_LEN + key_len + val_len;
-        if off + total > buf.len() {
-            break;
-        }
-        match decode_record(&buf[off..off + total]) {
-            Ok(rec) => {
-                if rec.epoch != hdr.epoch {
-                    break;
+    while off < buf.len() {
+        if let Some(total) = record_extent(buf, off) {
+            match decode_record(&buf[off..off + total]) {
+                Ok(rec) if rec.epoch == hdr.epoch => {
+                    out.push((off as u32, rec));
+                    off += total;
+                    continue;
                 }
-                out.push((off as u32, rec));
-                off += total;
+                Err(LogError::Corrupt(BAD_KIND)) if intact_record_of_epoch(&buf[off..off + total], hdr.epoch) => {
+                    return Err(LogError::Unsupported("record kind"));
+                }
+                _ => {}
             }
-            Err(LogError::Corrupt(BAD_KIND)) if intact_record_of_epoch(&buf[off..off + total], hdr.epoch) => {
-                return Err(LogError::Unsupported("record kind"));
-            }
-            Err(_) => break,
         }
+        let Some(next) = next_intact_record(buf, off + 1, hdr.epoch) else {
+            break;
+        };
+        note_replay_skip(hdr.epoch, off, next);
+        off = next;
     }
     Ok((hdr, out))
+}
+
+fn record_extent(buf: &[u8], off: usize) -> Option<usize> {
+    if off + HEADER_LEN > buf.len() || buf[off..off + 4] != REC_MAGIC.to_le_bytes() {
+        return None;
+    }
+    let key_len = u32::from_le_bytes(buf[off + 6..off + 10].try_into().unwrap()) as usize;
+    let val_len = u32::from_le_bytes(buf[off + 10..off + 14].try_into().unwrap()) as usize;
+    let total = HEADER_LEN + key_len + val_len;
+    (off + total <= buf.len()).then_some(total)
+}
+
+fn next_intact_record(buf: &[u8], from: usize, epoch: u64) -> Option<usize> {
+    let first = REC_MAGIC.to_le_bytes()[0];
+    (from..buf.len().saturating_sub(HEADER_LEN - 1)).find(|&p| {
+        buf[p] == first
+            && record_extent(buf, p).is_some_and(|total| intact_record_of_epoch(&buf[p..p + total], epoch))
+    })
+}
+
+fn note_replay_skip(epoch: u64, from: usize, to: usize) {
+    VLOG_REPLAY_SKIPS.fetch_add(1, Ordering::Relaxed);
+    VLOG_REPLAY_SKIPPED_BYTES.fetch_add((to - from) as u64, Ordering::Relaxed);
+    log::warn!(
+        "value-log segment epoch {epoch}: bytes {from}..{to} hold no valid record but intact records of the \
+         same segment follow; skipping them (mid-segment corruption, or blocks a crash left unwritten after \
+         the last sync)"
+    );
 }
 
 fn intact_record_of_epoch(b: &[u8], epoch: u64) -> bool {
@@ -1611,11 +1643,34 @@ mod tests {
 
         let mut buf = read_segment(&dev, &alloc, SegmentId(0));
         let (_, recs) = replay_segment(&buf).unwrap();
-        let second_off = recs[1].0 as usize;
-        buf[second_off + KEY_OFF] ^= 0xFF;
-        let (_, recs2) = replay_segment(&buf).unwrap();
-        assert_eq!(recs2.len(), 1);
-        assert_eq!(recs2[0].1.key, b"k0");
+        let last_off = recs[2].0 as usize;
+        buf[last_off + KEY_OFF] ^= 0xFF;
+        let (_, torn) = replay_segment(&buf).unwrap();
+        assert_eq!(torn.iter().map(|(_, r)| r.key.clone()).collect::<Vec<_>>(), [b"k0".to_vec(), b"k1".to_vec()]);
+        buf[last_off..].fill(0);
+        let (_, unwritten) = replay_segment(&buf).unwrap();
+        assert_eq!(unwritten.len(), 2);
+    }
+
+    #[test]
+    fn replay_skips_mid_segment_corruption_and_recovers_later_records() {
+        let (dev, mut alloc, mut log) = setup();
+        for i in 0..4u32 {
+            log.append(&dev, &mut alloc, RecordKind::Put, 0, format!("k{i}").as_bytes(), b"v")
+                .unwrap();
+        }
+        log.sync(&dev).unwrap();
+
+        let mut buf = read_segment(&dev, &alloc, SegmentId(0));
+        let (_, recs) = replay_segment(&buf).unwrap();
+        let keys = |rs: &[(u32, Record)]| rs.iter().map(|(o, r)| (*o, r.key.clone())).collect::<Vec<_>>();
+        buf[recs[0].0 as usize + KEY_OFF] ^= 0x01;
+        let (_, after_bit_flip) = replay_segment(&buf).unwrap();
+        assert_eq!(keys(&after_bit_flip), keys(&recs[1..]));
+
+        buf[recs[1].0 as usize + 6] ^= 0x40;
+        let (_, after_bad_length) = replay_segment(&buf).unwrap();
+        assert_eq!(keys(&after_bad_length), keys(&recs[2..]));
     }
 
     #[test]

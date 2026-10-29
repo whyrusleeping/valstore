@@ -246,7 +246,7 @@ fn decoders_never_panic_on_arbitrary_bytes() {
 }
 
 #[test]
-fn replay_never_panics_on_mutated_segments_and_only_truncates() {
+fn replay_never_panics_on_mutated_segments_and_only_drops_records() {
     let mut r = Rng::new(0x0BAD_C0DE_DEAD_BEEF);
     for seed in 0..1200u64 {
         let (dev, alloc, _appended, _segs) = build_batch(&mut r);
@@ -259,18 +259,16 @@ fn replay_never_panics_on_mutated_segments_and_only_truncates() {
 
         let replayed = catch_unwind(AssertUnwindSafe(|| replay_segment(&m)));
         if let Ok(Ok((_, recs))) = replayed {
-            assert!(
-                recs.len() <= baseline.1.len(),
-                "mutation extended replay at seed {seed}: {} > {}",
-                recs.len(),
-                baseline.1.len()
-            );
+            let mut base_iter = baseline.1.iter();
             for (i, (off, rec)) in recs.iter().enumerate() {
-                let (base_off, base_rec) = &baseline.1[i];
+                let found = base_iter.by_ref().find(|(base_off, _)| base_off == off);
+                let Some((_, base_rec)) = found else {
+                    panic!("mutated replay returned record {i} at offset {off}, not a baseline record in order, seed {seed}");
+                };
                 assert_eq!(
-                    (off, &rec.key, &rec.value, rec.seq),
-                    (base_off, &base_rec.key, &base_rec.value, base_rec.seq),
-                    "mutated replay diverged from the valid prefix at index {i}, seed {seed}"
+                    (&rec.key, &rec.value, rec.seq),
+                    (&base_rec.key, &base_rec.value, base_rec.seq),
+                    "mutated replay diverged from the baseline record at offset {off}, seed {seed}"
                 );
             }
         }

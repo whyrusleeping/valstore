@@ -469,9 +469,23 @@ codec for the whole segment, so §2.1 has no separate record-format field (its
 and recovery does not replay those segments into the mutable index; their values
 remain reachable through run pointers.
 
-Replay walks records until the first non-`VAL2` magic, a torn/short record, or a
-record whose epoch differs from the segment header's (a prior-incarnation
-leftover) — whichever comes first marks the live tail. A CRC-valid record of the
+Replay walks records from the segment header. At a position that does not hold a
+valid record of the segment's epoch (a non-`VAL2` magic, a short or CRC-failing
+record, or a prior-incarnation leftover), it searches forward byte by byte for
+the next CRC-valid record of the segment's epoch. If there is none, the position
+is the live tail (a torn tail or the end of the data) and replay stops there
+silently, as before 0528. If there is one, the bytes in between are damaged
+inside the log, because an append-only segment only tears at its end. Replay
+skips them, keeps every intact record after them, logs a warning with the epoch
+and byte range, and counts the region in `vals_vlog_replay_skips_total` and its
+bytes in `vals_vlog_replay_skipped_bytes_total` (0528). Opening does not fail:
+the damaged records are lost, but the records after them stay recoverable. The
+counter is not proof of bit rot. Full value-log blocks are written asynchronously
+and can complete out of order, so a crash between syncs can leave a block
+unwritten before a written one; the records lost that way were never synced and
+so never acknowledged. Replay cannot tell such a gap from bit rot in synced
+records. Segment reclaim and `valsd dump` use the same replay, so they skip
+damaged regions too, and reclaim counts them in the same metrics. A CRC-valid record of the
 segment's epoch whose `kind` this release does not know is not a tail: replay
 fails with `LogError::Unsupported("record kind")` (0450).
 
