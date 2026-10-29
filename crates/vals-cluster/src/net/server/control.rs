@@ -59,6 +59,7 @@ pub(super) fn serve_control_request<D: BlockDevice>(
                 }
                 drop(ring);
                 shared.merge_peer_addrs(&addrs);
+                shared.fence_regained_copies();
                 shared.kick_sweep();
             } else {
                 log::debug!(
@@ -105,6 +106,7 @@ pub(super) fn serve_control_request<D: BlockDevice>(
                 shared.release_uncataloged_sorted();
                 shared.persist_catalog();
                 shared.expect_range_maps();
+                shared.fence_regained_copies();
                 shared.kick_sweep();
             } else {
                 log::debug!(
@@ -193,6 +195,7 @@ pub(super) fn serve_control_request<D: BlockDevice>(
                         .borrow_mut()
                         .retain(|(zone_id, lower), _| boundary_kept(zone_id, lower));
                 }
+                shared.fence_regained_copies();
                 shared.kick_sweep();
             } else {
                 log::debug!(

@@ -11,9 +11,11 @@ use vals_spdk::{AsyncRead, BlockDevice};
 use vals_store::EngineError;
 
 use crate::antientropy::{
-    cleanup_scoped, cleanup_scoped_zone, reconcile_scoped_gate as reconcile_scoped,
+    reconcile_scoped_gate as reconcile_scoped,
     reconcile_scoped_zone_gate as reconcile_scoped_zone, ForgetGate, DEFAULT_BUCKETS,
 };
+#[cfg(test)]
+use crate::antientropy::cleanup_scoped;
 use crate::coord::Transport;
 use crate::hlc::physical_now_ms;
 use crate::liveness::LivenessLog;

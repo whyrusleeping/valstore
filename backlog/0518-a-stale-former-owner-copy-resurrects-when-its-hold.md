@@ -1,7 +1,7 @@
 ---
 id: "0518"
 title: A stale former-owner copy resurrects when a membership change makes its holder an owner again
-status: todo
+status: done
 priority: 2
 created: "2026-10-28"
 updated: "2026-10-29"
@@ -11,6 +11,7 @@ spec_refs: []
 ---
 
 ## Description
+
 Found by 0515's review. A node keeps a put for a key it no longer owns when every owner refuses the cleanup handoff, for example when the owners have already collected a newer tombstone (the 0038 admission floor). That copy stays on the node indefinitely.
 
 0515 fences the re-home path. When `gc_grace > 0`, the copier on the target checks each page window, keys only. If the target holds a live value that the source lacks and that is older than half the grace, the copy is held, so cutover cannot happen and the PD aborts the move (`vals_rehome_copy_target_only_blocks`). Backup create treats a copy held only by a pending target as a non-owner copy.
@@ -30,9 +31,8 @@ Decide how this interacts with 0517: stranded valid data has the same signature.
 
 Acceptance: a deterministic regression in which a former owner holding a stale put becomes an owner again through a membership change, with the newer delete already collected. The deleted key must stay deleted, and no valid record may be lost.
 
-## Acceptance criteria
+## Outcome
 
-## Work log
+Handoffs from the key's committed previous owner skip the GC floor (BatchApply fill) for gc_grace/2 after a move, so RF 1 moves carry aged values. A put every owner refuses, no owner holds (digest check) and older than gc_grace/2 is recorded in memory per zone/shard: never re-offered (empty floor-0 owners cannot admit it), and deleted locally (tombstone hlc+1) when a placement adoption makes the node an owner again, before the reply; a failed delete fences reads/AE until it succeeds. Policy: an all-owners refusal counts as a delete, so a valid value whose handoff missed the window is lost only if --force returns it to its holder (documented; follow-up 0541). Regressions fail without each mechanism. vals-cluster lib 1015 pass, clippy clean. Reviews: claude accept; sol objects to the late-handoff policy (work log). No hardware run.
 
-- 2026-10-29: owner accepted (backlog triage), after 0517: 0517 decides which copies to refuse and this task decides which to trust, so the two share one design.
-- 2026-10-29 (from 0517): the floor is now waived (`LiveFloor::Waive`) for AE pulls from the peer shard that owns the key under the committed placement, for re-home copies from the current owner and for `backup load` (`BatchApply` `fill` flag); pulls from a pending re-home target or a sibling shard, client writes, read repair, hint replay and cleanup handoffs keep it. Consequences for this task: (1) a stale copy on a node that becomes an owner again (or one admitted by an owner whose floor is still 0) now also spreads to its co-owners by AE, not only through that node's reads; (2) a cleanup handoff of a disjoint move (RF 1, or two quick membership changes) still refuses values older than the grace, so they stay on the former owner and the PD gate refuses the next change — the trust rule for handoffs from a recent former owner belongs here too.
+Commit: 0518: trusted handoffs from the previous owner; copies every owner refuses are not re-offered and are deleted locally when their holder owns the key again (fail closed)

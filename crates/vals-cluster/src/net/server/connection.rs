@@ -151,7 +151,7 @@ impl<D: BlockDevice + AsyncRead + 'static> ConnDriver<D> {
                 );
             }
             Ok(ref req)
-                if self.shared.fenced()
+                if (self.shared.fenced() || self.shared.regain_fence_failed())
                     && matches!(
                         req,
                         OwnedRequest::Read { .. }
@@ -166,10 +166,12 @@ impl<D: BlockDevice + AsyncRead + 'static> ConnDriver<D> {
                     ) =>
             {
                 crate::observe::counters().server_errors.inc();
-                self.out.push_resp(
-                    reqid,
-                    &Response::Err("fenced: node is resyncing after being out of contact".into()),
-                );
+                let why = if self.shared.fenced() {
+                    "fenced: node is resyncing after being out of contact"
+                } else {
+                    "fenced: a former-owner copy this node owns again could not be deleted yet"
+                };
+                self.out.push_resp(reqid, &Response::Err(why.into()));
             }
             Ok(ref req)
                 if matches!(

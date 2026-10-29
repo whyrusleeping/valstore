@@ -58,6 +58,8 @@ impl<D: BlockDevice> ServerShared<D> {
             range_write_marks: RefCell::new(FastMap::default()),
             rehome_copy_holds: RefCell::new(FastMap::default()),
             cleanup_status: RefCell::new(FastMap::default()),
+            refused_copies: RefCell::new(FastMap::default()),
+            regain_fence_failed: Cell::new(false),
             cleanup_recheck: Cell::new((0, None)),
             zone_forget_gens: RefCell::new(FastMap::default()),
             rehome_transport: RefCell::new(None),
@@ -1143,8 +1145,14 @@ impl<D: BlockDevice> ServerShared<D> {
             store.borrow_mut().clear()?;
             self.integrity_watch.borrow_mut().cleared(zone_id);
         }
+        self.refused_copies.borrow_mut().clear();
+        self.regain_fence_failed.set(false);
         self.clear_wipe_pending();
         Ok(())
+    }
+
+    pub(crate) fn last_contact_ms(&self) -> u64 {
+        self.last_contact.get()
     }
 
     pub(crate) fn zone_config(&self, zone_id: ZoneId) -> Option<ZoneConfig> {
@@ -1599,6 +1607,7 @@ impl<D: BlockDevice> ServerShared<D> {
         );
         crate::observe::counters().zones_dropped.inc();
         self.range_load.borrow_mut().counts.remove(&zone_id);
+        self.refused_copies.borrow_mut().remove(&zone_id);
         self.integrity_watch.borrow_mut().cleared(zone_id);
         let store = self.zones.borrow_mut().remove(&zone_id);
         crate::observe::remove_engine_metrics(self.shard().0, zone_id);

@@ -1,4 +1,5 @@
 use super::*;
+use crate::antientropy::{cleanup_scoped_with, cleanup_scoped_zone_with, HandoffPolicy};
 use crate::replica::seed_policy;
 use crate::replica::RecountStep;
 
@@ -615,11 +616,16 @@ pub(super) async fn sweep_loop<D: BlockDevice + AsyncRead + 'static>(
         std::collections::HashMap::new();
     let mut last_cleanup_stamp: Option<(u64, u64, u64, u64)> = None;
     let mut last_recheck_gen = 0u64;
+    let mut owner_views: std::collections::HashMap<ZoneId, crate::net::OwnerView> =
+        std::collections::HashMap::new();
+    let mut previous_views: std::collections::HashMap<ZoneId, (crate::net::OwnerView, u64)> =
+        std::collections::HashMap::new();
     loop {
         shared.sweep_notified().await;
         if shared.is_shutdown() {
             return;
         }
+        let contact_before = shared.last_contact_ms();
         let eager = shared.take_rebalance_pending();
         shared.note_sweep_pass();
         let recheck_gen = shared.cleanup_recheck_gen();
@@ -777,11 +783,30 @@ pub(super) async fn sweep_loop<D: BlockDevice + AsyncRead + 'static>(
                     tally.moved = true;
                 }
             }
+            let view = crate::net::OwnerView {
+                ring: cleanup_ring.clone(),
+                cfg: cfg.clone(),
+                map: range_map.clone(),
+            };
+            if moved {
+                let grace = store.borrow().gc_grace_ms();
+                match owner_views.remove(&zone_id) {
+                    Some(previous) => {
+                        let since = physical_now_ms().min(contact_before);
+                        previous_views.insert(zone_id, (previous, since.saturating_add(grace / 2)));
+                    }
+                    None => {
+                        previous_views.remove(&zone_id);
+                    }
+                }
+            }
+            owner_views.insert(zone_id, view);
             cleanup_placements.insert(zone_id, placement.clone());
             shared.note_cleanup_placement(zone_id, moved, (stamp.0, stamp.1, stamp.2));
             store.borrow_mut().set_cleanup_placement(placement.clone());
             prepared_zones.push((zone_id, cfg, range_map, placement));
         }
+        shared.fence_regained_copies();
         if eager {
             let all_buckets = std::collections::HashSet::from([0]);
             for (zone_id, _, _, _) in &prepared_zones {
@@ -1018,9 +1043,18 @@ pub(super) async fn sweep_loop<D: BlockDevice + AsyncRead + 'static>(
                 };
                 let cleanup_resume = lap.resume();
                 let cleanup_end = lap.end();
+                let trust_now = physical_now_ms();
+                let trust = previous_views.get(&zone_id).filter(|(_, until)| trust_now < *until);
+                let trusted = |key: &[u8]| {
+                    trust.is_some_and(|(previous, _)| {
+                        !shared.fenced() && previous.owns_committed(zone_id, key, node_id, shared.shard())
+                    })
+                };
+                let refused = |key: &[u8], version| shared.is_refused_copy(zone_id, key, version);
+                let policy = HandoffPolicy { trusted: &trusted, refused: &refused };
                 let cleaned = match &cfg {
                     None => {
-                        cleanup_scoped(
+                        cleanup_scoped_with(
                             &store,
                             &handoff,
                             &cleanup_ring,
@@ -1035,12 +1069,13 @@ pub(super) async fn sweep_loop<D: BlockDevice + AsyncRead + 'static>(
                                 shared.is_shutdown()
                                     || !shared.zone_is_current(zone_id, &store)
                             },
+                            policy,
                         )
                         .await
                     }
                     Some(cfg) => {
                         let hold_now_ms = physical_now_ms();
-                        cleanup_scoped_zone(
+                        cleanup_scoped_zone_with(
                             &store,
                             &handoff,
                             &cleanup_ring,
@@ -1066,6 +1101,7 @@ pub(super) async fn sweep_loop<D: BlockDevice + AsyncRead + 'static>(
                                 shared.is_shutdown()
                                     || !shared.zone_is_current(zone_id, &store)
                             },
+                            policy,
                         )
                         .await
                     }
@@ -1083,6 +1119,7 @@ pub(super) async fn sweep_loop<D: BlockDevice + AsyncRead + 'static>(
                         crate::observe::counters()
                             .cleanup_probe_released_keys
                             .add(progress.probe_released as u64);
+                        shared.note_refused_copies(zone_id, std::mem::take(&mut progress.refused));
                         if progress.released > 0 {
                             shared.bump_zone_forget_gen(zone_id);
                         }
@@ -1131,6 +1168,7 @@ pub(super) async fn sweep_loop<D: BlockDevice + AsyncRead + 'static>(
                         if lap.advance(progress.next_cursor, progress.wrapped) {
                             crate::observe::counters().cleanup_traversals.inc();
                             lap_done = true;
+                            shared.prune_refused_copies(zone_id);
                             let held = !tally.saw_copy_hold
                                 && !tally.moved
                                 && with_cleanup_placement(&shared, zone_id, |base, map| {

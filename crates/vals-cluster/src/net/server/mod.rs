@@ -169,6 +169,8 @@ pub(crate) struct ServerShared<D: BlockDevice> {
     range_write_marks: RefCell<FastMap<ZoneId, ZoneWriteMarks>>,
     rehome_copy_holds: RefCell<FastMap<(ZoneId, Vec<u8>), u64>>,
     cleanup_status: RefCell<FastMap<ZoneId, CleanupZoneStatus>>,
+    refused_copies: RefCell<FastMap<ZoneId, RefusedCopies>>,
+    regain_fence_failed: Cell<bool>,
     cleanup_recheck: Cell<(u64, Option<std::time::Instant>)>,
     zone_forget_gens: RefCell<FastMap<ZoneId, u64>>,
     rehome_transport: RefCell<Option<RehomeTransport>>,
@@ -404,6 +406,7 @@ mod placement;
 mod range_delete;
 mod read;
 mod read_gate;
+mod regain;
 mod scan;
 mod shared;
 
@@ -418,6 +421,10 @@ use scan::*;
 use shared::{KEY_FILTER_GAUGES, RUN_META_GAUGES};
 
 pub use accept::{ReplicaServer, ServerHandle, ShardedServer};
+pub(crate) use regain::OwnerView;
+use regain::RefusedCopies;
+#[cfg(test)]
+pub(crate) use regain::FAIL_FENCE_WRITES;
 pub(crate) use accept::{accept_loop, server_poll, DeadlineKind, ServerOut};
 pub(crate) use connection::ConnDriver;
 #[cfg(test)]

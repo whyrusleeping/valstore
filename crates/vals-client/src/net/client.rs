@@ -966,6 +966,26 @@ impl Transport for NetTransport {
         }
     }
 
+    async fn apply_fill(
+        &self,
+        node: NodeId,
+        zone_id: ZoneId,
+        key: &[u8],
+        value: Option<&[u8]>,
+        version: crate::hlc::Version,
+    ) -> Result<Applied, TransportError> {
+        let entry = [BatchEntry { key, value, version }];
+        match self.batch_apply_rpc(node, zone_id, false, true, &entry).await.into_iter().next() {
+            Some(BatchAck::Applied(a)) => Ok(a),
+            Some(BatchAck::Stale(e)) => Err(TransportError::StaleEpoch(e)),
+            Some(BatchAck::Busy) => Err(TransportError::Busy),
+            Some(BatchAck::Overloaded) => Err(TransportError::Overloaded),
+            Some(BatchAck::Timeout) => Err(TransportError::Timeout),
+            Some(BatchAck::Remote) => Err(TransportError::Remote("batch apply failed".into())),
+            Some(BatchAck::Unreachable) | None => Err(TransportError::Unavailable),
+        }
+    }
+
     async fn apply_send(
         &self,
         node: NodeId,

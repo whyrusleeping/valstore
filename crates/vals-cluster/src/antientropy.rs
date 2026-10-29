@@ -71,10 +71,31 @@ pub struct CleanupProgress<D: BlockDevice> {
     pub deferred: bool,
     pub kept: usize,
     pub kept_samples: Vec<Vec<u8>>,
+    pub refused: Vec<RefusedCopyNote>,
     pub forget_plan: Option<vals_store::CompactPlan<D>>,
 }
 
 pub const CLEANUP_KEPT_SAMPLES: usize = 4;
+
+pub type RefusedCopyNote = (Vec<u8>, Version);
+
+#[derive(Clone, Copy)]
+pub struct HandoffPolicy<'a> {
+    pub trusted: &'a dyn Fn(&[u8]) -> bool,
+    pub refused: &'a dyn Fn(&[u8], Version) -> bool,
+}
+
+fn never_trusted(_: &[u8]) -> bool {
+    false
+}
+
+fn never_refused(_: &[u8], _: Version) -> bool {
+    false
+}
+
+impl HandoffPolicy<'static> {
+    pub const PLAIN: Self = HandoffPolicy { trusted: &never_trusted, refused: &never_refused };
+}
 
 impl<D: BlockDevice> CleanupProgress<D> {
     fn note_kept(&mut self, key: &[u8]) {
@@ -97,6 +118,7 @@ impl<D: BlockDevice> Default for CleanupProgress<D> {
             deferred: false,
             kept: 0,
             kept_samples: Vec::new(),
+            refused: Vec::new(),
             forget_plan: None,
         }
     }
@@ -801,8 +823,10 @@ async fn cleanup_with<D: BlockDevice + vals_spdk::AsyncRead, T: Transport, G: Fo
     mut gate: G,
     placement_valid: impl Fn() -> bool,
     stop: impl Fn() -> bool,
+    policy: HandoffPolicy<'_>,
 ) -> Result<CleanupProgress<D>, TransportError> {
     let dev = local.borrow().device_handle();
+    let refusal_age_ms = local.borrow().gc_grace_ms() / 2;
     let mut page_restarts = 0usize;
     let mut staged = local
         .borrow()
@@ -1084,13 +1108,23 @@ async fn cleanup_with<D: BlockDevice + vals_spdk::AsyncRead, T: Transport, G: Fo
             completed_cursor = Some(key);
             continue;
         }
+        if (policy.refused)(&key, stored.version) {
+            progress.deferred = true;
+            progress.note_kept(&key);
+            progress.refused.push((key.clone(), stored.version));
+            completed_cursor = Some(key);
+            continue;
+        }
+        let trusted = (policy.trusted)(&key);
         let need = min_confirms.min(owners.len());
         let mut confirms: usize = 0;
+        let mut refusals: usize = 0;
         let mut key_failed = false;
         for (owner_i, &owner) in owners.iter().enumerate() {
             let remaining = owners.len() - owner_i;
+            let only_refused = confirms == 0 && refusals == owner_i;
             if handoff_started.elapsed() >= CLEANUP_HANDOFF_WALL_BUDGET
-                || confirms.saturating_add(remaining) < need
+                || (confirms.saturating_add(remaining) < need && !only_refused)
             {
                 progress.deferred = true;
                 key_failed = true;
@@ -1103,18 +1137,15 @@ async fn cleanup_with<D: BlockDevice + vals_spdk::AsyncRead, T: Transport, G: Fo
                 return Ok(progress);
             }
             progress.handoff_rpcs += 1;
-            let confirmed = matches!(
-                transport
-                    .apply(
-                        owner,
-                        zone_id,
-                        &key,
-                        stored.value.as_deref(),
-                        stored.version
-                    )
-                    .await,
-                Ok(Applied::Won) | Ok(Applied::Lost(_))
-            );
+            let value = stored.value.as_deref();
+            let reply = if trusted {
+                crate::observe::counters().cleanup_trusted_handoffs.inc();
+                transport.apply_fill(owner, zone_id, &key, value, stored.version).await
+            } else {
+                transport.apply(owner, zone_id, &key, value, stored.version).await
+            };
+            refusals += usize::from(matches!(reply, Ok(Applied::Rejected)));
+            let confirmed = matches!(reply, Ok(Applied::Won) | Ok(Applied::Lost(_)));
             if confirmed {
                 confirms += 1;
             } else {
@@ -1133,6 +1164,18 @@ async fn cleanup_with<D: BlockDevice + vals_spdk::AsyncRead, T: Transport, G: Fo
         } else {
             progress.deferred = true;
             progress.note_kept(&key);
+            if confirms == 0
+                && refusals == owners.len()
+                && refusal_age_ms > 0
+                && stored.value.is_some()
+                && stored.version.physical_ms().saturating_add(refusal_age_ms) < crate::hlc::physical_now_ms()
+                && {
+                    progress.handoff_rpcs += owners.len();
+                    no_owner_holds(transport, zone_id, &owners, &key, stored.version).await
+                }
+            {
+                progress.refused.push((key.clone(), stored.version));
+            }
         }
         completed_cursor = Some(key);
         if key_failed || handoff_started.elapsed() >= CLEANUP_HANDOFF_WALL_BUDGET {
@@ -1190,6 +1233,23 @@ async fn cleanup_with<D: BlockDevice + vals_spdk::AsyncRead, T: Transport, G: Fo
     progress.released = released;
     progress.forget_plan = plan;
     Ok(progress)
+}
+
+async fn no_owner_holds<T: Transport>(
+    transport: &T,
+    zone_id: ZoneId,
+    owners: &[NodeId],
+    key: &[u8],
+    version: Version,
+) -> bool {
+    for &owner in owners {
+        match transport.digest(owner, zone_id, key).await {
+            Ok(None) => {}
+            Ok(Some(held)) if held < version => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 struct ProbeCutoff<'a, S: Fn() -> bool> {
@@ -1255,6 +1315,38 @@ pub async fn cleanup_scoped<D: BlockDevice + vals_spdk::AsyncRead, T: Transport,
     placement_valid: impl Fn() -> bool,
     stop: impl Fn() -> bool,
 ) -> Result<CleanupProgress<D>, TransportError> {
+    cleanup_scoped_with(
+        local,
+        transport,
+        ring,
+        local_node,
+        min_confirms,
+        shard,
+        resume,
+        end,
+        gate,
+        placement_valid,
+        stop,
+        HandoffPolicy::PLAIN,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn cleanup_scoped_with<D: BlockDevice + vals_spdk::AsyncRead, T: Transport, G: ForgetGate>(
+    local: &RefCell<VersionedStore<D>>,
+    transport: &T,
+    ring: &Ring,
+    local_node: NodeId,
+    min_confirms: usize,
+    shard: (usize, usize),
+    resume: Option<&[u8]>,
+    end: Option<&[u8]>,
+    gate: G,
+    placement_valid: impl Fn() -> bool,
+    stop: impl Fn() -> bool,
+    policy: HandoffPolicy<'_>,
+) -> Result<CleanupProgress<D>, TransportError> {
     let (shard_index, shard_count) = shard;
     cleanup_with(
         local,
@@ -1278,6 +1370,7 @@ pub async fn cleanup_scoped<D: BlockDevice + vals_spdk::AsyncRead, T: Transport,
         gate,
         placement_valid,
         stop,
+        policy,
     )
     .await
 }
@@ -1304,6 +1397,52 @@ pub async fn cleanup_scoped_zone<
     copy_hold: impl Fn(&[u8]) -> bool,
     placement_valid: impl Fn() -> bool,
     stop: impl Fn() -> bool,
+) -> Result<CleanupProgress<D>, TransportError> {
+    cleanup_scoped_zone_with(
+        local,
+        transport,
+        ring,
+        local_node,
+        zone_id,
+        rf,
+        scope,
+        min_confirms,
+        range_map,
+        shard,
+        resume,
+        end,
+        gate,
+        copy_hold,
+        placement_valid,
+        stop,
+        HandoffPolicy::PLAIN,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn cleanup_scoped_zone_with<
+    D: BlockDevice + vals_spdk::AsyncRead,
+    T: Transport,
+    G: ForgetGate,
+>(
+    local: &RefCell<VersionedStore<D>>,
+    transport: &T,
+    ring: &Ring,
+    local_node: NodeId,
+    zone_id: ZoneId,
+    rf: usize,
+    scope: Option<&BTreeSet<NodeId>>,
+    min_confirms: usize,
+    range_map: Option<&RangeMap>,
+    shard: (usize, usize),
+    resume: Option<&[u8]>,
+    end: Option<&[u8]>,
+    gate: G,
+    copy_hold: impl Fn(&[u8]) -> bool,
+    placement_valid: impl Fn() -> bool,
+    stop: impl Fn() -> bool,
+    policy: HandoffPolicy<'_>,
 ) -> Result<CleanupProgress<D>, TransportError> {
     let (shard_index, shard_count) = shard;
     cleanup_with(
@@ -1343,6 +1482,7 @@ pub async fn cleanup_scoped_zone<
         gate,
         placement_valid,
         stop,
+        policy,
     )
     .await
 }

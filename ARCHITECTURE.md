@@ -979,9 +979,20 @@ collected under a **grace period (`gc_grace`)**:
   older than the grace has no newer delete anywhere, so a new replica, a
   wiped node or a restore target gets values of any age. A re-home copy
   counts only `Won`/`Lost` as copied, so an entry the target refuses keeps
-  the range from cutting over. Cleanup handoffs keep the floor, so a move
-  that gives a key only new owners (for example at RF 1) leaves its values
-  older than the grace on the former owner (backlog 0518).
+  the range from cutting over. Cleanup handoffs keep the floor, except from
+  a node that owned the key under the placement just before the latest
+  change and saw that change less than half the grace ago (counted from its
+  last cluster contact): assuming a delete reaches every owner within half
+  the grace, a delete it missed as an owner is younger than the change, so
+  nobody has collected it yet, and a move that gives a key only new owners
+  (for example at RF 1) still carries its values older than the grace.
+  A put that every owner refuses is ambiguous (a collected delete, or a valid
+  value that missed that window); the cluster treats it as deleted, which is
+  what clients already read. Cleanup does not offer it again (an empty new
+  owner, whose floor is 0, could accept it), and if a placement change makes
+  its holder an owner of the key, the holder deletes its copy locally before
+  serving the new placement
+  ([`docs/backup-restore.md`](docs/backup-restore.md#consistency-contract)).
 - ✅ Built: `VersionedStore::with_gc_grace_ms` + `VersionedStore::compact(wall_ms)`,
   over a new `Engine::compact_filtered(drop_live)` seam (a versioned tombstone is an
   opaque live `Put` to the engine, so only the cluster layer can decide it is

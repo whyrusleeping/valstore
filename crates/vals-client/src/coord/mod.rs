@@ -227,6 +227,18 @@ pub trait Transport {
         }
     }
 
+    #[doc(hidden)]
+    fn apply_fill(
+        &self,
+        node: NodeId,
+        zone_id: ZoneId,
+        key: &[u8],
+        value: Option<&[u8]>,
+        version: Version,
+    ) -> impl std::future::Future<Output = Result<Applied, TransportError>> {
+        async move { self.apply(node, zone_id, key, value, version).await }
+    }
+
     fn apply_persistent(
         &self,
         node: NodeId,

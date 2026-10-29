@@ -5391,6 +5391,11 @@ fn rehome_copy_holds_while_the_target_keeps_an_old_leftover_the_source_lacks() {
     let peers: Vec<(NodeId, SocketAddr)> =
         binds.iter().enumerate().map(|(i, (_, addr))| ((i + 1) as NodeId, *addr)).collect();
     let now = crate::hlc::physical_now_ms();
+    let at = |ms: u64| crate::hlc::Version { hlc: ms << crate::hlc::COUNTER_BITS, node: 9 };
+    let mut zombie = boundary.clone();
+    zombie.extend_from_slice(b"/zombie");
+    let mut live = boundary.clone();
+    live.extend_from_slice(b"/live");
     let mut handles = Vec::new();
     for (i, (listener, _)) in binds.into_iter().enumerate() {
         let node = (i + 1) as NodeId;
@@ -5401,13 +5406,21 @@ fn rehome_copy_holds_while_the_target_keeps_an_old_leftover_the_source_lacks() {
                 reserved_blocks: 0,
                 region_blocks: 8192,
             });
+        if node == target {
+            let mut zone = provider.open(zone_id, Ordering::Sorted).unwrap();
+            zone.apply(&zombie, Some(b"zombie"), at(now - 600_000)).unwrap();
+            zone.sync().unwrap();
+        }
+        if node == source {
+            let mut zone = provider.open(zone_id, Ordering::Sorted).unwrap();
+            zone.apply(&live, Some(b"live"), at(now)).unwrap();
+            zone.sync().unwrap();
+        }
         let zone0 = provider.open(DEFAULT_ZONE, Ordering::Unsorted).unwrap();
         let mut catalog = Catalog::new();
         catalog.insert(zone_id, cfg.clone());
         let log = MemLivenessLog::new();
-        if node != target {
-            log.store(now - 1_000).unwrap();
-        }
+        log.store(now - 1_000).unwrap();
         handles.push(crate::testutil::running(Node::serve_zoned_with_liveness_and_settings(
             node,
             listener,
@@ -5446,7 +5459,7 @@ fn rehome_copy_holds_while_the_target_keeps_an_old_leftover_the_source_lacks() {
             zone_id,
             key,
             value,
-            version: crate::hlc::Version { hlc: ms << crate::hlc::COUNTER_BITS, node: 9 },
+            version: at(ms),
         })
     };
     let eventually = |what: &str, mut ok: Box<dyn FnMut() -> bool + '_>| {
@@ -5456,27 +5469,14 @@ fn rehome_copy_holds_while_the_target_keeps_an_old_leftover_the_source_lacks() {
             std::thread::sleep(Duration::from_millis(20));
         }
     };
-    let mut zombie = boundary.clone();
-    zombie.extend_from_slice(b"/zombie");
-    let mut live = boundary.clone();
-    live.extend_from_slice(b"/live");
-
-    push(10, &map(&boundary, None));
-    eventually("the source takes writes", Box::new(|| apply(source, b"a-anchor", Some(b"a"), now) == Response::Apply(Applied::Won)));
-    eventually(
-        "the old owner takes the value",
-        Box::new(|| apply(target, &zombie, Some(b"zombie"), now - 600_000) == Response::Apply(Applied::Won)),
-    );
-    push(11, &map(b"", None));
-    eventually("the source owns the range", Box::new(|| apply(source, &live, Some(b"live"), now) == Response::Apply(Applied::Won)));
-    assert_eq!(
-        apply(source, &zombie, Some(b"zombie"), now - 600_000),
-        Response::Apply(Applied::Rejected),
-        "the source refuses the old value, as if it had collected its delete"
-    );
-
     let blocks_before = crate::observe::snapshot().rehome_copy_target_only_blocks;
     push(12, &map(b"", Some(&boundary)));
+    eventually("the source takes writes", Box::new(|| apply(source, b"a-anchor", Some(b"a"), now) == Response::Apply(Applied::Won)));
+    assert_eq!(
+        rpc_request(addr(source), &Request::Read { epoch: u64::MAX, zone_id, key: &zombie }),
+        Response::Read(None),
+        "the source lacks the old value, as if it had collected its delete (the target restarted with it, so its cleanup never offered it)"
+    );
     eventually(
         "the copy notices the leftover",
         Box::new(|| crate::observe::snapshot().rehome_copy_target_only_blocks > blocks_before),

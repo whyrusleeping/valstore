@@ -213,7 +213,8 @@ refusal also applies to a whole `BatchApply` (the reply replaces `Batch`;
 nothing was applied). `BatchApply.flags` bit 0 (`sync`) clear requests buffered
 acknowledgement; set, it delays acknowledgement until the coalesced shard/zone
 device-sync barrier. Bit 1 (`fill`, task 0517) marks a restore copy (`valsd backup
-load`): the replica applies its puts without the tombstone-GC admission floor. A
+load`) or, since task 0518, a cleanup handoff from the key's owner under the
+previous placement: the replica applies its puts without the tombstone-GC admission floor. A
 decoder treats any set bit other than bit 1 as `sync`; a node from before 0517 reads
 the whole byte as `sync != 0`, so it takes a `fill` batch as synced and keeps the
 floor. Protocol-v1 `Apply` is always buffered, so an explicitly

@@ -324,6 +324,14 @@ counters! {
     cleanup_scanned_keys,
     /// Not-owned keys over-replication cleanup confirmed with a batched digest probe (every owner already at or above the listed version), without reading the value or sending an apply.
     cleanup_probe_released_keys,
+    /// Over-replication cleanup handoffs sent with the fill flag (owner floor waived) because this node owned the key under the placement before the latest change and that change is less than half the GC grace old.
+    cleanup_trusted_handoffs,
+    /// Not-owned copies older than half the GC grace that every owner refused (below its tombstone-GC floor); cleanup stops offering them and deletes them locally if this node becomes an owner.
+    cleanup_refused_copies,
+    /// Refused copies not tracked because the zone's refused-copy table was full; they stay kept but are not fenced if the node becomes an owner again.
+    cleanup_refused_untracked,
+    /// Refused copies this node deleted locally (a tombstone just above the copy's version) when a placement change made it an owner of the key again.
+    former_owner_copies_fenced,
     /// Over-replication cleanup traversals that lapped a zone back to their sampled start key.
     cleanup_traversals,
     /// Extra cleanup pages a sweep pass ran in an idle burst (`cleanup_idle_burst_ms`) after the zone's first page of the pass.

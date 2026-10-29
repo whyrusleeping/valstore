@@ -146,14 +146,56 @@ Not captured:
   re-home target or another shard), re-home copies and `load` skip the
   floor, because their sender is a current owner or the backup, so a value
   older than the grace still reaches a new replica or a restore target.
+  A cleanup handoff skips it too (`BatchApply` with the `fill` flag,
+  `vals_cleanup_trusted_handoffs`) when the sender owned the key under the
+  placement just before the latest change (committed, not as a pending
+  re-home target) and saw that change less than half the grace ago, counted
+  from its last cluster contact before it. This assumes that a delete written
+  while the sender was an owner reached it within half the grace, so a delete
+  it missed is younger than the change and nobody has collected it before the
+  window ends. Values that a move gives only new owners (`add-node` at RF 1,
+  for example) therefore reach them if the sender's cleanup gets to them in
+  time. On a large store a lap can take longer than that; the rest are
+  refused and stay on the sender, as before this rule.
+
+  A put that every owner of the key refuses (none confirms and none is
+  unreachable), older than half the grace, and that a digest read then shows
+  no owner holding (an owner checks the floor before the key, so one that
+  holds the value refuses it too), is recorded as refused
+  (`vals_cleanup_refused_copies`). Such a copy is ambiguous: its delete may
+  have been collected, or it is a valid value whose handoff came too late. The
+  cluster treats it as deleted, because that is what clients already read: no
+  owner serves it. Cleanup does not offer it again, so an empty new owner cannot
+  admit it, and the owner probe still releases it once an owner holds that
+  version or a newer one. If a placement change (or a refusal that lands after
+  one) makes the holder an owner (or pending re-home target) of that key, the
+  node writes a local delete one step above the copy's version before it
+  serves anything under the new placement (`vals_former_owner_copies_fenced`,
+  with a warning naming a sample key), so the collected delete does not come
+  back and anti-entropy does not copy the value to the co-owners. If that
+  write fails, the node refuses to serve reads and anti-entropy, as a fenced
+  node does, until a later sweep pass writes it. To keep such a value, write
+  it again through a client before the change. A copy that an unreachable
+  owner could not answer for, and that was never refused by every owner, is
+  kept and offered again as before (and served if `--force` makes its holder
+  an owner). The record lives in memory, up to 65,536 keys per zone and shard
+  (`vals_cleanup_refused_untracked` counts the rest), so a restart forgets it
+  until the next cleanup lap; a record survives an owner going down later.
+  The local delete is buffered like any write: a crash before the next flush
+  loses it, and the restarted node, which now owns the key, serves the copy
+  again.
   Remaining assumptions:
   - Every owner that was an owner when the delete was written received the
     tombstone within `gc_grace`
-    ([`../ARCHITECTURE.md`](../ARCHITECTURE.md#deletes-and-tombstones)).
+    ([`../ARCHITECTURE.md`](../ARCHITECTURE.md#deletes-and-tombstones)), and
+    within half of it for the trusted cleanup handoff above.
+  - A node adopts a placement change promptly (the PD pushes it). A sender
+    that learns of a change long after the PD committed it starts its trust
+    window late.
   - An owner that has seen no data progress yet (an empty node that just
     became an owner or a pending re-home target) has floor 0. Until its first
-    write it would accept such a copy from a cleanup handoff, and anti-entropy
-    would then copy it to the other owners.
+    write it would accept a copy that is not recorded as refused, from a
+    cleanup handoff, and anti-entropy would then copy it to the other owners.
   - A re-home to a node that still holds such a copy does not complete. For
     each page, the target checks its own entries in the page's window. A value
     the source lacks, and older than half the grace, holds the copy, so the PD
@@ -173,9 +215,11 @@ Not captured:
     collected point or range delete, or an unreachable one), and the refusal
     names the node, the zone and up to four sample keys. To resolve it,
     delete a key that should stay deleted (the owner then holds a newer delete,
-    so cleanup releases the copy), or rerun the command with `--force`, which
-    lets the node serve its copies (the right call only if those values were
-    never deleted). A node that `add-node` brings in must hold no data unless
+    so cleanup releases the copy), write a value that should stay again through
+    a client, or rerun the command with `--force`. With `--force`, a node that
+    becomes an owner of a key whose copy every owner refused deletes that copy
+    (above); a copy that an unreachable owner could not answer for is served
+    as it is. A node that `add-node` brings in must hold no data unless
     tombstone GC is off on every member: the PD asks it at the addresses given
     to `add-node` and refuses one that holds records (wipe a removed node before
     it rejoins). A pending re-home also refuses the change, both in the PD
@@ -189,8 +233,11 @@ Not captured:
 
   Regression tests: `backup::tests::merge_*`, `node::former_owner_tests` (including
   a membership change after a real tombstone GC, the return of a removed
-  stale holder, and a pending then aborted re-home whose target holds the
-  stale copy), `pd::cleanup_gate::tests`,
+  stale holder, a pending then aborted re-home whose target holds the
+  stale copy, a forced removal that makes a stale holder an owner again, an
+  aged value moved to a new RF 1 owner and back, a refused copy kept from
+  an empty new owner, and a refused copy regained while one of the owners that
+  refused it is down, whose local delete fails first), `pd::cleanup_gate::tests`,
   `net::tests::rehome_copy_holds_while_the_target_keeps_an_old_leftover_the_source_lacks`,
   `net::tests::rehome_copy_carries_values_older_than_the_gc_grace_to_the_new_owner`,
   `node::tests::ae_fills_a_co_owner_with_values_older_than_the_gc_grace`,

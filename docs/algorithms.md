@@ -1091,6 +1091,21 @@ they are load-bearing and worth recording. Full rationale is in `ARCHITECTURE.md
   the liveness invariant: an owner received every delete within the grace, so an old put it
   still holds has no newer collected tombstone. A re-home copy counts only `Won` and `Lost` as
   copied; a refused entry keeps the range from completing.
+  **Trusted handoffs and refused copies** (0518). A cleanup handoff applies with `Waive`
+  (`BatchApply` with `fill`) when the sender owned the key, as a committed owner, under the
+  placement just before the latest change and saw that change less than half the grace ago,
+  counted from its last cluster contact before the sweep pass that saw it. If a delete reaches
+  every owner within half the grace, a delete the sender missed as an owner is younger than
+  the change, so nobody collects it before the window ends. A put that every owner refuses
+  (cleanup keeps asking the owners while every answer so far is a refusal), older than half
+  the grace, and that no owner holds at that version or newer (a digest read per owner after
+  the refusals, since the floor check comes before the key read), goes into an in-memory refused set per zone and shard (65,536 keys; an entry is
+  pruned at a lap end only when a read shows the copy gone or changed). Cleanup stops
+  offering it, and when a placement adoption (`SetMembers`, `SetZones` or `SetRangeMaps`,
+  before the reply; a sweep pass; a refusal noted after one) makes the node an owner (or
+  pending re-home target) of the key, the node applies a tombstone at `(hlc + 1, own node id)`,
+  so reads and AE under the new placement see the delete. If that write fails, the shard
+  answers reads and AE requests like a fenced node until a sweep pass succeeds.
   `valsd backup create` reads every replica directly, so its merge applies the floor itself.
   A put held only by non-owners (or only by a pending re-home target) is merged only if its
   physical time is at or above the `GcFloor` of every owner shard, read after that owner's stream
