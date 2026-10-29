@@ -651,6 +651,15 @@ rather than falling back (0450); the rebuild variable does not override it.
 Incomplete chains whose head was never written (non-head segments of a
 generation with no head) are ignored.
 
+A manifest that decodes is still checked before recovery allocates anything
+(0531): every run segment and `value_segs` entry must be a segment of the
+device, and the chain's segments, each run's segments and the value segments
+must not overlap (several runs may name the same value segment, and a value
+segment may be the value-log tail). A violation fails `Engine::open` with
+`SnapshotError::Corrupt`, which the rebuild variable does not override. With a
+`v1` manifest (any run without `value_segs`) recovery keeps every value-log
+segment allocated, as before `v2`.
+
 ---
 
 ## 3. Placement & operational on-disk (`vals-cluster`)

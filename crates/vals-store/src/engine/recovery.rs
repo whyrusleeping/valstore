@@ -245,30 +245,14 @@ impl<D: BlockDevice> Engine<D> {
                     let generation = live.generation;
                     let manifest_driven = man.runs.iter().all(|m| m.value_segs.is_some());
 
-                    let mut allocated: std::collections::HashSet<SegmentId> =
-                        std::collections::HashSet::new();
-                    for s in &live.segs {
-                        allocated.insert(*s);
-                    }
-                    for meta in &man.runs {
-                        for s in &meta.handle.segs {
-                            allocated.insert(*s);
-                        }
-                        if manifest_driven {
-                            if let Some(vs) = &meta.value_segs {
-                                allocated.extend(vs.iter().copied());
-                            }
-                        }
-                    }
+                    let (mut allocated, value_segs) =
+                        manifest_segments(&man, &live.segs, alloc.num_segments())?;
                     if manifest_driven {
+                        allocated.extend(value_segs);
                         for (seg, ep, not_tail) in &log_segs {
                             if !*not_tail && *ep >= covered_epoch {
                                 allocated.insert(*seg);
                             }
-                        }
-                    } else {
-                        for (seg, _ep, _nt) in &log_segs {
-                            allocated.insert(*seg);
                         }
                     }
                     for s in stale_heads {
@@ -277,9 +261,7 @@ impl<D: BlockDevice> Engine<D> {
                         }
                     }
                     for s in &allocated {
-                        alloc
-                            .mark_allocated(*s)
-                            .expect("recover: segment marked twice");
+                        alloc.mark_allocated(*s).map_err(|_| segment_claimed_twice())?;
                     }
                     for meta in man.runs {
                         let run = DeviceRun::open(dev.clone(), &alloc, meta.handle.clone())?;
@@ -401,9 +383,7 @@ impl<D: BlockDevice> Engine<D> {
         let mut max_epoch: Option<u64> = None;
         for (seg, seg_epoch, not_tail) in log_segs {
             if mark {
-                alloc
-                    .mark_allocated(*seg)
-                    .expect("recover: segment marked twice");
+                alloc.mark_allocated(*seg).map_err(|_| segment_claimed_twice())?;
             }
             max_epoch = Some(max_epoch.map_or(*seg_epoch, |m| m.max(*seg_epoch)));
             if *not_tail && !include_rewrites {
@@ -542,5 +522,44 @@ impl<D: BlockDevice> Engine<D> {
     pub(super) fn bump_mutable_generation(&mut self) {
         self.mutable_gen = self.mutable_gen.wrapping_add(1);
     }
+}
+
+fn corrupt_manifest(why: &'static str) -> EngineError {
+    EngineError::Snapshot(SnapshotError::Corrupt(why))
+}
+
+fn segment_claimed_twice() -> EngineError {
+    corrupt_manifest("a segment is claimed by both the manifest and the value log")
+}
+
+type SegmentSet = std::collections::HashSet<SegmentId>;
+
+fn manifest_segments(
+    man: &crate::manifest::Manifest,
+    chain: &[SegmentId],
+    num_segments: u64,
+) -> Result<(SegmentSet, SegmentSet), EngineError> {
+    let mut owned: SegmentSet = chain.iter().copied().collect();
+    for meta in &man.runs {
+        for &seg in &meta.handle.segs {
+            if seg.0 >= num_segments {
+                return Err(corrupt_manifest("a run segment is out of range"));
+            }
+            if !owned.insert(seg) {
+                return Err(corrupt_manifest("a run segment is also another run's or the manifest chain's"));
+            }
+        }
+    }
+    let mut values = SegmentSet::new();
+    for seg in man.runs.iter().filter_map(|m| m.value_segs.as_ref()).flatten() {
+        if seg.0 >= num_segments {
+            return Err(corrupt_manifest("a value segment is out of range"));
+        }
+        if owned.contains(seg) {
+            return Err(corrupt_manifest("a value segment is also a run or manifest chain segment"));
+        }
+        values.insert(*seg);
+    }
+    Ok((owned, values))
 }
 

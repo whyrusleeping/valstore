@@ -317,3 +317,89 @@ fn lost_manifest_with_rewrite_segments_fails_open_and_rebuild_replays_them() {
         );
     }
 }
+
+fn rewrite_manifest(dev: &MemBlockDevice, edit: impl FnOnce(&mut crate::manifest::Manifest, SegmentId)) {
+    let mut alloc = fence_alloc();
+    let (mut man, live) = snapshot_io::load_manifest(dev, &alloc).unwrap().expect("a manifest");
+    let log = crate::dump::scan_log_segments(dev, &alloc, BS).unwrap();
+    let runs = man.runs.iter().flat_map(|m| m.handle.segs.iter().chain(m.value_segs.iter().flatten()));
+    for seg in live.segs.iter().chain(log.iter().map(|(s, _, _)| s)).chain(runs) {
+        let _ = alloc.mark_allocated(*seg);
+    }
+    let next_chain = alloc.allocate().unwrap();
+    alloc.free(next_chain).unwrap();
+    edit(&mut man, next_chain);
+    let new = snapshot_io::write_manifest(dev, &mut alloc, &man, live.generation + 1, Some(&live)).unwrap();
+    assert_eq!(new.segs, [next_chain], "test premise: the rewritten manifest's chain segment");
+}
+
+fn assert_corrupt_manifest(dev: &MemBlockDevice, case: &str) {
+    match Engine::open(dev.share(), fence_cfg()) {
+        Ok(e) => panic!("{case}: open accepted the manifest with {} runs", e.run_count()),
+        Err(EngineError::Snapshot(SnapshotError::Corrupt(_))) => {}
+        Err(e) => panic!("{case}: expected a corrupt-manifest error, got: {e}"),
+    }
+}
+
+#[test]
+fn manifest_segments_out_of_range_fail_open_as_corrupt() {
+    for (case, run_seg) in [("value segment", false), ("run segment", true)] {
+        let dev = tail_engine(true);
+        rewrite_manifest(&dev, |man, _| {
+            let far = SegmentId(1 << 40);
+            if run_seg {
+                man.runs[0].handle.segs.push(far);
+            } else {
+                man.runs[0].value_segs.as_mut().unwrap().push(far);
+            }
+        });
+        assert_corrupt_manifest(&dev, case);
+    }
+}
+
+#[test]
+fn manifest_segments_claimed_twice_fail_open_as_corrupt() {
+    type Edit = fn(&mut crate::manifest::Manifest, SegmentId);
+    let cases: [(&str, Edit); 4] = [
+        ("two runs share segments", |man, _| man.runs.push(man.runs[0].clone())),
+        ("a value segment is a run segment", |man, _| {
+            let seg = man.runs[0].handle.segs[0];
+            man.runs[0].value_segs.as_mut().unwrap().push(seg);
+        }),
+        ("a value segment is the chain segment", |man, chain| {
+            man.runs[0].value_segs.as_mut().unwrap().push(chain);
+        }),
+        ("a run segment is the chain segment", |man, chain| man.runs[0].handle.segs.push(chain)),
+    ];
+    for (case, edit) in cases {
+        let dev = tail_engine(true);
+        rewrite_manifest(&dev, edit);
+        assert_corrupt_manifest(&dev, case);
+    }
+}
+
+#[test]
+fn legacy_manifest_without_value_segments_opens_with_log_segments() {
+    let dev = tail_engine(true);
+    rewrite_manifest(&dev, |man, _| {
+        for run in &mut man.runs {
+            run.value_segs = None;
+            run.value_bytes = None;
+            run.tombstone_min_version = None;
+            run.value_seg_bytes = None;
+        }
+    });
+    let mut e = Engine::open(dev.share(), fence_cfg()).expect("a v1-style manifest plus log segments opens");
+    assert_eq!(e.run_count(), 1);
+    for key in ["k0", "k1", "k2", "k3", "late"] {
+        assert_eq!(e.get(key.as_bytes()).unwrap().as_deref(), Some(&b"v"[..]), "{key}");
+    }
+    e.put(b"after", b"v", 1000).unwrap();
+    e.flush(RunBuildOpts::default()).unwrap();
+    e.sync().unwrap();
+    drop(e);
+    let e = Engine::open(dev.share(), fence_cfg()).unwrap();
+    for key in ["k0", "k1", "k2", "k3", "late", "after"] {
+        assert_eq!(e.get(key.as_bytes()).unwrap().as_deref(), Some(&b"v"[..]), "{key}");
+    }
+}
