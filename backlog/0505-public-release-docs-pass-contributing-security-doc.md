@@ -1,10 +1,10 @@
 ---
 id: "0505"
 title: 'Public-release docs pass: CONTRIBUTING/SECURITY, docs index, deploy.md and ARCHITECTURE cleanup, crate rustdoc'
-status: in_review
+status: done
 priority: 2
 created: "2026-10-27"
-updated: "2026-10-27"
+updated: "2026-10-28"
 depends_on: []
 spec_refs: []
 ---

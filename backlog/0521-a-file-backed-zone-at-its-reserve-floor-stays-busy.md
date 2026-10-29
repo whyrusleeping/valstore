@@ -1,10 +1,10 @@
 ---
 id: "0521"
 title: A file-backed zone at its reserve floor stays Busy after add-node hands off half its keys
-status: proposed
+status: done
 priority: 4
 created: "2026-10-28"
-updated: "2026-10-28"
+updated: "2026-10-29"
 depends_on: []
 spec_refs: []
 ---
@@ -21,3 +21,5 @@ Acceptance: reproduce at a realistic region size; either fix reclaim so a zone w
 ## Acceptance criteria
 
 ## Work log
+
+- 2026-10-29: closed, not pursued (owner, backlog triage). Seen only with `region_mib = 16`, where the reserve is capped at half the region; not reproduced at a realistic size. Re-file if a realistically sized zone stays wedged after its live data shrinks.

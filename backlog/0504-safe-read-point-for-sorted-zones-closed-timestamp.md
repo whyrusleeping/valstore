@@ -1,10 +1,10 @@
 ---
 id: "0504"
 title: 'Safe read point for sorted zones: closed-timestamp floor plus client-stamped append keys (design note first)'
-status: proposed
+status: done
 priority: 4
 created: "2026-10-23"
-updated: "2026-10-23"
+updated: "2026-10-29"
 depends_on: []
 spec_refs: []
 ---
@@ -36,3 +36,5 @@ A consumer scanning a sorted zone in key order can't tell whether an earlier key
 ## Acceptance criteria
 
 ## Work log
+
+- 2026-10-29: closed, not pursued (owner, backlog triage). No current workload needs a safe read point for multi-writer streams; 0471's pattern (one producer per partition, dense sequence numbers, consumers read the contiguous prefix) remains the supported approach. The proposal above stays as the starting point if such a workload appears. This decision also closes 0440.

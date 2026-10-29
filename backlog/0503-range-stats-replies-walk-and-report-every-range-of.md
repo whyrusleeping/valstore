@@ -1,10 +1,10 @@
 ---
 id: "0503"
 title: Range-stats replies walk and report every range of the zone on every node each poll
-status: proposed
+status: done
 priority: 4
 created: "2026-10-23"
-updated: "2026-10-23"
+updated: "2026-10-29"
 depends_on: []
 spec_refs: []
 ---
@@ -19,5 +19,7 @@ Acceptance: semantics of the PD's split/merge/balance inputs preserved (tests), 
 ## Acceptance criteria
 
 ## Work log
+
+- 2026-10-29: closed, not pursued (owner, backlog triage). The revisit trigger (17,000+ ranges per node in practice) has not occurred. The analysis stays in bench/0469-range-map-share/FINDINGS.md §3–§4; re-file from this description if range counts reach that scale.
 
 - 2026-10-26: triage: kept proposed (parked). The fix changes the PD's split/merge/balance aggregation for a small per-write gain; revisit once range counts per node approach 17,000+ in practice or 0502 shows such counts are a real target.

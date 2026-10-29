@@ -7,6 +7,11 @@ them against the harness source before relying on them. Box facts are in
 [local-multinode-valsd.md](local-multinode-valsd.md), and supported entry points are listed in
 [bench/HARNESSES.md](../bench/HARNESSES.md).
 
+Builds can silently reuse stale binaries when sources get older mtimes: A/B git-archive
+snapshots sharing `CARGO_TARGET_DIR`, or a kill-the-fix source restored with `mv`. Touch the
+restored or second tree's files (or use separate targets) and check that the binary hashes
+differ before measuring.
+
 ## Local (devbox)
 
 devbox has no perf (`perf_event_paranoid=4`). Its rates shift with other sessions' load, so
@@ -26,7 +31,24 @@ run repeat or ABBA pairs. Avoid heavy cargo work there during L1 arms, because b
   3 in-process nodes plus a PD with a sorted RF 3 zone and `VALS_RTQ_*` knobs. The matrix is
   `bench/0465-rt-ae-busy/run.sh` (about 9 min). In-process, any zone with ≥1k writes/s loses
   most AE reconcile slots to tree-scope-token exhaustion (task 0467). Read fold Busy from
-  `rt_fold_not_ready_busy` and local skips, not from the total.
+  `rt_fold_not_ready_busy` and local skips, not from the total. Real SPDK nodes lose only 1–9%
+  per hot store (`vals_ae_tree_token_exhaustions`, `bench/0467-ae-token-busy/run.sh` on the 0471
+  cluster, about 35 min), so judge token exhaustion on hardware.
+- **Tombstone GC repro:** `bench/0499-tombstone-gc` (`cluster.sh`, `repro.sh`, `observe.sh`,
+  about 5 min; `seg_blocks=16` so the file backend flushes).
+- **Client fault drills:** `bench/0513-blackhole/cluster.sh` runs a local 3-node cluster on
+  127.0.0.11–13; `blackhole` drops lo traffic to .13 with sudo iptables (plus kill and SIGSTOP).
+  `run.sh`, `matrix.sh` and `phases.py` run netqueue or `vals-bench vals netprogress` arms
+  (about 1 min each).
+- **File-backed benchmarks:** `scripts/file-bench.py` (start/run/stop/report; local, or
+  `--hosts a,b,c --addrs ...` over ssh). A full 4M-key run takes about 45–60 min. The
+  2026-10-28 lab evidence (ports 17801–17803) is in
+  `bench/0510-file-bench/results-{single,multi}[-64]`.
+- **macOS (LAN mac mini, 10.0.0.99, M1, 16 GB):** rustup is in `~/.cargo/bin` (not on the
+  non-login PATH) and there is no `timeout`. `bench/0525-macos/macsync.sh FILES...` ships HEAD
+  plus the listed working-tree files to `~/code/valstore-mac` for build/clippy/test checks.
+  vals-cluster and vals-server tests show timing flakes there (seed share, PD read-index race
+  0542).
 - **Sorted-zone RSS:** use `VALS_RSS_ORDERING=sorted VALS_RSS_KEY_SHAPE=replay` with
   `vals-store` `engine/tests/rss_bench.rs`. The default unsorted 8-byte HashIndex arm does not
   represent the soak zones.
@@ -59,12 +81,42 @@ run repeat or ABBA pairs. Avoid heavy cargo work there during L1 arms, because b
   ABBA arms under `nohup setsid`, because an ssh timeout kills the loop between arms. Write
   cost at 17k ranges was about 2.87 µs/write after 0442 and about 3.09 with 0449-era builds.
   All three A/B harnesses save each node's final `/metrics`.
+  High range counts need `--template DIR`: PD splits slow as a zone grows (25,000 ranges took
+  5,437 s to set up), so the first arm at each count saves the PD and node data dirs and later
+  arms restore them in about 20 s; `--split-par 8` barely helps. An interrupted ab.py can leave
+  valsd running, so check `ss -ltnp` for ports 173xx/174xx before an arm.
 - **Queue cluster (0471):** `bench/0471-queue-hw/hw.py` runs 3 SPDK valsd × 8 shards from
-  `~/vals0471` (build, provision, start, fresh-zone, arm, redis-*). Create zones at least 60 s
+  `~/vals0471` (build, provision, start, fresh-zone, arm, redis-*), with three voting PDs since
+  0194. Create zones at least 60 s
   after any drop, or the presplit falls back to unbalanced placement (fresh-zone checks this).
-  `hw.py provision` does not reset PD state, so drop old zones before an arm. R15 kept ring14's
-  204 empty ranges in `vals_pd_sorted_ranges`. As of 0485 (2026-10-19) the boxes ran tree
-  0d8827f6 with no zones, and 0492 later re-provisioned node 1. Check `hw.py status` first.
+  `hw.py provision` does not reset PD state, so drop old zones before an arm; changing the PD
+  mode needs `provision --pd-mode X --reset-pd`. Provision fails on a root-owned
+  `~/vals0471/node.conf` left by an earlier session, so chown it first. `hw.py arm` needs
+  `--vals-bench` before LABEL; use `VALS_BENCH_BOUNDED_CLIENT=1` for netqueue arms that kill
+  hosts. `hw.py build --commit` accepts a git tree id, so uncommitted work can be built without
+  touching HEAD (temp `GIT_INDEX_FILE`: read-tree HEAD, add the files, write-tree); it archives
+  `vendor/` since 0525. R15 kept ring14's
+  204 empty ranges in `vals_pd_sorted_ranges`. Since 2026-10-28 the boxes run the restored 0511
+  cluster; the 0194 PD state is in `~/vals0471/pd.old-20261028T082357Z`. Check `hw.py status`
+  first.
+- **SPDK hot-path A/B (non-destructive):** `bench/0535-spdk-soundness/ab.py LABEL base|fix` on
+  the restored 0511 cluster stops, swaps `~/vals0471/valsd.<arm>0535`, starts, then runs
+  backupdrill verify (4.5M reads) and netload, about 3 min per arm. netload is client-noisy;
+  the verify read time (about 13 s) is the steadier signal.
+- **Backup/restore drills:** `bench/0511-backup-restore/hw_drill.py LABEL
+  {prep,populate,backup,reset,restore,fence,restart}` uses hw.py (about 25 min for 4.85M
+  records). `restore-pd` there needs the PD env `VALS_PD_OPAQUE_RANGE_MAPS=1`.
+- **PD raft with an unreachable peer:** `bench/0498-pd-prevote/drill.py OUT send-blackhole`
+  (about 1 min) drops the leader's outbound packets to one follower's port 7100, resets the
+  cached connection with `ss -K` and samples admin-status latency and leader/term.
+  `host-loss HOST` runs the reboot drill (about 3 min).
+- **Host black-hole:** `bench/0513-blackhole/hw_drill.py` black-holes one lab host (non-ssh
+  traffic, self-removing rules) from a devbox client.
+- **File-backed shard holds:** `bench/0524-ae-stall/arm.sh STOP3=30` forces an AE catch-up
+  (SIGSTOP node 3 late in a buffered write phase, about 13 min per arm on lab-1:`~/vals0524`).
+  `diag_patch.py` builds a never-committed valsd that logs every executor task poll over 3 ms
+  with its future type name (request spawns tagged `req:<Kind>`); it pinpointed reconcile
+  probes and digest-page planning as the holders.
 - **Debt re-home analysis:** `bench/0485-rehome-decisions/analyze.py <arm-dir> [zone]`
   reconstructs the PD's debt re-home inputs from the `decision-inputs.tsv.gz` that
   `bench/0477-covered-merges/run.py` writes. `control.py` runs an unsplit append-only balancing

@@ -1,10 +1,10 @@
 ---
 id: "0440"
 title: 'Make vals a good substrate for queues and logs: general-purpose primitives'
-status: blocked
+status: done
 priority: 4
 created: "2026-10-14"
-updated: "2026-10-23"
+updated: "2026-10-29"
 depends_on: []
 spec_refs: []
 ---
@@ -69,6 +69,8 @@ The owner decides which primitives to pursue. Each accepted one is split into it
 ## Acceptance criteria
 
 ## Work log
+
+- 2026-10-29: owner decision recorded (backlog triage): 0504 (safe read point) rejected for now and closed; the deferred items (long-poll/watch, PD leases and fencing, per-key TTL, server-side compression, hash bucketing) stay deferred. All acceptance criteria are met (decision recorded, benchmark run as 0471), so this task closes.
 
 - 2026-10-20: owner accepted as a short decision pass. Much of the list has since shipped or been measured: range deletes (0439), the 0471 queue benchmark, reverse scans (0484), index-only scan replies (0482), and the re-home and cleanup fixes (0475/0477/0478/0485). Update the list to match, then bring the owner at most one of the remaining large items: coordinator-stamped append plus a closed timestamp, long-poll/watch scans, or PD leases and fencing.
 - 2026-10-23 (unattended session): the list above is updated to match shipped work and the 0471 numbers. The benchmark criterion is met by 0471. The item brought to the owner is the safe read point, filed as **proposed 0504** (design note first). Why this one rather than the other two:

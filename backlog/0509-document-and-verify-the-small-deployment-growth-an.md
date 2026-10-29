@@ -1,10 +1,10 @@
 ---
 id: "0509"
 title: Document and verify the small-deployment growth and migration path
-status: blocked
+status: todo
 priority: 2
 created: "2026-10-28"
-updated: "2026-10-28"
+updated: "2026-10-29"
 depends_on: []
 spec_refs:
     - docs/deploy.md
@@ -44,3 +44,6 @@ Local smoke tests (release valsd 0b546f51 tree, file backend, gc_grace = 0s, one
 Review round 1 (sol, revise) found the guide's content sound (its independent `cargo test -p vals-server --test backup restore` passed) but the committable snapshot incoherent: (1) the guide's `cargo build --release -p vals-client --example kv` fails on the snapshot because `crates/vals-client/examples/` is untracked (0269's demo); (2) HEAD's README/getting-started/docs index do not link the guide, and HEAD's getting-started still says "Single-PD (durable): fine to start with; raft-replicate later." Both are already fixed in the working tree, but by uncommitted 0505 (in_review) / 0516 (done) / 0269 edits, whose closure also needs untracked docs/embedding.md, SECURITY.md, CONTRIBUTING.md, docs/format-history.md, the tokio_bridge example and the Cargo.toml/Cargo.lock dev-dependency change. The commit tool only takes files this session changed, so 0509 cannot land a coherent tree without bypassing 0505's review gate or making artificial edits to those files.
 
 Unblock: commit the pending onboarding stack (0505's review and commit, carrying the 0516/0269 files), or have the owner approve landing it together with 0509. Then re-run 0509's review on a snapshot that includes the `kv` example and the README/getting-started/docs-index links (already in the working tree; see the note in 0505), and commit `docs/growing.md`, deploy.md and backup-restore.md. Nothing else in 0509 remains open.
+
+### 2026-10-29 — unblock condition met (memory groom)
+0505's commit cb51f82 landed the onboarding stack, including docs/embedding.md and docs/growing.md, and 0269's 0f02d04 landed the kv/tokio_bridge examples, so 0509 is back to todo. Next: re-run the review against HEAD. Also fix the stale growing.md line ~102 ("a restore into nodes with tombstone GC on is not qualified"): since 0517 it is tested locally, not yet qualified on hardware (0522 already fixed the §Replication factor gc_grace claim).

@@ -369,7 +369,13 @@ resolve it before resetting devices; see [SPDK ownership](../docs/SPDK.md).
 - **Profiling.** devbox has no perf (`perf_event_paranoid=4`, no sudo). Profile
   shard CPU on lab-1 as in `bench/0390-shard-cpu/FINDINGS.md`. Use the `cpu_core`
   PMU and read leaf symbols. Prometheus histogram `_sum` values are seconds. perf data
-  recorded from a root valsd needs `perf report -f`.
+  recorded from a root valsd needs `perf report -f`. `perf record -p <PD pid>` fails or
+  segfaults (perf 7.0.14), because the PD keeps spawning short-lived push and stats threads
+  (since 0497); record system-wide on the valsd CPUs (`sudo perf record -e cpu_core/cycles/ -C 0-7`)
+  and use `perf report --tid <thread>`.
+- **Driver host.** Run long drivers on lab-3, not devbox (which can stall local processes for
+  over a minute). lab-3 has an ssh key authorized on all three lab boxes and a git clone at
+  `~/valstore-0194`, where cargo is not on the non-login PATH (prefix `$HOME/.cargo/bin`).
 - **After a reopen,** gate aediag on `vals_ae_seed_active` = 0 on all nodes. Before that,
   its Busy message is misleading (0433).
 - **run_full1 resumes:** the real binary of a resumed attempt is in `server-install.json`, not
