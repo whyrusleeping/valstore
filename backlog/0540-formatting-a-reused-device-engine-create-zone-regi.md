@@ -1,7 +1,7 @@
 ---
 id: "0540"
 title: Formatting a reused device (Engine::create, zone region reuse) resurrects the previous store's records
-status: todo
+status: done
 priority: 1
 created: "2026-10-29"
 updated: "2026-10-29"
@@ -10,6 +10,7 @@ spec_refs: []
 ---
 
 ## Description
+
 Found while building 0532's crash harness (2026-10-29).
 
 Since 0528, value-log replay searches forward past a damaged region for the next CRC-valid record of the segment's epoch and keeps it. A format only wipes segment header blocks (docs/formats.md §2.2 "pre-format resurrection fence") and the new log starts again at epoch 0 (`Engine::create_prewiped`: `ValueLog::new(.., 0, 0)`), so a segment that the previous store wrote at epoch 0 still holds CRC-valid epoch-0 records past the new data's end. Replay walks past the new tail's zero padding into them.
@@ -24,6 +25,8 @@ Possible directions: start every format (create, region reuse, and recovery with
 
 Acceptance: a regression test that formats a used device (and a reused zone region) and shows no old record replays; the 0532 crash harness extended to start from a device holding a previous store's data, and it stays green.
 
-## Acceptance criteria
+## Outcome
 
-## Work log
+Engine::create/create_prewiped (incl. zone-region reuse) and Engine::open with no visible header and no manifest start the log at a random epoch below 2^62, so 0528's forward search can't replay a previous store's bodies; tail_epochs unchanged, truncate counts its tail from the truncation point. A value-rewriting merge planned while the recovered log's fence is pending writes and flushes its first value segment's header before records. Tests: format_fence used-device test (incl. dump), zonestore reused-region test checks 40 old keys, crash_points merge-fence and truncated-store tests; the crash harness now formats over a previous store (knockout base=0 fails 364/~1000 cases per test). formats.md §2.1/§2.2 and testing-notes updated. Workspace tests pass; claude+sol accepted.
+
+Commit: 0540: new stores start at a random epoch so a reused device's old records never replay; merges before the recovered log's first segment fence their header; crash harness formats over a previous store

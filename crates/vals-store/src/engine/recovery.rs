@@ -155,7 +155,8 @@ impl<D: BlockDevice> Engine<D> {
     pub fn create_prewiped(dev: D, cfg: Config) -> Self {
         let block_size = dev.block_size();
         let alloc = Allocator::new(dev.num_blocks(), cfg.seg_blocks, cfg.reserved_blocks);
-        let log = ValueLog::new(block_size, cfg.seg_blocks, 0, 0);
+        let epoch_base = fresh_epoch_base();
+        let log = ValueLog::new(block_size, cfg.seg_blocks, 0, epoch_base);
         let index = new_index(cfg.ordering);
         Self::from_parts(
             Arc::new(dev),
@@ -167,7 +168,7 @@ impl<D: BlockDevice> Engine<D> {
                 runs: Vec::new(),
                 manifest_gen: 0,
                 live_manifest: None,
-                last_flush_epoch: 0,
+                last_flush_epoch: epoch_base,
                 last_flush_seq: 0,
                 winner_directory: winner_directory_requested().then(WinnerDirectory::default),
                 rts: RtState::default(),
@@ -328,7 +329,11 @@ impl<D: BlockDevice> Engine<D> {
             (a, b) => a.or(b),
         };
         let next_seq = max_seq.map_or(0, |m| m + 1);
-        let next_epoch = resume_next_epoch(max_epoch_all, min_replay_epoch).saturating_add(RECOVERY_EPOCH_GAP);
+        let next_epoch = if max_epoch_all.is_none() && min_replay_epoch.is_none() {
+            fresh_epoch_base()
+        } else {
+            resume_next_epoch(max_epoch_all, min_replay_epoch).saturating_add(RECOVERY_EPOCH_GAP)
+        };
         let flushed_epoch = min_replay_epoch.unwrap_or(0);
         let tail_count = log_segs.iter().filter(|(_, ep, not_tail)| !*not_tail && *ep > flushed_epoch).count() as u64;
         let tail_epoch_gap = next_epoch.saturating_sub(1).saturating_sub(flushed_epoch).saturating_sub(tail_count);
@@ -475,7 +480,7 @@ impl<D: BlockDevice> Engine<D> {
         self.key_filter.reset();
         self.cover_scan_backoff.clear();
         self.live_manifest = None;
-        self.last_flush_epoch = 0;
+        self.last_flush_epoch = self.log.next_epoch().saturating_sub(1);
         self.last_flush_seq = 0;
         self.mutable_tombstones = None;
         self.refresh_data_reserve();
@@ -532,6 +537,13 @@ impl<D: BlockDevice> Engine<D> {
     pub(super) fn bump_mutable_generation(&mut self) {
         self.mutable_gen = self.mutable_gen.wrapping_add(1);
     }
+}
+
+fn fresh_epoch_base() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    h.finish() >> 2
 }
 
 fn corrupt_manifest(why: &'static str) -> EngineError {

@@ -643,6 +643,7 @@ pub struct VlogWriter<'a, D: BlockDevice> {
     block_size: usize,
     seg_idx: usize,
     open: bool,
+    fence_first_header: bool,
     buf: Vec<u8>,
     err: Option<LogError>,
 }
@@ -667,9 +668,15 @@ impl<'a, D: BlockDevice> VlogWriter<'a, D> {
             block_size,
             seg_idx: usize::MAX,
             open: false,
+            fence_first_header: false,
             buf: Vec::with_capacity(seg_capacity),
             err: None,
         }
+    }
+
+    pub fn fence_first_header(mut self, fence: bool) -> Self {
+        self.fence_first_header = fence;
+        self
     }
 
     pub fn usable_per_segment(&self) -> usize {
@@ -747,6 +754,15 @@ impl<'a, D: BlockDevice> VlogWriter<'a, D> {
         );
         self.buf.extend_from_slice(&hdr);
         self.open = true;
+        if next == 0 && self.fence_first_header {
+            let mut block = vec![0u8; self.block_size];
+            block[..hdr.len()].copy_from_slice(&hdr);
+            crate::attribution::write_bytes(2, block.len());
+            if let Err(e) = self.dev.write_at(self.seg_lbas[0], &block).and_then(|()| self.dev.flush()) {
+                self.err = Some(LogError::Corrupt("vlog co-compaction write failed"));
+                return Err(e.into());
+            }
+        }
         Ok(())
     }
 
@@ -884,6 +900,10 @@ impl ValueLog {
 
     pub fn carry_epoch_fence(&mut self, from: &ValueLog) {
         self.epoch_fence_pending |= from.epoch_fence_pending;
+    }
+
+    pub fn epoch_fence_pending(&self) -> bool {
+        self.epoch_fence_pending
     }
 
     fn reap(&self) -> Result<(), LogError> {

@@ -125,6 +125,39 @@ fn create_fences_stale_pre_format_segments() {
 }
 
 #[test]
+fn create_over_a_used_device_replays_no_record_past_the_new_tail() {
+    let cfg = Config { seg_blocks: 16, reserved_blocks: 0, ordering: Ordering::Sorted };
+    let dev = MemBlockDevice::new(BLOCK_SIZE, 256);
+    for round in 0..3u32 {
+        let mut e = Engine::create(dev.share(), cfg).unwrap();
+        for i in 0..40u32 {
+            e.put(format!("old-{i:02}").as_bytes(), &[7; 100], 100 + i as u128).unwrap();
+        }
+        e.sync().unwrap();
+        drop(e);
+        if round == 1 {
+            drop(Engine::open(dev.share(), cfg).unwrap());
+        }
+
+        let mut e = Engine::create(dev.share(), cfg).unwrap();
+        e.put(b"new", b"v", 1).unwrap();
+        e.sync().unwrap();
+        drop(e);
+
+        let e = Engine::open(dev.share(), cfg).unwrap();
+        let back: Vec<u32> = (0..40).filter(|i| e.get(format!("old-{i:02}").as_bytes()).unwrap().is_some()).collect();
+        assert!(back.is_empty(), "round {round}: old keys replayed after a format: {back:?}");
+        assert_eq!(e.get(b"new").unwrap().as_deref(), Some(&b"v"[..]));
+        let stats = scan_vlog_records(&dev, &cfg, |rec| {
+            assert_eq!(rec.key, b"new", "dump surfaced a pre-format record");
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        assert_eq!(stats.records, 1);
+    }
+}
+
+#[test]
 fn dump_over_fenced_device_sees_only_live_records() {
     let dev = MemBlockDevice::new(BLOCK_SIZE, NUM_BLOCKS);
     write_corpus_a(&dev);

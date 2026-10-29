@@ -462,13 +462,27 @@ Recovery now does two things (0532):
   value-log GC or `truncate`) has its header block written and the device
   flushed before any record goes into it. `Engine::open` itself never writes.
   The next recovery therefore sees that epoch and skips past it, even if a
-  second crash hides every later header.
+  second crash hides every later header. A merge that rewrites values while
+  that first log segment is still unopened fences its own first value segment
+  the same way: it writes that segment's header block and flushes the device
+  before writing any record into it (0540).
 
 The skipped epochs do not count toward `Engine::tail_epochs`, the count of
 unflushed log segments that the node's `flush_tail_epochs` setting is compared
-with. Two cases remain open (0540): a format restarts epochs at 0, so a reused
-device can hold records of a reused epoch, and value-rewrite epochs that a
-merge reserves before the recovered store's first log segment are not fenced.
+with.
+
+A format cannot skip past epochs it cannot see: the wipe removes every header,
+but a reused device or zone region still holds the previous store's record
+bodies, and 0528's forward search would walk past the new data's end into any
+of them whose epoch matches the segment's. So a new store does not start at
+epoch 0. `Engine::create` and `Engine::create_prewiped` (which zone-region
+reuse calls after `wipe_region`) start at a random epoch below 2^62, and so
+does `Engine::open` when it finds no segment header and no manifest (an empty
+device, or a truncated store whose crash lost every later header). Epochs then
+rise monotonically from that base. A collision with a previous store's epoch
+on the same segment needs the two random ranges to overlap, which is
+negligibly unlikely in 2^62 (0540). `truncate` keeps the store's epoch
+sequence and counts its tail from the truncation point.
 
 ### 2.2 Segment header
 
@@ -542,7 +556,8 @@ first**, then flushes, before any new data is written or the region is named:
   replay.
 
 A valid header thus always postdates the last format, and the intra-segment
-record-epoch binding (§2.1) fences reuse *within* a segment. Together they make
+record-epoch binding (§2.1) fences reuse *within* a segment, because a format
+starts the new store at a random epoch rather than 0 (0540). Together they make
 "valid header ⇒ written since this format" hold on any device, reused or not.
 
 A **format-generation stamp** (a monotone counter in each header + a superblock,

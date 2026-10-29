@@ -2089,6 +2089,9 @@ mod tests {
         sb.persist(1, &table.regions(), None, None, None).unwrap();
         let mut ex = Engine::create_prewiped(shard(&rx), cfg);
         ex.put(b"x-key", b"x-secret", 0).unwrap();
+        for i in 0..40u32 {
+            ex.put(format!("x-{i:02}").as_bytes(), &[7; 100], 100 + i as u128).unwrap();
+        }
         ex.sync().unwrap();
         drop(ex);
 
@@ -2107,7 +2110,10 @@ mod tests {
 
         wipe_region(&shard(&ry), &cfg).unwrap();
         sb.persist(3, &table.regions(), None, None, None).unwrap();
-        let _ey = Engine::create_prewiped(shard(&ry), cfg);
+        let mut ey = Engine::create_prewiped(shard(&ry), cfg);
+        ey.put(b"y-key", b"y", 1).unwrap();
+        ey.sync().unwrap();
+        drop(ey);
 
         let (gen, regions, _wm, _, _) = sb.load().unwrap().unwrap();
         assert_eq!(gen, 3);
@@ -2116,15 +2122,14 @@ mod tests {
         let r = table2.get(2).unwrap();
         assert_eq!(r.base, rx.base);
         let ey = Engine::open(shard(&r), cfg).unwrap();
-        assert!(
-            ey.is_empty(),
-            "zone Y must reopen empty, not with the dropped zone's keys"
-        );
+        assert_eq!(ey.get(b"y-key").unwrap().as_deref(), Some(&b"y"[..]));
         assert_eq!(
             ey.get(b"x-key").unwrap(),
             None,
             "the dropped zone's data must not resurrect under the new zone"
         );
+        let back: Vec<u32> = (0..40).filter(|i| ey.get(format!("x-{i:02}").as_bytes()).unwrap().is_some()).collect();
+        assert!(back.is_empty(), "the dropped zone's records replayed past zone Y's tail: {back:?}");
     }
 
     #[test]

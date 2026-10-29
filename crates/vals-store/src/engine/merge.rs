@@ -212,6 +212,7 @@ struct CompactPlanOutput {
     vlog_segs: Vec<SegmentId>,
     vlog_seg_lbas: Vec<u64>,
     vlog_epochs: Vec<u64>,
+    vlog_fence: bool,
     paced: bool,
     kind: MergeKind,
     inner: bool,
@@ -238,6 +239,7 @@ pub struct CompactPlan<D: BlockDevice> {
     pub(super) vlog_segs: Vec<SegmentId>,
     vlog_seg_lbas: Vec<u64>,
     vlog_epochs: Vec<u64>,
+    vlog_fence: bool,
     vlog_seg_capacity: usize,
     pub(super) paced: bool,
     dev: Arc<D>,
@@ -282,6 +284,7 @@ impl<D: BlockDevice> CompactPlan<D> {
             vlog_segs: output.vlog_segs,
             vlog_seg_lbas: output.vlog_seg_lbas,
             vlog_epochs: output.vlog_epochs,
+            vlog_fence: output.vlog_fence,
             vlog_seg_capacity: seg_bytes,
             paced: output.paced,
             dev,
@@ -522,7 +525,8 @@ async fn compact_and_write_inner<D: BlockDevice>(
             &plan.vlog_epochs,
             plan.vlog_seg_capacity,
             plan.block_size,
-        )),
+        )
+        .fence_first_header(plan.vlog_fence)),
     };
 
     let sink = run::SegmentStreamSink::new(
@@ -2057,6 +2061,7 @@ impl<D: BlockDevice> Engine<D> {
                 vlog_segs,
                 vlog_seg_lbas,
                 vlog_epochs,
+                vlog_fence: self.log.epoch_fence_pending(),
                 paced: !matches!(kind, PlanKind::Pressure) || (shadow_fold && !at_floor),
                 inner,
                 kind: match kind {
@@ -2357,6 +2362,7 @@ impl<D: BlockDevice> Engine<D> {
                 vlog_segs,
                 vlog_seg_lbas,
                 vlog_epochs,
+                vlog_fence: self.log.epoch_fence_pending(),
                 paced: false,
                 kind: MergeKind::VlogGc,
                 inner: false,

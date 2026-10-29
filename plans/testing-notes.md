@@ -37,12 +37,15 @@ common when devbox's load average is high (about 50 or more, from other sessions
 ## Crash-point harness (0532)
 
 - `engine::tests::crash_points` (vals-store lib) runs a seeded engine workload on
-  `CrashSimDevice`, which records every write and device flush: puts, tombstone puts, range
+  `CrashSimDevice`, which records every write and device flush. The device first holds a
+  previous store (puts, a flush and a reopen, at higher versions than the workload's), then
+  `Engine::create` formats it (0540), so a replay of an old record shows up as a wrong value.
+  The workload: puts, tombstone puts, range
   deletes (sorted test), syncs, value-log GC (`compact`), flushes, a whole-run merge, a
   tombstone-GC merge (with value rewrite in the sorted test, which runs under
   `VALS_VLOG_CO_COMPACT=1`) and two clean reopens, so later crashes hit a recovered store. It
   then replays the events into a `WriteBackCache` and crashes
-  before every event: a flush makes earlier writes durable, and `crash(seed, tear)` keeps each
+  before every event from the format on: a flush makes earlier writes durable, and `crash(seed, tear)` keeps each
   unflushed block with probability 1/2; with `tear`, one unflushed block keeps a random subset
   of its 512-byte sectors.
 - Each crash image must open without error or panic and pass `storage_audit_for_test`. Every
@@ -58,9 +61,8 @@ common when devbox's load average is high (about 50 or more, from other sessions
   fails it at one crash point in each test with `ManifestLost`. Before 0532's `RECOVERY_EPOCH_GAP`, about
   6% of crash cases failed the reopen check; without the first-segment epoch fence after a
   recovery, up to 9 cases per seed and test fail it after a reopen (4 at the default seed,
-  none at seed 1; docs/formats.md §2.1).
-- The workload starts on a zeroed device. Starting from a device that holds an older store is
-  0540.
+  none at seed 1; docs/formats.md §2.1). Starting new stores at epoch 0 again (before 0540's
+  random epoch base) fails 364 of about 1,000 cases per test with old-store values.
 
 ## Test seams and assertions
 

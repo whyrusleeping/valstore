@@ -221,6 +221,7 @@ struct Workload {
     rewrite_values: bool,
     geo: Geometry,
     cfg: Config,
+    formatted_at: usize,
 }
 
 fn crash_key(i: u32) -> Vec<u8> {
@@ -234,8 +235,22 @@ fn crash_value(ver: u128, len: usize) -> Vec<u8> {
 impl Workload {
     fn new(geo: Geometry, cfg: Config, seed: u64, rewrite_values: bool) -> Self {
         let dev = CrashSimDevice::new(geo.bs, geo.blocks);
-        let e = Engine::create_prewiped(dev.clone(), cfg);
-        Workload { e, dev, rng: Rng(seed), ver: 1, ops: Vec::new(), acks: Vec::new(), maint: Vec::new(), rewrite_values, geo, cfg }
+        write_previous_store(&dev, cfg, seed);
+        let e = Engine::create(dev.clone(), cfg).unwrap();
+        let formatted_at = dev.events();
+        Workload {
+            e,
+            dev,
+            rng: Rng(seed),
+            ver: 1,
+            ops: Vec::new(),
+            acks: Vec::new(),
+            maint: Vec::new(),
+            rewrite_values,
+            geo,
+            cfg,
+            formatted_at,
+        }
     }
 
     fn record(&mut self, effect: Effect, start: usize) {
@@ -332,6 +347,28 @@ impl Workload {
     }
 }
 
+fn write_previous_store(dev: &CrashSimDevice, cfg: Config, seed: u64) {
+    let mut rng = Rng(seed ^ 0x0540);
+    let mut ver = 1u128 << 64;
+    let mut puts = |e: &mut Engine<CrashSimDevice>, n: usize| {
+        for _ in 0..n {
+            let key = crash_key(rng.below(CRASH_KEYS as u64) as u32);
+            let len = [120usize, 900, 3000][rng.below(3) as usize];
+            e.put(&key, &crash_value(ver, len), ver).unwrap();
+            ver += 1;
+        }
+    };
+    let mut e = Engine::create_prewiped(dev.clone(), cfg);
+    puts(&mut e, 120);
+    e.flush(RunBuildOpts::default()).unwrap().expect("flush builds a run");
+    puts(&mut e, 120);
+    e.sync().unwrap();
+    drop(e);
+    let mut e = Engine::open(dev.clone(), cfg).unwrap();
+    puts(&mut e, 120);
+    e.sync().unwrap();
+}
+
 fn crash_universe() -> Vec<Vec<u8>> {
     let mut keys: Vec<Vec<u8>> = (0..CRASH_KEYS).map(crash_key).collect();
     keys.push(b"never-written".to_vec());
@@ -385,11 +422,11 @@ fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
 }
 
-fn crash_cases(geo: Geometry, total: usize, seed: u64) -> Vec<CrashCase> {
+fn crash_cases(geo: Geometry, from: usize, total: usize, seed: u64) -> Vec<CrashCase> {
     let mut rng = Rng(seed ^ 0x5eed_c0de);
     let tears: &[bool] = if geo.bs > SECTOR { &[false, true] } else { &[false] };
     let mut cases = Vec::new();
-    for point in 0..=total {
+    for point in from..=total {
         for &tear in tears {
             cases.push(CrashCase { point, seed: rng.next(), tear });
         }
@@ -515,14 +552,15 @@ fn crash_point_harness(ordering: Ordering, rewrite_values: bool) {
             let w = run_crash_workload(geo, cfg, seed, rewrite_values);
             let events = w.dev.take_events();
             let flushes = events.iter().filter(|e| matches!(e, CrashEvent::Flush)).count();
-            let cases = crash_cases(geo, events.len(), seed);
+            let cases = crash_cases(geo, w.formatted_at, events.len(), seed);
             println!(
-                "crash harness: {ordering:?} {}-byte blocks, seed {seed}: {} ops, {} acked syncs, {} device writes, \
-                 {flushes} flushes, maintenance at {:?}; {} crash cases",
+                "crash harness: {ordering:?} {}-byte blocks, seed {seed}: {} ops, {} acked syncs, {} device events \
+                 ({flushes} flushes) after formatting at event {}, maintenance at {:?}; {} crash cases",
                 geo.bs,
                 w.ops.len(),
                 w.acks.len(),
-                events.len() - flushes,
+                events.len(),
+                w.formatted_at,
                 w.maint,
                 cases.len(),
             );
@@ -679,5 +717,84 @@ fn a_crash_that_loses_a_reopened_logs_first_header_does_not_reuse_its_epoch() {
     drop(e);
     let e = Engine::open(crashed.share(), cfg).unwrap();
     assert_eq!(e.get(b"old-20").unwrap(), seen, "recovery writes must not expose records recovery did not see");
+    assert_eq!(e.get(b"new").unwrap().as_deref(), Some(&b"v"[..]));
+}
+
+#[test]
+fn a_merge_that_rewrites_values_before_the_recovered_log_opens_fences_its_first_epoch() {
+    if bottommost_co_compact_env() {
+        return;
+    }
+    let cfg = Config { seg_blocks: 16, reserved_blocks: 0, ordering: Ordering::Sorted };
+    let dev = CrashSimDevice::new(512, 512);
+    let mut e = Engine::create_prewiped(dev.clone(), cfg);
+    for round in 0..2u128 {
+        for i in 0..12u32 {
+            e.put(format!("k-{i:02}").as_bytes(), &[round as u8; 900], 10 * round + i as u128 + 1).unwrap();
+        }
+        e.flush(RunBuildOpts::default()).unwrap().expect("flush builds a run");
+    }
+    e.sync().unwrap();
+    drop(e);
+    let mut e = Engine::open(dev.clone(), cfg).unwrap();
+    let recovered = e.log.next_epoch();
+    let plan = e.compact_plan(RunBuildOpts::default(), None).unwrap().expect("a merge plan");
+    assert!(plan.co_compacts(), "the merge rewrites values");
+    let reserved = plan.vlog_segs.len() as u64;
+    let headers: Vec<u64> = plan.vlog_segs.iter().map(|s| e.alloc.segment_range(*s).0).collect();
+    let header = headers[0];
+    let merge_start = dev.events();
+    let wdev = Arc::new(dev.sibling().unwrap());
+    vals_rt::block_on(compact_and_write(plan, wdev), || {}).map_err(|(_, err)| err).unwrap();
+    drop(e);
+    let events = dev.take_events();
+    let filled = (merge_start..events.len())
+        .find(|&i| matches!(&events[i], CrashEvent::Write(lba, data) if *lba == header && data[SEG_HEADER_LEN..].iter().any(|&b| b != 0)))
+        .expect("the merge writes its first value segment");
+    let before_flush = (filled..events.len()).find(|&i| matches!(events[i], CrashEvent::Flush)).unwrap();
+    let mut cache = WriteBackCache::new(512, 512);
+    for event in &events[..before_flush] {
+        match event {
+            CrashEvent::Write(lba, data) => cache.write(*lba, data),
+            CrashEvent::Flush => cache.flush(),
+        }
+    }
+    let image = cache.crash_keeping(|lba| !headers.contains(&lba));
+    let geo = Geometry { bs: 512, blocks: 512, seg_blocks: 16 };
+    let crashed = Engine::open(image_device(geo, &image), cfg).unwrap();
+    assert!(
+        crashed.log.next_epoch() > recovered + reserved,
+        "a crash that loses the merge's first header must not let the next open reuse its epochs: \
+         next epoch {} after the merge reserved {recovered}..{}",
+        crashed.log.next_epoch(),
+        recovered + reserved,
+    );
+}
+
+#[test]
+fn recovery_of_a_truncated_store_with_no_visible_header_replays_no_truncated_record() {
+    let cfg = Config { seg_blocks: 16, reserved_blocks: 0, ordering: Ordering::Sorted };
+    let dev = CrashSimDevice::new(512, 256);
+    let mut e = Engine::open(dev.clone(), cfg).unwrap();
+    for i in 0..40u32 {
+        e.put(format!("old-{i:02}").as_bytes(), &[7; 100], 100 + i as u128).unwrap();
+    }
+    e.sync().unwrap();
+    e.truncate().unwrap();
+    e.put(b"unsynced", &[8; 100], 500).unwrap();
+    e.sync_prepare().unwrap();
+    let (new_header, _) = e.alloc.segment_range(e.log.open_segment().unwrap());
+    drop(e);
+    let image = dev.state.lock().unwrap().cache.crash_keeping(|lba| lba != new_header);
+    let geo = Geometry { bs: 512, blocks: 256, seg_blocks: 16 };
+    let crashed = image_device(geo, &image);
+    let mut e = Engine::open(crashed.share(), cfg).unwrap();
+    assert!(e.is_empty(), "nothing synced survives the truncate");
+    e.put(b"new", b"v", 600).unwrap();
+    e.sync().unwrap();
+    drop(e);
+    let e = Engine::open(crashed.share(), cfg).unwrap();
+    let back: Vec<u32> = (0..40).filter(|i| e.get(format!("old-{i:02}").as_bytes()).unwrap().is_some()).collect();
+    assert!(back.is_empty(), "truncated records replayed: {back:?}");
     assert_eq!(e.get(b"new").unwrap().as_deref(), Some(&b"v"[..]));
 }
