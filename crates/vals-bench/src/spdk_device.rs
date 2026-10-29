@@ -27,7 +27,8 @@ pub(super) fn workload_asyncread(pci: &str, n: usize, concurrency: usize) {
         let okc = ok.clone();
         ex.spawn(async move {
             let mut b = vec![0u8; bs];
-            d.read_at_async(0, &mut b).await.unwrap();
+            // SAFETY: `b` is owned by this task, so leaking the read leaks it too.
+            unsafe { d.read_at_async(0, &mut b) }.await.unwrap();
             okc.set(b == pattern);
         });
         let dp = dev.clone();
@@ -83,7 +84,8 @@ pub(super) fn workload_asyncread(pci: &str, n: usize, concurrency: usize) {
                 counter.set(i + 1);
                 let lba = rng.below(region);
                 let t = Instant::now();
-                dev.read_at_async(lba, &mut buf).await.unwrap();
+                // SAFETY: `buf` is owned by this task, so leaking the read leaks it too.
+                unsafe { dev.read_at_async(lba, &mut buf) }.await.unwrap();
                 lat.borrow_mut().push(t.elapsed().as_nanos() as u64);
             }
         });

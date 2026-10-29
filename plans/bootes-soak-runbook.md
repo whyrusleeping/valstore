@@ -349,8 +349,8 @@ named zones, write at least 100 checked keys to each, and retain their expected
 values. Then stop the writer, gracefully stop one node, and wait until its
 unit is gone and its node PID is absent from `pgrep -x valsd` (a colocated PD
 must remain running). Ensure that node's config has no `format = true`, preserve
-the PD state and every drive, and restart it with the normal §2 command plus
-`-E VALS_SPDK_AFFINITY_CHECK=1`.
+the PD state and every drive, and restart it with the normal §2 command (the
+qpair ownership checks are always on).
 
 The gate passes only when all of the following hold:
 
@@ -360,14 +360,13 @@ The gate passes only when all of the following hold:
   `VALS SPDK FATAL`;
 - all retained keys read back with their expected values through the restarted
   node, and the normal §4 parity checks still pass through the cluster;
-- the strict rejection test passes in the SPDK-linked box checkout:
-  `VALS_SPDK_LINK=1 cargo test -p vals-spdk --features spdk
-  sealed_owner_binding_rejects_cross_thread_use_and_rebind`.
+- the strict rejection tests pass in the SPDK-linked box checkout:
+  `VALS_SPDK_LINK=1 cargo test -p vals-spdk --features spdk owner`.
 
 Repeat the ordinary non-destructive restart one node at a time if the candidate
 is being certified fleet-wide. On any failure, stop that node and retain its
-config, complete log, core, binary hash, and catalog/key evidence; do not retry
-with the affinity check disabled and call that a pass. Restore the pre-gate
+config, complete log, core, binary hash, and catalog/key evidence; a passing
+retry does not make the gate a pass. Restore the pre-gate
 service state; destroy the gate corpus only with a separately planned offline
 provision command.
 

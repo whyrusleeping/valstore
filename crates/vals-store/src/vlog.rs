@@ -353,7 +353,9 @@ impl ReadPlan {
 
     async fn read_buf<D: AsyncRead + BlockDevice>(&self, dev: &D) -> Result<Scratch, LogError> {
         let mut buf: Scratch = dev.take_scratch(self.nblocks * self.block_size);
-        if let Err(e) = dev.read_async(self.lba, buf.as_mut_slice()).await {
+        // SAFETY: `buf` is owned by this future, so leaking the read leaks it too.
+        let read = unsafe { dev.read_async_in_place(self.lba, buf.as_mut_slice()) }.await;
+        if let Err(e) = read {
             dev.release_scratch(buf);
             return Err(e.into());
         }
@@ -496,12 +498,14 @@ impl SpanReadPlan {
     {
         let span = &self.spans[i];
         let mut buf: Scratch = dev.take_scratch(span.nblocks * self.block_size);
-        let read = dev
-            .read_async(
+        // SAFETY: `buf` is owned by this future, so leaking the read leaks it too.
+        let read = unsafe {
+            dev.read_async_in_place(
                 span.lba,
                 &mut buf.as_mut_slice()[..span.nblocks * self.block_size],
             )
-            .await;
+        }
+        .await;
         if let Err(e) = read {
             dev.release_scratch(buf);
             return Err(SpanReadError {
@@ -1227,7 +1231,8 @@ impl ValueLog {
                 .zip(&spans)
                 .zip(items)
                 .map(|((buf, &(first, _)), (seg_start, _))| {
-                    dev.read_async(seg_start + first, buf.as_mut_slice())
+                    // SAFETY: `bufs` is owned by this future, so leaking the reads leaks it too.
+                    unsafe { dev.read_async_in_place(seg_start + first, buf.as_mut_slice()) }
                 })
                 .collect();
             vals_rt::join_all(futs).await

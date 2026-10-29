@@ -1233,6 +1233,12 @@ impl<D: BlockDevice + AsyncRead> AsyncRead for SubDev<D> {
         self.check(lba, buf.len())?;
         self.parent.read_async(self.base + lba, buf).await
     }
+
+    async unsafe fn read_async_in_place(&self, lba: u64, buf: &mut [u8]) -> BlockResult<()> {
+        self.check(lba, buf.len())?;
+        // SAFETY: forwarded under this method's contract, which the caller upholds.
+        unsafe { self.parent.read_async_in_place(self.base + lba, buf) }.await
+    }
 }
 
 #[derive(Debug, Clone)]

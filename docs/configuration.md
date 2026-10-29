@@ -314,10 +314,9 @@ code, not a contract.
 
 ## Incident instrumentation
 
-`VALS_SPDK_AFFINITY_CHECK` defaults on; exactly `0` disables the qpair/thread
-ownership checks in `vals-spdk/src/spdk.rs`. This is an incident escape hatch
-and safety tripwire, not an endorsed way to run cross-thread serving I/O. Leave
-it on.
+The SPDK qpair/thread ownership checks in `vals-spdk/src/spdk.rs` are always
+on: the `SpdkBlockDevice` `Send`/`Sync` soundness argument rests on them, so
+`VALS_SPDK_AFFINITY_CHECK` no longer exists and setting it does nothing.
 
 `VALS_STORE_REBUILD_LOST_MANIFEST` is unset by default. A store whose run
 manifest is damaged fails to open with an error naming the manifest

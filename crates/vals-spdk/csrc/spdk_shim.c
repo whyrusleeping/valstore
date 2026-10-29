@@ -579,6 +579,10 @@ int vals_spdk_poll(struct vals_spdk_dev *d) {
     return spdk_nvme_qpair_process_completions(d->qpair, 0);
 }
 
+uint64_t vals_spdk_aio_inflight(const struct vals_spdk_dev *d) {
+    return d->aio_inflight;
+}
+
 struct vals_aio_f {
     uint64_t magic;
     struct vals_spdk_dev *d;

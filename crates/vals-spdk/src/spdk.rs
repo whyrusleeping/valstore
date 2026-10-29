@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::{
     check_range, AsyncRead, BlockDevice, BlockError, MaintenanceCacheKey, Result, WriteHandle,
@@ -94,6 +94,7 @@ mod ffi {
             ctx: *mut c_void,
         ) -> c_int;
         pub fn vals_spdk_poll(dev: *mut vals_spdk_dev) -> c_int;
+        pub fn vals_spdk_aio_inflight(dev: *const vals_spdk_dev) -> u64;
         pub fn vals_spdk_flush(dev: *mut vals_spdk_dev) -> c_int;
         pub fn vals_spdk_deallocate(dev: *mut vals_spdk_dev, lbas: *const u64, counts: *const u32, n: u32) -> c_int;
         pub fn vals_spdk_aio_flush(
@@ -199,34 +200,39 @@ impl SubmittedIo {
     }
 }
 
+struct AbortOnUnwind;
+
+impl Drop for AbortOnUnwind {
+    fn drop(&mut self) {
+        std::process::abort();
+    }
+}
+
 impl Drop for SubmittedIo {
     fn drop(&mut self) {
-        self.state.waker.borrow_mut().take();
+        let unwinding = AbortOnUnwind;
+        drop(self.state.waker.borrow_mut().take());
         while !self.state.done.get() {
             if (self.poll)(self.dev) < 0 {
                 std::process::abort();
             }
             std::hint::spin_loop();
         }
+        std::mem::forget(unwinding);
     }
 }
 
 fn poll_submitted_spdk(dev: *mut c_void) -> c_int {
-    // SAFETY: accepted I/O keeps the qpair represented by `dev` live because the
-    // future borrows its SpdkBlockDevice; Drop drains before ending that borrow.
-    let completions = unsafe { ffi::vals_spdk_poll(dev.cast()) };
-    crate::note_spdk_async_poll(completions);
-    completions
+    // SAFETY: `dev` is the SpdkBlockDevice the submitting ReadAt or WriteAt
+    // borrows, and its Drop drains before that borrow ends.
+    let dev = unsafe { &*dev.cast::<SpdkBlockDevice>() };
+    dev.poll()
 }
 
 pub struct ReadAt<'a> {
-    dev: *mut ffi::vals_spdk_dev,
+    dev: &'a SpdkBlockDevice,
     lba: u64,
     buf: &'a mut [u8],
-    block_size: usize,
-    num_blocks: u64,
-    sectors_per_block: u64,
-    base_block: u64,
     submitted: Option<SubmittedIo>,
 }
 
@@ -247,7 +253,8 @@ impl Future for ReadAt<'_> {
             return Poll::Pending;
         }
 
-        if let Err(e) = check_range(this.block_size, this.num_blocks, this.lba, this.buf.len()) {
+        let dev = this.dev;
+        if let Err(e) = check_range(dev.block_size, dev.num_blocks, this.lba, this.buf.len()) {
             return Poll::Ready(Err(e));
         }
         let state = Rc::new(IoState {
@@ -255,17 +262,21 @@ impl Future for ReadAt<'_> {
             err: Cell::new(false),
             waker: RefCell::new(Some(cx.waker().clone())),
         });
+        let qpair = dev.qpair();
         let ctx = Rc::into_raw(state.clone()) as *mut c_void;
+        // SAFETY: the qpair guard makes this thread the qpair's only user;
+        // `read_at_async`'s contract keeps `buf` valid until completion.
         let rc = unsafe {
             ffi::vals_spdk_aio_read(
-                this.dev,
-                (this.base_block + this.lba) * this.sectors_per_block,
+                qpair.dev,
+                dev.dev_sector(this.lba),
                 this.buf.as_mut_ptr() as *mut c_void,
                 this.buf.len() as u64,
                 aio_complete,
                 ctx,
             )
         };
+        drop(qpair);
         if rc != 0 {
             // SAFETY: submit failed, so no completion will fire — reclaim the
             // reference leaked into `ctx` above.
@@ -274,7 +285,7 @@ impl Future for ReadAt<'_> {
         }
         crate::note_async_io_submitted();
         this.submitted = Some(SubmittedIo {
-            dev: this.dev.cast(),
+            dev: (dev as *const SpdkBlockDevice).cast_mut().cast(),
             state,
             poll: poll_submitted_spdk,
         });
@@ -283,13 +294,9 @@ impl Future for ReadAt<'_> {
 }
 
 pub struct WriteAt<'a> {
-    dev: *mut ffi::vals_spdk_dev,
+    dev: &'a SpdkBlockDevice,
     lba: u64,
     buf: &'a [u8],
-    block_size: usize,
-    num_blocks: u64,
-    sectors_per_block: u64,
-    base_block: u64,
     submitted: Option<SubmittedIo>,
 }
 
@@ -310,7 +317,8 @@ impl Future for WriteAt<'_> {
             return Poll::Pending;
         }
 
-        if let Err(e) = check_range(this.block_size, this.num_blocks, this.lba, this.buf.len()) {
+        let dev = this.dev;
+        if let Err(e) = check_range(dev.block_size, dev.num_blocks, this.lba, this.buf.len()) {
             return Poll::Ready(Err(e));
         }
         let state = Rc::new(IoState {
@@ -318,17 +326,22 @@ impl Future for WriteAt<'_> {
             err: Cell::new(false),
             waker: RefCell::new(Some(cx.waker().clone())),
         });
+        let qpair = dev.qpair();
         let ctx = Rc::into_raw(state.clone()) as *mut c_void;
+        // SAFETY: the qpair guard makes this thread the qpair's only user; the
+        // shim copies `buf` into its own DMA buffer before returning, so the
+        // write never reads `buf` after this call.
         let rc = unsafe {
             ffi::vals_spdk_aio_write(
-                this.dev,
-                (this.base_block + this.lba) * this.sectors_per_block,
+                qpair.dev,
+                dev.dev_sector(this.lba),
                 this.buf.as_ptr() as *const c_void,
                 this.buf.len() as u64,
                 aio_write_complete,
                 ctx,
             )
         };
+        drop(qpair);
         if rc != 0 {
             // SAFETY: submit failed, so no completion will fire — reclaim the
             // reference leaked into `ctx` above.
@@ -338,7 +351,7 @@ impl Future for WriteAt<'_> {
         crate::note_spdk_api_write_submit(this.buf.len() as u64);
         crate::note_async_io_submitted();
         this.submitted = Some(SubmittedIo {
-            dev: this.dev.cast(),
+            dev: (dev as *const SpdkBlockDevice).cast_mut().cast(),
             state,
             poll: poll_submitted_spdk,
         });
@@ -363,14 +376,26 @@ impl OwnerBinding {
         }
     }
 
-    fn bind(&mut self, current: std::thread::ThreadId) {
+    fn bind(&mut self, current: std::thread::ThreadId, aio_inflight: impl FnOnce() -> u64) {
         assert!(
             !self.sealed || self.owner == Some(current),
             "SPDK qpair ownership steal after seal"
         );
+        if self.owner.is_some_and(|owner| owner != current) {
+            assert_eq!(
+                aio_inflight(),
+                0,
+                "SPDK qpair ownership move with async I/O in flight"
+            );
+        }
         self.owner = Some(current);
         self.sealed = true;
     }
+}
+
+struct QpairGuard<'a> {
+    _binding: MutexGuard<'a, OwnerBinding>,
+    dev: *mut ffi::vals_spdk_dev,
 }
 
 pub struct SpdkBlockDevice {
@@ -384,13 +409,6 @@ pub struct SpdkBlockDevice {
     maintenance_qpair: Option<Arc<MaintenanceQpair>>,
 }
 
-fn affinity_check_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("VALS_SPDK_AFFINITY_CHECK").map_or(true, |value| value != "0")
-    })
-}
-
 fn geometry(sector_size: u32) -> (usize, u64) {
     debug_assert!(sector_size > 0, "sector_size validated at open/attach");
     let sector = sector_size as usize;
@@ -402,11 +420,14 @@ fn geometry(sector_size: u32) -> (usize, u64) {
     (logical, (logical / sector.max(1)) as u64)
 }
 
-// SAFETY: `dev` is one SPDK I/O qpair, which must be used by exactly one thread.
-// Sequential boot I/O first-use-binds it; `bind_io_owner` explicitly rebinds and
-// seals ownership once at shard start. After sealing, cross-thread rebind panics
-// and every qpair use asserts the owner. Pre-seal cross-thread races are outside
-// the contract; these checks are best-effort tripwires, not a soundness proof.
+// SAFETY: `dev` is one SPDK I/O qpair, which only one thread may use at a time.
+// Every call that touches it goes through `qpair()`, which holds
+// `qpair_owner_thread` for the whole call and asserts that the caller is the
+// bound owner (and, for a shared maintenance qpair, the thread that opened it),
+// so no two threads ever use the qpair at once. First use binds the owner;
+// `bind_io_owner` moves ownership only while no async I/O is in flight, so
+// completions, whose `IoState` is a thread-confined `Rc`, always run on the
+// thread that submitted them. A maintenance qpair never changes thread.
 unsafe impl Send for SpdkBlockDevice {}
 unsafe impl Sync for SpdkBlockDevice {}
 
@@ -452,59 +473,60 @@ impl SpdkBlockDevice {
     }
 
     #[inline]
-    fn assert_owner_thread(&self) {
-        if !affinity_check_enabled() {
-            return;
-        }
+    fn qpair(&self) -> QpairGuard<'_> {
         let current = std::thread::current().id();
-        self.qpair_owner_thread
+        let mut binding = self
+            .qpair_owner_thread
             .lock()
-            .unwrap()
-            .assert_owner(current);
+            .unwrap_or_else(PoisonError::into_inner);
+        binding.assert_owner(current);
         if let Some(qpair) = self.maintenance_qpair.as_ref() {
             assert_eq!(
                 qpair.owner_thread, current,
                 "maintenance qpair used outside its owning worker thread"
             );
         }
-    }
-
-    #[inline]
-    fn raw_dev(&self) -> *mut ffi::vals_spdk_dev {
-        self.assert_owner_thread();
-        self.dev
+        QpairGuard {
+            _binding: binding,
+            dev: self.dev,
+        }
     }
 }
 
 impl SpdkBlockDevice {
-    pub fn read_at_async<'a>(&'a self, lba: u64, buf: &'a mut [u8]) -> ReadAt<'a> {
+    /// Reads into `buf`; the device DMAs straight into it when it is DMA
+    /// memory (a [`crate::Scratch`] from this device).
+    ///
+    /// # Safety
+    ///
+    /// Dropping the returned future waits for the device, but leaking it
+    /// after its first poll (`mem::forget`, an `Rc` cycle) does not. The
+    /// caller must not free or reuse `buf` unless the future has completed or
+    /// been dropped. Awaiting it inside an async fn or block that owns `buf`
+    /// meets this: leaking that outer future leaks `buf` with it.
+    pub unsafe fn read_at_async<'a>(&'a self, lba: u64, buf: &'a mut [u8]) -> ReadAt<'a> {
         ReadAt {
-            dev: self.raw_dev(),
+            dev: self,
             lba,
             buf,
-            block_size: self.block_size,
-            num_blocks: self.num_blocks,
-            sectors_per_block: self.sectors_per_block,
-            base_block: self.base_block,
             submitted: None,
         }
     }
 
     pub fn write_at_async<'a>(&'a self, lba: u64, buf: &'a [u8]) -> WriteAt<'a> {
         WriteAt {
-            dev: self.raw_dev(),
+            dev: self,
             lba,
             buf,
-            block_size: self.block_size,
-            num_blocks: self.num_blocks,
-            sectors_per_block: self.sectors_per_block,
-            base_block: self.base_block,
             submitted: None,
         }
     }
 
     pub fn poll(&self) -> i32 {
-        let completions = unsafe { ffi::vals_spdk_poll(self.raw_dev()) };
+        let qpair = self.qpair();
+        // SAFETY: the guard makes this thread the qpair's only user.
+        let completions = unsafe { ffi::vals_spdk_poll(qpair.dev) };
+        drop(qpair);
         crate::note_spdk_async_poll(completions);
         completions
     }
@@ -516,22 +538,20 @@ struct MaintenanceQpair {
     owner_thread: std::thread::ThreadId,
 }
 
-// SAFETY: access to `dev` is guarded by SpdkBlockDevice::raw_dev's owner-thread
-// assertion; Arc provides lifetime sharing, not permission for concurrent I/O.
+// SAFETY: every use of `dev` goes through SpdkBlockDevice::qpair, which asserts
+// `owner_thread`; Arc provides lifetime sharing, not permission for concurrent I/O.
 unsafe impl Send for MaintenanceQpair {}
 unsafe impl Sync for MaintenanceQpair {}
 
 impl Drop for MaintenanceQpair {
     fn drop(&mut self) {
-        if affinity_check_enabled() {
-            let current = std::thread::current().id();
-            if self.owner_thread != current {
-                eprintln!(
-                    "WARN SPDK: qpair closed on non-owner thread role=maintenance \
-                     owner={:?} current={current:?}",
-                    self.owner_thread
-                );
-            }
+        let current = std::thread::current().id();
+        if self.owner_thread != current {
+            eprintln!(
+                "WARN SPDK: qpair closed on non-owner thread role=maintenance \
+                 owner={:?} current={current:?}",
+                self.owner_thread
+            );
         }
         unsafe { ffi::vals_spdk_close(self.dev) };
         let live = self
@@ -764,9 +784,10 @@ impl BlockDevice for SpdkBlockDevice {
 
     fn read_at(&self, lba: u64, buf: &mut [u8]) -> Result<()> {
         check_range(self.block_size, self.num_blocks, lba, buf.len())?;
+        let qpair = self.qpair();
         let rc = unsafe {
             ffi::vals_spdk_read(
-                self.raw_dev(),
+                qpair.dev,
                 self.dev_sector(lba),
                 buf.as_mut_ptr() as *mut c_void,
                 buf.len() as u64,
@@ -777,14 +798,16 @@ impl BlockDevice for SpdkBlockDevice {
 
     fn write_at(&self, lba: u64, buf: &[u8]) -> Result<()> {
         check_range(self.block_size, self.num_blocks, lba, buf.len())?;
+        let qpair = self.qpair();
         let rc = unsafe {
             ffi::vals_spdk_write(
-                self.raw_dev(),
+                qpair.dev,
                 self.dev_sector(lba),
                 buf.as_ptr() as *const c_void,
                 buf.len() as u64,
             )
         };
+        drop(qpair);
         if rc == 0 {
             crate::note_spdk_api_write_submit(buf.len() as u64);
             crate::note_spdk_api_write_complete(true);
@@ -793,7 +816,9 @@ impl BlockDevice for SpdkBlockDevice {
     }
 
     fn flush(&self) -> Result<()> {
-        let rc = unsafe { ffi::vals_spdk_flush(self.raw_dev()) };
+        let qpair = self.qpair();
+        let rc = unsafe { ffi::vals_spdk_flush(qpair.dev) };
+        drop(qpair);
         rc_to_result(rc, "nvme flush")
     }
 
@@ -804,9 +829,11 @@ impl BlockDevice for SpdkBlockDevice {
             let lbas: Vec<_> = command.iter().map(|r| r.0).collect();
             let counts: Vec<_> = command.iter().map(|r| r.1).collect();
             let start = std::time::Instant::now();
+            let qpair = self.qpair();
             let rc = unsafe {
-                ffi::vals_spdk_deallocate(self.raw_dev(), lbas.as_ptr(), counts.as_ptr(), command.len() as u32)
+                ffi::vals_spdk_deallocate(qpair.dev, lbas.as_ptr(), counts.as_ptr(), command.len() as u32)
             };
+            drop(qpair);
             let result = if rc == -95 { Ok(false) } else { rc_to_result(rc, "nvme deallocate").map(|()| true) };
             let bytes = counts.iter().map(|&n| n as u64).sum::<u64>() * (self.block_size as u64 / self.sectors_per_block);
             crate::dealloc::note_dealloc(start, command.len(), bytes, &result);
@@ -828,9 +855,10 @@ impl BlockDevice for SpdkBlockDevice {
             .iter_mut()
             .map(|o| o.buf.as_mut_ptr() as *mut c_void)
             .collect();
+        let qpair = self.qpair();
         let rc = unsafe {
             ffi::vals_spdk_read_batch(
-                self.raw_dev(),
+                qpair.dev,
                 lbas.as_ptr(),
                 nbytes.as_ptr(),
                 out_ptrs.as_ptr(),
@@ -845,10 +873,14 @@ impl BlockDevice for SpdkBlockDevice {
             return WriteHandle::ready(Err(e));
         }
         let state = WriteState::pending();
+        let qpair = self.qpair();
         let ctx = Arc::into_raw(state.clone()) as *mut c_void;
+        // SAFETY: the guard makes this thread the qpair's only user; the shim
+        // copies `buf` into its own DMA buffer before returning, so the write
+        // never reads `buf` after this call.
         let rc = unsafe {
             ffi::vals_spdk_aio_write(
-                self.raw_dev(),
+                qpair.dev,
                 self.dev_sector(lba),
                 buf.as_ptr() as *const c_void,
                 buf.len() as u64,
@@ -856,6 +888,7 @@ impl BlockDevice for SpdkBlockDevice {
                 ctx,
             )
         };
+        drop(qpair);
         if rc != 0 {
             // SAFETY: submit failed, so no completion will fire — reclaim the
             // reference leaked into `ctx` above.
@@ -869,7 +902,9 @@ impl BlockDevice for SpdkBlockDevice {
     fn submit_flush(&self) -> Option<WriteHandle> {
         let state = WriteState::timed_pending();
         let ctx = Arc::into_raw(state.clone()) as *mut c_void;
-        let rc = unsafe { ffi::vals_spdk_aio_flush(self.raw_dev(), flush_complete, ctx) };
+        let qpair = self.qpair();
+        let rc = unsafe { ffi::vals_spdk_aio_flush(qpair.dev, flush_complete, ctx) };
+        drop(qpair);
         if rc != 0 {
             // SAFETY: submit failed, so no completion will fire — reclaim the
             // reference leaked into `ctx` above.
@@ -896,10 +931,18 @@ impl BlockDevice for SpdkBlockDevice {
     }
 
     fn bind_io_owner(&self) {
+        let maintenance = self.maintenance_qpair.is_some();
         self.qpair_owner_thread
             .lock()
-            .unwrap()
-            .bind(std::thread::current().id());
+            .unwrap_or_else(PoisonError::into_inner)
+            .bind(std::thread::current().id(), || {
+                if maintenance {
+                    return 0;
+                }
+                // SAFETY: every other use of this serving qpair holds the
+                // binding lock this call holds, so nothing touches it meanwhile.
+                unsafe { ffi::vals_spdk_aio_inflight(self.dev) }
+            });
     }
 
     fn maintenance_sibling_cache_key(&self) -> Option<MaintenanceCacheKey> {
@@ -959,7 +1002,21 @@ impl BlockDevice for SpdkBlockDevice {
 
 impl AsyncRead for SpdkBlockDevice {
     async fn read_async(&self, lba: u64, buf: &mut [u8]) -> Result<()> {
-        self.read_at_async(lba, buf).await
+        check_range(self.block_size, self.num_blocks, lba, buf.len())?;
+        let mut scratch = self.take_scratch(buf.len());
+        // SAFETY: `scratch` belongs to this future, so leaking the future leaks
+        // it too and its memory is never reused while the device writes it.
+        let read = unsafe { self.read_at_async(lba, scratch.as_mut_slice()) }.await;
+        if read.is_ok() {
+            buf.copy_from_slice(&scratch);
+        }
+        self.release_scratch(scratch);
+        read
+    }
+
+    async unsafe fn read_async_in_place(&self, lba: u64, buf: &mut [u8]) -> Result<()> {
+        // SAFETY: this method's contract is `read_at_async`'s, and the caller upholds it.
+        unsafe { self.read_at_async(lba, buf) }.await
     }
 }
 
@@ -968,21 +1025,17 @@ impl Drop for SpdkBlockDevice {
         if self.maintenance_qpair.is_some() {
             return;
         }
-        if affinity_check_enabled() {
-            let current = std::thread::current().id();
-            let binding = self
-                .qpair_owner_thread
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match binding.owner {
-                Some(owner) if owner != current => {
-                    eprintln!(
-                        "WARN SPDK: qpair closed on non-owner thread role=serving \
-                         owner={owner:?} current={current:?}"
-                    );
-                }
-                _ => {}
-            }
+        let current = std::thread::current().id();
+        let owner = self
+            .qpair_owner_thread
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .owner;
+        if let Some(owner) = owner.filter(|owner| *owner != current) {
+            eprintln!(
+                "WARN SPDK: qpair closed on non-owner thread role=serving \
+                 owner={owner:?} current={current:?}"
+            );
         }
         if let Some(ctrlr) = self._ctrlr.as_ref() {
             let live = ctrlr
@@ -1030,6 +1083,47 @@ impl MapCtx for BlockError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panicking_waker_drop_aborts_instead_of_skipping_the_drain() {
+        const CHILD: &str = "VALS_SPDK_TEST_PANICKING_WAKER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "spdk::tests::a_panicking_waker_drop_aborts_instead_of_skipping_the_drain", "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(6), "child status {status:?}");
+            return;
+        }
+
+        struct PanicOnDrop;
+        #[allow(clippy::manual_noop_waker)]
+        impl std::task::Wake for PanicOnDrop {
+            fn wake(self: Arc<Self>) {}
+        }
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                panic!("waker drop");
+            }
+        }
+        fn never_completes(_: *mut c_void) -> c_int {
+            0
+        }
+        let state = Rc::new(IoState {
+            done: Cell::new(false),
+            err: Cell::new(false),
+            waker: RefCell::new(Some(Waker::from(Arc::new(PanicOnDrop)))),
+        });
+        let submitted = SubmittedIo {
+            dev: std::ptr::null_mut(),
+            state,
+            poll: never_completes,
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(submitted)));
+        std::process::exit(0);
+    }
 
     #[test]
     fn submitted_io_drop_drains_before_buffer_can_be_reused() {
@@ -1085,7 +1179,7 @@ mod tests {
             owner: Some(owner),
             sealed: false,
         }));
-        binding.lock().unwrap().bind(owner);
+        binding.lock().unwrap().bind(owner, || 0);
         binding.lock().unwrap().assert_owner(owner);
         let cross_thread = binding.clone();
         assert!(std::thread::spawn(move || {
@@ -1101,15 +1195,46 @@ mod tests {
             owner: Some(owner),
             sealed: false,
         }));
-        binding.lock().unwrap().bind(owner);
+        binding.lock().unwrap().bind(owner, || 0);
         assert!(std::thread::spawn(move || {
             binding
                 .lock()
                 .unwrap()
-                .bind(std::thread::current().id())
+                .bind(std::thread::current().id(), || 0)
         })
         .join()
         .is_err());
+    }
+
+    #[test]
+    fn unsealed_ownership_moves_only_with_no_async_io_in_flight() {
+        let owner = std::thread::current().id();
+        let busy = Arc::new(Mutex::new(OwnerBinding {
+            owner: Some(owner),
+            sealed: false,
+        }));
+        let moved = busy.clone();
+        assert!(std::thread::spawn(move || {
+            moved.lock().unwrap().bind(std::thread::current().id(), || 1)
+        })
+        .join()
+        .is_err());
+        assert_eq!(busy.lock().unwrap_or_else(PoisonError::into_inner).owner, Some(owner));
+
+        let idle = Arc::new(Mutex::new(OwnerBinding {
+            owner: Some(owner),
+            sealed: false,
+        }));
+        let moved = idle.clone();
+        let new_owner = std::thread::spawn(move || {
+            moved.lock().unwrap().bind(std::thread::current().id(), || 0);
+            std::thread::current().id()
+        })
+        .join()
+        .unwrap();
+        let binding = idle.lock().unwrap();
+        assert_eq!(binding.owner, Some(new_owner));
+        assert!(binding.sealed);
     }
 
     #[test]

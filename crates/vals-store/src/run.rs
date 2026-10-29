@@ -2253,7 +2253,8 @@ impl RangeLocator {
             let blk_end = (within + take).div_ceil(block_size) * block_size;
             let mut buf = vec![0u8; blk_end - blk_start];
             let lba = seg_lba + (blk_start / block_size) as u64;
-            dev.read_async(lba, &mut buf)
+            // SAFETY: `buf` is owned by this future, so leaking the read leaks it too.
+            unsafe { dev.read_async_in_place(lba, &mut buf) }
                 .await
                 .map_err(SnapshotError::Io)?;
             let s = within - blk_start;

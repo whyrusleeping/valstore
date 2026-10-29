@@ -383,6 +383,25 @@ pub trait BlockDevice: Send + Sync + 'static {
 pub trait AsyncRead {
     fn read_async(&self, lba: u64, buf: &mut [u8])
         -> impl std::future::Future<Output = Result<()>>;
+
+    /// Like [`read_async`](Self::read_async), but the device may keep writing
+    /// into `buf` until the read completes, which saves a copy on backends
+    /// that DMA straight into the caller's memory.
+    ///
+    /// # Safety
+    ///
+    /// Dropping the returned future waits for the device, but leaking it
+    /// after its first poll (`mem::forget`, an `Rc` cycle) does not. The
+    /// caller must not free or reuse `buf` unless the future has completed or
+    /// been dropped. Awaiting it inside an async fn or block that owns `buf`
+    /// meets this: leaking that outer future leaks `buf` with it.
+    unsafe fn read_async_in_place(
+        &self,
+        lba: u64,
+        buf: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<()>> {
+        self.read_async(lba, buf)
+    }
 }
 
 impl AsyncRead for MemBlockDevice {
@@ -465,6 +484,15 @@ impl<T: AsyncRead + ?Sized> AsyncRead for std::sync::Arc<T> {
         buf: &mut [u8],
     ) -> impl std::future::Future<Output = Result<()>> {
         (**self).read_async(lba, buf)
+    }
+
+    unsafe fn read_async_in_place(
+        &self,
+        lba: u64,
+        buf: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<()>> {
+        // SAFETY: forwarded under this method's contract, which the caller upholds.
+        unsafe { (**self).read_async_in_place(lba, buf) }
     }
 }
 

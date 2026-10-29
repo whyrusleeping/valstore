@@ -15,8 +15,17 @@ how the backend uses NVMe queue pairs, and what has been measured.
 (`crates/vals-spdk/csrc/spdk_shim.c`) around the SPDK NVMe driver: attach a
 controller and namespace, one I/O qpair per core, synchronous `read`/`write`,
 batched `read_batch`, asynchronous `read_at_async`/`write_at_async`
-(non-blocking submit plus a completion-to-waker bridge), and `poll`. `build.rs`
-compiles the shim and links SPDK only when `VALS_SPDK_LINK=1`.
+(non-blocking submit plus a completion-to-waker bridge), and `poll`.
+`read_at_async` is an `unsafe fn`: the device writes into the caller's buffer
+until the read completes, and dropping the future waits for that, but leaking
+it does not, so the caller must keep the buffer alive (owning it in the
+awaiting async fn is enough). The safe `AsyncRead::read_async` reads into a
+buffer the future owns and copies out; the engine's hot paths use the unsafe
+`read_async_in_place` to skip that copy. Writes are safe because the shim
+copies the buffer when it submits. Every qpair call holds the device's
+ownership lock and asserts the caller is the owning thread; these checks are
+always on. `build.rs` compiles the shim and links SPDK only when
+`VALS_SPDK_LINK=1`.
 
 The things that matter for performance:
 
