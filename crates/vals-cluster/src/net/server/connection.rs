@@ -583,6 +583,11 @@ impl<D: BlockDevice + AsyncRead + 'static> ConnDriver<D> {
                 scope,
                 requester,
             }) => {
+                if let Some(why) = sync_tree_geometry_error(level, scope_g, &scope) {
+                    crate::observe::counters().server_errors.inc();
+                    self.out.push_resp(reqid, &Response::Err(why));
+                    return true;
+                }
                 let (shared, out) = (self.shared.clone(), self.out.clone());
                 let inflight = InflightReadGuard::new(&out);
                 self.spawner.spawn(async move {
@@ -648,6 +653,11 @@ impl<D: BlockDevice + AsyncRead + 'static> ConnDriver<D> {
                 ids,
                 after,
             }) => {
+                if let Some(why) = bucket_digest_geometry_error(num_buckets) {
+                    crate::observe::counters().server_errors.inc();
+                    self.out.push_resp(reqid, &Response::Err(why));
+                    return true;
+                }
                 let resumable = self.negotiated.is_some_and(|n| {
                     n.features & crate::proto::FEATURE_RESUMABLE_DIGESTS != 0
                 });

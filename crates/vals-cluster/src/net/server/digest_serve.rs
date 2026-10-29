@@ -293,3 +293,72 @@ fn bucket_digest_serve_duration_measurement() {
     drop(store);
     let _ = std::fs::remove_file(&path);
 }
+
+fn rpc(addr: SocketAddr, request: &wire::Request) -> Response {
+    use std::io::{Read, Write};
+    let payload = wire::encode_request_payload(request);
+    let mut frame = ((8 + payload.len()) as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(&1u64.to_le_bytes());
+    frame.extend_from_slice(&payload);
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    crate::proto::client_handshake_blocking(&mut stream).unwrap();
+    stream.write_all(&frame).unwrap();
+    let mut len = [0u8; 4];
+    stream.read_exact(&mut len).expect("the node answers instead of dying");
+    let mut block = vec![0u8; u32::from_le_bytes(len) as usize];
+    stream.read_exact(&mut block).unwrap();
+    wire::decode_response(&block[8..]).unwrap()
+}
+
+#[test]
+fn bad_tree_and_bucket_geometry_is_refused_without_taking_the_node_down() {
+    let engine = Engine::create_prewiped(
+        MemBlockDevice::new(256, 4096),
+        Config { seg_blocks: 8, reserved_blocks: 0, ordering: SOrdering::Unsorted },
+    );
+    let mut store = VersionedStore::new(engine, 1).unwrap();
+    for i in 0..50u64 {
+        store.apply(format!("k{i:03}").as_bytes(), Some(b"v"), Version { hlc: i + 1, node: 1u32.into() }).unwrap();
+    }
+    let (addr, _server) = ReplicaServer::spawn_with_handle(store).unwrap();
+    let tree = |level, scope_g, scope: &[u32]| {
+        rpc(addr, &wire::Request::SyncTree { zone_id: DEFAULT_ZONE, level, scope_g, scope, requester: None })
+    };
+    let digests = |num_buckets, ids: &[u32]| {
+        rpc(addr, &wire::Request::SyncBucketDigests { zone_id: DEFAULT_ZONE, num_buckets, ids, after: None })
+    };
+    let ids: Vec<u32> = (0..BUCKETS).collect();
+    for (level, scope_g, scope) in [
+        (16, 0, &[0][..]),
+        (0, 1, &[0][..]),
+        (u32::MAX, 1, &[0][..]),
+        (1 << 20, 1, &[0][..]),
+        (48, 16, &[0][..]),
+        (16, 32, &[0][..]),
+        (16, 3, &[0][..]),
+        (16, 1, &[1][..]),
+        (256, 16, &[3, 16][..]),
+    ] {
+        let reply = tree(level, scope_g, scope);
+        assert!(
+            matches!(&reply, Response::Err(why) if why.starts_with("bad tree geometry")),
+            "level {level} scope_g {scope_g} scope {scope:?}: {reply:?}"
+        );
+    }
+    let reply = digests(0, &ids);
+    assert!(matches!(&reply, Response::Err(why) if why.starts_with("bad bucket geometry")), "{reply:?}");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let tree_reply = loop {
+        match tree(16, 1, &[0]) {
+            Response::Busy if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            reply => break reply,
+        }
+    };
+    assert!(matches!(&tree_reply, Response::Tree(nodes) if nodes.len() == 16), "{tree_reply:?}");
+    match digests(BUCKETS, &ids) {
+        Response::BucketDigests { digests, .. } => assert_eq!(digests.len(), 50),
+        other => panic!("valid geometry is still served: {other:?}"),
+    }
+}

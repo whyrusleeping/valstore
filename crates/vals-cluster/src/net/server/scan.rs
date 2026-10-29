@@ -2,6 +2,24 @@ use super::*;
 
 pub(super) mod reverse;
 
+pub(super) fn sync_tree_geometry_error(level: u32, scope_g: u32, scope: &[u32]) -> Option<String> {
+    let leaves = crate::antientropy::DEFAULT_BUCKETS;
+    if level == 0 || !leaves.is_multiple_of(level) {
+        return Some(format!("bad tree geometry: level {level} must divide {leaves}"));
+    }
+    if scope_g == 0 || !level.is_multiple_of(scope_g) {
+        return Some(format!("bad tree geometry: scope group {scope_g} must divide level {level}"));
+    }
+    scope
+        .iter()
+        .find(|&&id| id >= scope_g)
+        .map(|id| format!("bad tree geometry: scope id {id} is not below scope group {scope_g}"))
+}
+
+pub(super) fn bucket_digest_geometry_error(num_buckets: u32) -> Option<String> {
+    (num_buckets == 0).then(|| "bad bucket geometry: num_buckets must be non-zero".to_string())
+}
+
 pub(super) async fn serve_sync_tree<D: BlockDevice + AsyncRead>(
     store: &RefCell<VersionedStore<D>>,
     level: u32,
