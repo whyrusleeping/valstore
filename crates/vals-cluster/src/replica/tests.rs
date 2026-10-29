@@ -4894,22 +4894,80 @@
         );
     }
 
+    type GcCompact = fn(&mut VersionedStore<MemBlockDevice>, u64) -> Result<usize, EngineError>;
+
+    const GC_COMPACTIONS: [(&str, GcCompact); 2] = [
+        ("compact", |s, wall| s.compact(wall).map(|stats| stats.gc_dropped)),
+        ("compact_step", |s, wall| {
+            let mut dropped = 0;
+            loop {
+                let (stats, done) = s.compact_step(wall, 2)?;
+                dropped += stats.gc_dropped;
+                if done {
+                    return Ok(dropped);
+                }
+            }
+        }),
+    ];
+
     #[test]
     fn compact_never_uses_an_unpersisted_gc_cutoff() {
         let t = 10_000_000u64;
-        let mut s = store(1).with_gc_grace_ms(1000);
-        s.apply_at(b"k", None, vp(t, 1), t).unwrap();
-        s.apply_at(b"other", Some(b"x"), vp(t + 2000, 1), t + 2000)
-            .unwrap();
+        for (what, compact) in GC_COMPACTIONS {
+            let mut s = store(1).with_gc_grace_ms(1000);
+            s.apply_at(b"k", None, vp(t, 1), t).unwrap();
+            for i in 0..20u64 {
+                s.apply_at(format!("other{i:02}").as_bytes(), Some(&[b'x'; 200]), vp(t + 2000, 1), t + 2000)
+                    .unwrap();
+            }
 
-        let stats = s.compact(t + 2000).unwrap();
-        assert_eq!(stats.gc_dropped, 0);
-        assert!(s.get_versioned(b"k").unwrap().is_some());
+            assert_eq!(compact(&mut s, t + 2000).unwrap(), 0, "{what}");
+            assert!(s.get_versioned(b"k").unwrap().is_some(), "{what}");
 
-        s.advance_durable_gc_watermark(t + 2000);
-        let stats = s.compact(t + 2000).unwrap();
-        assert_eq!(stats.gc_dropped, 1);
-        assert_eq!(s.get_versioned(b"k").unwrap(), None);
+            s.advance_durable_gc_watermark(t + 2000);
+            assert_eq!(compact(&mut s, t + 2000).unwrap(), 1, "{what}");
+            assert_eq!(s.get_versioned(b"k").unwrap(), None, "{what}");
+        }
+    }
+
+    #[test]
+    fn gc_compaction_never_lets_an_old_value_back_in_after_a_restart() {
+        let t = 10_000_000u64;
+        let grace = 1000;
+        let cfg = Config { seg_blocks: 4, reserved_blocks: 0, ordering: Ordering::Unsorted };
+        for (what, compact) in GC_COMPACTIONS {
+            let mem = MemBlockDevice::new(BS, 256);
+            let mut s = VersionedStore::new(Engine::create_prewiped(mem.share(), cfg), 1)
+                .unwrap()
+                .with_gc_grace_ms(grace);
+            s.apply_at(b"k", Some(b"old"), vp(t - 10, 1), t).unwrap();
+            s.apply_at(b"k", None, vp(t, 1), t).unwrap();
+            let moved: std::collections::HashSet<Vec<u8>> =
+                (0..20u64).map(|i| format!("moved{i:02}").into_bytes()).collect();
+            for key in &moved {
+                s.apply_at(key, Some(&[b'x'; 200]), vp(t + 2000, 1), t + 2000).unwrap();
+            }
+            s.advance_durable_gc_watermark(t);
+            assert_eq!(
+                s.apply_at(b"k", Some(b"old"), vp(t - 10, 1), t + 2000).unwrap(),
+                Applied::Rejected,
+                "{what}: the live floor (high water - grace) refuses the old value before the restart"
+            );
+
+            compact(&mut s, t + 2000).unwrap();
+            assert!(
+                s.get_versioned(b"k").unwrap().is_some(),
+                "{what}: a tombstone above the persisted cutoff survives GC"
+            );
+            assert_eq!(s.forget(&moved).unwrap(), moved.len());
+            s.sync().unwrap();
+            drop(s);
+
+            let mut reopened = VersionedStore::open(mem.share(), cfg, 1).unwrap().with_gc_grace_ms(grace);
+            reopened.advance_durable_gc_watermark(t);
+            reopened.apply_at(b"k", Some(b"old"), vp(t - 10, 1), t + 2000).unwrap();
+            assert_eq!(reopened.get(b"k").unwrap(), None, "{what}: the deleted value stays deleted after the restart");
+        }
     }
 
     #[test]

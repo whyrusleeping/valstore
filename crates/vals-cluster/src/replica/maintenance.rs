@@ -530,10 +530,12 @@ impl<D: BlockDevice> VersionedStore<D> {
         self.engine.compact_in_flight()
     }
 
-    pub fn compact(&mut self, _wall_ms: u64) -> Result<vals_store::CompactStats, EngineError> {
+    fn tombstone_gc_filter<'a>(
+        &self,
+        dropped: &'a std::cell::RefCell<Vec<(Vec<u8>, Version)>>,
+    ) -> impl Fn(&[u8], u128, &[u8]) -> bool + 'a {
         let cutoff = self.durable_gc_cutoff_ms();
-        let dropped = std::cell::RefCell::new(Vec::new());
-        let stats = self.engine.compact_filtered(|key, record_version, raw| {
+        move |key, record_version, raw| {
             let Some(cutoff) = cutoff else {
                 return false;
             };
@@ -544,12 +546,22 @@ impl<D: BlockDevice> VersionedStore<D> {
                 dropped.borrow_mut().push((key.to_vec(), version));
             }
             drop
-        });
-        let stats = self.retire_gc_dropped(stats)?;
-        for (k, version) in dropped.into_inner() {
+        }
+    }
+
+    fn retire_tombstone_gc_drops(&self, dropped: Vec<(Vec<u8>, Version)>) {
+        for (k, version) in dropped {
             let group = self.group_of(&k);
             self.retire_winner(&k, &group, version);
         }
+    }
+
+    pub fn compact(&mut self, _wall_ms: u64) -> Result<vals_store::CompactStats, EngineError> {
+        let dropped = std::cell::RefCell::new(Vec::new());
+        let filter = self.tombstone_gc_filter(&dropped);
+        let stats = self.engine.compact_filtered(filter);
+        let stats = self.retire_gc_dropped(stats)?;
+        self.retire_tombstone_gc_drops(dropped.into_inner());
         Ok(stats)
     }
 
@@ -568,32 +580,14 @@ impl<D: BlockDevice> VersionedStore<D> {
 
     pub fn compact_step(
         &mut self,
-        wall_ms: u64,
+        _wall_ms: u64,
         max_segments: usize,
     ) -> Result<(vals_store::CompactStats, bool), EngineError> {
-        let grace = self.gc_grace_ms;
-        let eff_now = wall_ms.min(self.high_water_ms());
         let dropped = std::cell::RefCell::new(Vec::new());
-        let stepped =
-            self.engine
-                .compact_step_filtered(max_segments, |key, record_version, raw| {
-                    if grace == 0 {
-                        return false;
-                    }
-                    let version = unpack_version(record_version);
-                    let (kind, _) = decode(raw);
-                    let drop =
-                        kind == KIND_TOMB && eff_now.saturating_sub(version.physical_ms()) > grace;
-                    if drop {
-                        dropped.borrow_mut().push((key.to_vec(), version));
-                    }
-                    drop
-                });
+        let filter = self.tombstone_gc_filter(&dropped);
+        let stepped = self.engine.compact_step_filtered(max_segments, filter);
         let (stats, done) = self.retire_gc_dropped(stepped)?;
-        for (k, version) in dropped.into_inner() {
-            let group = self.group_of(&k);
-            self.retire_winner(&k, &group, version);
-        }
+        self.retire_tombstone_gc_drops(dropped.into_inner());
         Ok((stats, done))
     }
 
