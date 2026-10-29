@@ -2792,6 +2792,7 @@
 
     #[test]
     fn range_metrics_warn_on_concentrated_multi_range_zone() {
+        if crate::testutil::isolated_env_test(&[]) { return; }
         let zone_id = 7;
         let mut snap = PushState::new();
         snap.single_range_warn_entries = 50;

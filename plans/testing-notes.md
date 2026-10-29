@@ -8,12 +8,15 @@ against the current tests before relying on them.
 Before blaming a diff, check `uptime` and rerun the failing test alone. These failures are more
 common when devbox's load average is high (about 50 or more, from other sessions' builds).
 
-- **Process-global counters and gauges** (other tests bump them during a full
-  `cargo test -p vals-cluster --lib`): `ram::tests::swap_counts_against_budget_and_headroom`,
+- **Process-global counters and gauges:** a vals-cluster test that asserts an exact value or
+  an unchanged value of a process-global counter or gauge (`crate::observe`, vals-store
+  statics such as `rt_max_tree_built_blocks_total`) fails when other tests bump it in parallel.
+  Start such a test with `if crate::testutil::isolated_env_test(&[]) { return; }`, which reruns
+  it alone in a child process. `>= before + n` checks on monotonic counters are safe without
+  it. 0506 isolated the four known cases: `ram::tests::swap_counts_against_budget_and_headroom`,
   `pd::tests::range_metrics_warn_on_concentrated_multi_range_zone`,
-  `net::server::corrupt_read` `merge_rewrite_corruption_counts_logs_once_and_excludes_the_segment`,
-  and `coord::range_delete_scan_cost_tests::head_of_queue_scan_cost_does_not_depend_on_the_deleted_span_three_nodes_r2`
-  (panics at line ~209: "max_tree_built_blocks_total moved during every measured scan").
+  `net::server::corrupt_read` `merge_rewrite_corruption_counts_logs_once_and_excludes_the_segment`
+  and both `coord::range_delete_scan_cost_tests::head_of_queue_scan_cost_*` tests.
 - **Timing under load:** vals-cluster `node::tests` liveness_wipe and
   `multidrive_*_liveness_*`, `pd::tests::rival_and_obsolete_pd_groups…`,
   `maint::tests::cover_scans_progress_while_merges_are_continuously_queued` and
@@ -22,6 +25,14 @@ common when devbox's load average is high (about 50 or more, from other sessions
   `three_node_cluster_with_pd_serves_zones_and_survives_restart` (`ops >= 100` on node 1, line
   ~416) when it runs alongside the full vals-cluster and vals-server suites. Rerun that one with
   `--test daemon`.
+- **CPU saturation:** on 2026-10-29 `scripts/ci.sh` passed on devbox once unloaded and three
+  times beside `stress -c 48` (load averages 54 to 100). Beside `stress -c 160` (load about
+  167 on 192 cores) all three runs failed on timing tests: the maint cover-scan test above,
+  `antientropy::tests::cleanup_owner_probe_cuts_a_grown_window_when_the_peer_slows_down` ("one
+  pass took 784ms"), `net::tests::a_connection_silent_for_a_deadline_is_replaced_and_the_next_request_succeeds`
+  (QuorumFailed) and vals-server `tests/rehome_regroup.rs`
+  `knockout_whole_engine_invalidation_reseeds_peers_on_a_rehome` (timed out waiting for the
+  re-home).
 
 ## Test seams and assertions
 

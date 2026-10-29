@@ -266,10 +266,12 @@ fn assert_head_of_queue_cost_is_independent_of_n(nodes: u32, r: usize) {
 
 #[test]
 fn head_of_queue_scan_cost_does_not_depend_on_the_deleted_span_one_node() {
+    if crate::testutil::isolated_env_test(&[]) { return; }
     assert_head_of_queue_cost_is_independent_of_n(1, 1);
 }
 
 #[test]
 fn head_of_queue_scan_cost_does_not_depend_on_the_deleted_span_three_nodes_r2() {
+    if crate::testutil::isolated_env_test(&[]) { return; }
     assert_head_of_queue_cost_is_independent_of_n(3, 2);
 }

@@ -227,6 +227,7 @@ mod tests {
 
     #[test]
     fn swap_counts_against_budget_and_headroom() {
+        if crate::testutil::isolated_env_test(&[]) { return; }
         let _guard = override_with_swap_for_test(60, 39, 100);
         assert!(!ram_over_budget());
         assert_eq!(crate::observe::gauges().ram_headroom_bytes.get(), 1);

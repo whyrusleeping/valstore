@@ -204,6 +204,7 @@
 
     #[test]
     fn merge_rewrite_corruption_counts_logs_once_and_excludes_the_segment() {
+        if crate::testutil::isolated_env_test(&[]) { return; }
         reset_corrupt_read_log();
         let store = memtable_store(&[b"key-a", b"key-b"]);
         let b = ptr_of(&store, b"key-b");
