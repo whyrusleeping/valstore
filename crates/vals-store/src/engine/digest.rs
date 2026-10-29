@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) const DIGEST_PLAN_MEM_SCAN_CAP: usize = 16_384;
+
 impl<D: BlockDevice> Engine<D> {
     pub fn version_digest_page(
         &self,
@@ -96,11 +98,39 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
         per_entry_overhead: usize,
         cover: Option<std::sync::Arc<FragmentSet>>,
     ) -> Result<DigestPagePlan, EngineError> {
+        self.plan_version_digest_page_inner(want, bucket_of, after, max_bytes, per_entry_overhead, cover, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_version_digest_page_covered_resumable(
+        &self,
+        want: &std::collections::HashSet<u32>,
+        bucket_of: impl Fn(&[u8]) -> u32,
+        after: Option<&[u8]>,
+        max_bytes: usize,
+        per_entry_overhead: usize,
+        cover: Option<std::sync::Arc<FragmentSet>>,
+    ) -> Result<DigestPagePlan, EngineError> {
+        self.plan_version_digest_page_inner(want, bucket_of, after, max_bytes, per_entry_overhead, cover, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_version_digest_page_inner(
+        &self,
+        want: &std::collections::HashSet<u32>,
+        bucket_of: impl Fn(&[u8]) -> u32,
+        after: Option<&[u8]>,
+        max_bytes: usize,
+        per_entry_overhead: usize,
+        cover: Option<std::sync::Arc<FragmentSet>>,
+        resumable: bool,
+    ) -> Result<DigestPagePlan, EngineError> {
         let cover = cover.filter(|cover| !cover.is_empty());
         if want.is_empty() {
             return Ok(DigestPagePlan {
                 mem: Vec::new(),
                 mem_stop: None,
+                mem_through: None,
                 sources: Vec::new(),
                 after: after.map(<[u8]>::to_vec),
                 cover,
@@ -109,30 +139,40 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
         let mut mem = Vec::new();
         let mut mem_bytes = 0usize;
         let mut mem_stop = None;
+        let mut mem_through: Option<Vec<u8>> = None;
+        let mut mem_scanned = 0usize;
         let mut scan_after = after.map(<[u8]>::to_vec);
-        loop {
+        'scan: loop {
             let (entries, more) = self.index.maintenance_page(scan_after.as_deref(), 1024);
             if entries.is_empty() {
                 break;
             }
             let last = entries.last().unwrap().0.clone();
             for (key, entry) in entries {
+                mem_scanned += 1;
+                if mem_scanned > DIGEST_PLAN_MEM_SCAN_CAP && (resumable || !mem.is_empty()) {
+                    mem_stop = Some(key);
+                    break 'scan;
+                }
                 if !want.contains(&bucket_of(&key)) || digest_covered(cover.as_deref(), &key, entry.version) {
+                    mem_through = Some(key);
                     continue;
                 }
                 let size = key.len().saturating_add(per_entry_overhead);
                 if !mem.is_empty() && mem_bytes.saturating_add(size) > max_bytes {
                     mem_stop = Some(key);
-                    break;
+                    break 'scan;
                 }
                 mem_bytes = mem_bytes.saturating_add(size);
+                mem_through = Some(key.clone());
                 mem.push((key, entry.version));
             }
-            if mem_stop.is_some() || !more {
+            if !more {
                 break;
             }
             scan_after = Some(last);
         }
+        let mem_through = if resumable && mem_stop.is_some() { mem_through } else { None };
 
         let granularity = self.runs_bucket_granularity();
         let mut sources: Vec<run::VersionSource> = Vec::with_capacity(self.runs.len());
@@ -147,6 +187,7 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
         Ok(DigestPagePlan {
             mem,
             mem_stop,
+            mem_through,
             sources,
             after: after.map(<[u8]>::to_vec),
             cover,
@@ -194,6 +235,7 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
         let DigestPagePlan {
             mem,
             mem_stop,
+            mem_through,
             sources,
             after: planned_after,
             cover,
@@ -279,16 +321,19 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
                         DigestStep::Continue => continue,
                         DigestStep::Invalidated => return Ok(None),
                         DigestStep::Expired(resume) => {
-                            return Ok(Some(expired_page(out, resume, mem_stop.as_deref())));
+                            return Ok(Some(expired_page(out, resume, mem_stop.as_deref(), &mem_through)));
                         }
                     }
                 }
             }
             let Some(min_key) = ready_min(&heads).map(<[u8]>::to_vec) else {
-                return Ok(Some((out, mem_stop.is_some(), None)));
+                if mem_stop.is_some() {
+                    return Ok(Some(mem_stop_page(out, &mem_through)));
+                }
+                return Ok(Some((out, false, None)));
             };
             if mem_stop.as_ref().is_some_and(|stop| min_key >= *stop) {
-                return Ok(Some((out, true, None)));
+                return Ok(Some(mem_stop_page(out, &mem_through)));
             }
             let version = heads
                 .iter()
@@ -340,7 +385,7 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
                     DigestStep::Continue => {}
                     DigestStep::Invalidated => return Ok(None),
                     DigestStep::Expired(resume) => {
-                        return Ok(Some(expired_page(out, resume, mem_stop.as_deref())));
+                        return Ok(Some(expired_page(out, resume, mem_stop.as_deref(), &mem_through)));
                     }
                 }
             }
@@ -410,11 +455,17 @@ fn expired_page(
     out: Vec<(Vec<u8>, u128)>,
     resume: Vec<u8>,
     mem_stop: Option<&[u8]>,
+    mem_through: &Option<Vec<u8>>,
 ) -> ResumableDigestPage {
     if mem_stop.is_some_and(|stop| resume.as_slice() >= stop) {
-        return (out, true, None);
+        return mem_stop_page(out, mem_through);
     }
     (out, true, Some(resume))
+}
+
+fn mem_stop_page(out: Vec<(Vec<u8>, u128)>, mem_through: &Option<Vec<u8>>) -> ResumableDigestPage {
+    let resume = if out.is_empty() { mem_through.clone() } else { None };
+    (out, true, resume)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -479,6 +530,7 @@ impl DigestCheckpoint for NoopDigestCheckpoint {
 pub struct DigestPagePlan {
     mem: Vec<(Vec<u8>, u128)>,
     mem_stop: Option<Vec<u8>>,
+    mem_through: Option<Vec<u8>>,
     sources: Vec<run::VersionSource>,
     after: Option<Vec<u8>>,
     cover: Option<std::sync::Arc<FragmentSet>>,

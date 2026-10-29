@@ -203,13 +203,23 @@ At saturation the three nodes used 0.5 cores in all for `write-device` and
   run, the cache recovered quickly enough that its median was 0.39 ms.
 - **Background work after write bursts.** After a sustained burst of
   overwrites, the nodes need up to a few minutes of flushing, merging and
-  anti-entropy catch-up. During the catch-up, foreground reads stalled for
-  about 1.2 s at every 5 s sweep. One read phase that started straight after
-  two minutes of overwrites saw these stalls for about 15 s. A phase that
-  started straight after the device-durable write phase saw them for the
-  whole phase, at 12.3k reads/s with a p99 of 1.1 s. The tables above were
-  measured after the nodes went idle. Plan for this if your load arrives in
-  bursts.
+  anti-entropy catch-up, and reads are slower while it runs. The build
+  measured above also stalled reads for about 1.2 s at every 5 s sweep during
+  the catch-up: file-backend reads complete inline, and anti-entropy checked
+  a whole 8 MiB page of peer digests against the local store without letting
+  anything else run on the node's thread. Anti-entropy now yields every 128
+  local lookups or applies, and stops looking up keys once it has as many to
+  fetch as the pass may read. A node serving a digest page cuts it short after
+  5 ms without a device wait or after 16,384 memtable entries. To check this,
+  node 3 was stopped for the last 30 s of a buffered write phase on one host
+  and resumed as a read phase started. Before the change, reads stalled for
+  1.0–1.3 s in 10 of 58 saturated seconds and 29 of 58 moderate seconds.
+  After it, apart from reads that were waiting on node 3 when it resumed, no
+  read took longer than 45 ms. The worst one-second p99 was 17 ms, against
+  5 ms with no catch-up running. Node 3 caught up 146 s after
+  it resumed, against 166 s before. The tables above were measured after the
+  nodes went idle. Plan for slower reads during catch-up if your load arrives
+  in bursts.
 - **Same host vs network.** On one host the client, the three nodes and their
   disk traffic all share one machine and one drive. The loopback network adds
   little, but the shared drive matters for every phase that syncs or reads

@@ -164,9 +164,9 @@ cover the design-level ones.
 - **File backend.** Each node serves from one thread, which caps it at about
   the rates above. Device-durable writes sync on that thread, so reads mixed
   with them wait behind the sync (median read latency 15–29 ms in that
-  benchmark). After a burst of writes, anti-entropy catch-up can stall reads
-  for about 1.2 s every sweep for seconds to minutes
-  ([`benchmarks.md`](benchmarks.md)).
+  benchmark). After a burst of writes, anti-entropy catch-up slows reads for
+  seconds to minutes (worst one-second p99 17 ms against 5 ms idle in a forced
+  catch-up; [`benchmarks.md`](benchmarks.md)).
 - **Tombstone GC (`gc_grace > 0`).** Every node refuses a client write or
   cleanup handoff older than its newest data minus the grace. Anti-entropy
   between owners, range re-homes and `backup load` still copy older values,

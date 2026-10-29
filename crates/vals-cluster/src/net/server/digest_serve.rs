@@ -99,6 +99,59 @@ fn expired_bucket_digest_serves_resume_to_the_unbounded_page() {
 }
 
 #[test]
+fn bucket_digest_pages_end_at_the_hold_slice_while_the_deadline_is_far() {
+    let engine = Engine::create_prewiped(
+        MemBlockDevice::new(256, 262_144),
+        Config { seg_blocks: 256, reserved_blocks: 0, ordering: SOrdering::Unsorted },
+    );
+    let mut store = VersionedStore::new(engine, 1).unwrap();
+    for run in 0..4u64 {
+        for i in (run * 2_000..24_000).filter(|i| (i + run) % 3 != 0) {
+            let version = Version { hlc: (run + 1) << 20 | i, node: 1u32.into() };
+            store.apply(&bench_key(i), Some(b"value-08"), version).unwrap();
+        }
+        store.flush().unwrap();
+    }
+    let ids = vec![7u32, 2_000];
+    let (expected, _) = store.bucket_digest_page(BUCKETS, &ids, None, usize::MAX).unwrap();
+    let store = RefCell::new(store);
+    let dev = store.borrow().device_handle();
+    let gate = ReadGate::new();
+    struct Slice;
+    impl Drop for Slice {
+        fn drop(&mut self) {
+            DIGEST_SERVE_TEST_HOLD_SLICE.with(|slice| slice.set(None));
+        }
+    }
+    let _slice = Slice;
+    for (slice, cut) in [(Duration::from_secs(3_600), false), (Duration::ZERO, true)] {
+        DIGEST_SERVE_TEST_HOLD_SLICE.with(|s| s.set(Some(slice)));
+        let (mut got, mut after, mut pages) = (Vec::new(), None::<Vec<u8>>, 0usize);
+        loop {
+            let deadline = Some(Instant::now() + Duration::from_secs(3_600));
+            let response = vals_rt::block_on(
+                serve_bucket_digests_inner(&store, &*dev, &gate, BUCKETS, &ids, after.as_deref(), deadline),
+                || {},
+            );
+            pages += 1;
+            assert!(pages < 10_000);
+            let Response::BucketDigests { digests, more, resume } = response else {
+                panic!("expected bucket digests, got {response:?}");
+            };
+            assert_eq!(resume.is_some(), cut && more, "slice {slice:?}: a page ends early only at the hold slice");
+            let next = next_after(&digests, more, resume);
+            got.extend(digests);
+            match next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(got, expected, "slice {slice:?}");
+        assert_eq!(pages > 1, cut, "slice {slice:?}: {pages} pages");
+    }
+}
+
+#[test]
 fn served_bucket_digests_exclude_accounted_covered_winners() {
     let engine = Engine::create_prewiped(
         MemBlockDevice::new(256, 262_144),

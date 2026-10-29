@@ -132,6 +132,8 @@ const AE_RECONCILE_MAX_DIGEST_PAGES_PER_PASS: usize = 16;
 
 const AE_VALUE_FETCH_CHUNK: usize = 256;
 
+const AE_RECONCILE_YIELD_EVERY: usize = 128;
+
 pub fn bucket_of(key: &[u8], num_buckets: u32) -> u32 {
     (hash64(key) % num_buckets as u64) as u32
 }
@@ -521,6 +523,13 @@ fn apply_is_acknowledged(applied: Applied) -> bool {
     matches!(applied, Applied::Won | Applied::Lost(_))
 }
 
+async fn pace_local_op(ops: &mut usize) {
+    *ops += 1;
+    if ops.is_multiple_of(AE_RECONCILE_YIELD_EVERY) {
+        vals_rt::yield_now().await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_with<D: BlockDevice + AsyncRead, P: AePeer>(
     local: &RefCell<VersionedStore<D>>,
@@ -592,27 +601,36 @@ async fn reconcile_with<D: BlockDevice + AsyncRead, P: AePeer>(
     let mut value_reads = 0usize;
     let mut pages = 0usize;
     let mut after: Option<Vec<u8>> = resume.map(<[u8]>::to_vec);
+    let mut local_ops = 0usize;
     loop {
         pages += 1;
         let (digests, next) = peer
             .bucket_digests(zone_id, num_buckets, &diff, after.as_deref())
             .await?;
-        examined += digests.len();
-        counters.ae_digests_examined.add(digests.len() as u64);
 
+        let fetchable = max_value_reads - value_reads;
         let mut need: Vec<Vec<u8>> = Vec::new();
+        let mut seen = 0usize;
         for (key, peer_version) in digests {
+            seen += 1;
             if keep(&key).is_none() {
                 continue;
             }
+            pace_local_op(&mut local_ops).await;
             let behind = match local_version(local, &key, gate).await? {
                 None => true,
                 Some(cur) => peer_version.wins_over(&cur),
             };
             if behind {
                 need.push(key);
+                if need.len() >= fetchable {
+                    break;
+                }
             }
         }
+        examined += seen;
+        counters.ae_digests_examined.add(seen as u64);
+        let probing_cut = need.len() >= fetchable;
 
         let mut start = 0;
         while start < need.len() {
@@ -633,6 +651,7 @@ async fn reconcile_with<D: BlockDevice + AsyncRead, P: AePeer>(
                 let Some(floor) = keep(&key) else {
                     continue;
                 };
+                pace_local_op(&mut local_ops).await;
                 let acknowledged = local_apply(
                     local,
                     &key,
@@ -656,6 +675,9 @@ async fn reconcile_with<D: BlockDevice + AsyncRead, P: AePeer>(
                 let resume_at = need.get(start.saturating_sub(1)).cloned().or(next);
                 return Ok((applied, resume_at));
             }
+        }
+        if probing_cut {
+            return Ok((applied, need.last().cloned()));
         }
 
         let Some(next) = next else {
@@ -3592,6 +3614,146 @@ mod tests {
         assert_eq!(a.get(b"shared").unwrap().as_deref(), Some(&b"new"[..]));
         assert_eq!(a.get(b"only_b").unwrap().as_deref(), Some(&b"v"[..]));
         assert_eq!(a.get(b"only_a").unwrap().as_deref(), Some(&b"v"[..]));
+    }
+
+    struct PrefetchedValues<'a> {
+        digests: LocalPeer<'a, MemBlockDevice>,
+        values: std::collections::HashMap<Vec<u8>, Stored>,
+    }
+
+    impl AePeer for PrefetchedValues<'_> {
+        async fn tree(
+            &self,
+            zone_id: ZoneId,
+            level: u32,
+            scope_g: u32,
+            scope: &[u32],
+            requester: Option<NodeId>,
+        ) -> Result<Vec<(u32, u64)>, TransportError> {
+            self.digests.tree(zone_id, level, scope_g, scope, requester).await
+        }
+        async fn bucket_digests(
+            &self,
+            zone_id: ZoneId,
+            num_buckets: u32,
+            ids: &[u32],
+            after: Option<&[u8]>,
+        ) -> Result<crate::replica::DigestCursorPage, TransportError> {
+            self.digests.bucket_digests(zone_id, num_buckets, ids, after).await
+        }
+        async fn values(
+            &self,
+            _zone_id: ZoneId,
+            keys: &[Vec<u8>],
+        ) -> Result<crate::replica::EntryPage, TransportError> {
+            let found = keys.iter().filter_map(|key| Some((key.clone(), self.values.get(key)?.clone())));
+            Ok((found.collect(), false))
+        }
+    }
+
+    fn stale_flushed_copy(keys: usize) -> (RefCell<VersionedStore<MemBlockDevice>>, VersionedStore<MemBlockDevice>) {
+        let big = |node| {
+            let engine = Engine::create_prewiped(
+                MemBlockDevice::new(4096, 2048),
+                Config { seg_blocks: 16, reserved_blocks: 0, ordering: Ordering::Unsorted },
+            );
+            VersionedStore::new(engine, node).unwrap()
+        };
+        let a = RefCell::new(big(1));
+        let mut b = big(2);
+        for i in 0..keys {
+            let key = format!("k{i:05}").into_bytes();
+            a.borrow_mut().apply(&key, Some(b"old"), v(100, 1)).unwrap();
+            b.apply(&key, Some(b"new"), v(200, 2)).unwrap();
+        }
+        a.borrow_mut().flush().unwrap();
+        (a, b)
+    }
+
+    fn newer_values(keys: impl Iterator<Item = usize>) -> std::collections::HashMap<Vec<u8>, Stored> {
+        keys.map(|i| (format!("k{i:05}").into_bytes(), Stored { version: v(200, 2), value: Some(b"new".to_vec()) }))
+            .collect()
+    }
+
+    fn local_probes() -> u64 {
+        vals_store::attribution::lookup_snapshot()[2][0]
+    }
+
+    #[test]
+    fn reconcile_yields_between_local_probes_and_applies_of_one_digest_page() {
+        let keys = 4 * AE_RECONCILE_YIELD_EVERY + 7;
+        let (a, b) = stale_flushed_copy(keys);
+        let peer = PrefetchedValues { digests: LocalPeer(&b), values: newer_values(0..keys) };
+        let local_ops = || (local_probes(), a.borrow().mutable_generation());
+        let start = local_ops();
+        let last = std::cell::Cell::new(start);
+        let longest = std::cell::Cell::new(0u64);
+        let note = || {
+            let now = local_ops();
+            let (p, w) = last.replace(now);
+            longest.set(longest.get().max((now.0 - p) + (now.1 - w)));
+        };
+        let ticker = async {
+            loop {
+                note();
+                vals_rt::yield_now().await;
+            }
+        };
+        let vals_rt::Either::Left(applied) = run(vals_rt::race(reconcile(&a, &peer, DEFAULT_BUCKETS), ticker)) else {
+            unreachable!("the ticker never finishes")
+        };
+        note();
+        assert_eq!(applied.unwrap(), keys);
+        let end = last.get();
+        assert_eq!((end.0 - start.0, end.1 - start.1), (keys as u64, keys as u64), "one local probe and one write per key");
+        assert!(
+            longest.get() <= AE_RECONCILE_YIELD_EVERY as u64,
+            "{} local probes and applies ran without yielding to other tasks",
+            longest.get()
+        );
+        assert_eq!(a.borrow().get(b"k00000").unwrap().as_deref(), Some(&b"new"[..]));
+    }
+
+    #[test]
+    fn value_budgeted_reconcile_probes_no_further_than_it_can_fetch() {
+        let keys = 200;
+        let budget = 16;
+        let (a, b) = stale_flushed_copy(keys);
+        let peer = PrefetchedValues { digests: LocalPeer(&b), values: newer_values((0..keys).step_by(2)) };
+        let (mut resume, mut passes) = (None::<Vec<u8>>, 0);
+        loop {
+            let before = local_probes();
+            let (applied, next) = run(reconcile_with(
+                &a,
+                &peer,
+                DEFAULT_ZONE,
+                DEFAULT_BUCKETS,
+                usize::MAX,
+                usize::MAX,
+                budget,
+                resume.as_deref(),
+                None,
+                None,
+                None,
+                |_| Some(crate::replica::LiveFloor::Waive),
+            ))
+            .unwrap();
+            let probed = local_probes() - before;
+            assert!(probed <= budget as u64, "pass {passes} probed {probed} keys for a {budget}-value budget");
+            assert!(applied <= budget / 2);
+            passes += 1;
+            assert!(passes < 100, "budgeted reconcile failed to converge");
+            match next {
+                Some(c) => resume = Some(c),
+                None => break,
+            }
+        }
+        assert!(passes >= keys / budget, "{passes} passes");
+        let a = a.borrow();
+        for i in 0..keys {
+            let want: &[u8] = if i % 2 == 0 { b"new" } else { b"old" };
+            assert_eq!(a.get(format!("k{i:05}").as_bytes()).unwrap().as_deref(), Some(want), "k{i:05}");
+        }
     }
 
     struct AwaitMutationPeer<'a> {

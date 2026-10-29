@@ -368,7 +368,18 @@ so these replies are **paged** rather than ever exceeding `MAX_FRAME`:
   request it seeks v4/v5 runs past `after` through their block index. The budget is
   cooperative: a page ends at the first window read after it lapses, so a page
   normally overruns it by at most one window read per run. Pre-v4 legacy sidecar runs
-  cannot seek and still rescan from offset 0 on every continuation page.
+  cannot seek and still rescan from offset 0 on every continuation page. The page is
+  cut the same way once it has run 5 ms without waiting for the device
+  (`AE_DIGEST_SERVE_HOLD_SLICE`). On the file backend reads complete inline, so this
+  cut is what keeps a digest scan from holding the serving thread for the whole
+  budget.
+- A `BucketDigests` page also ends with `more = 1` once the replica has examined
+  16,384 memtable entries (`DIGEST_PLAN_MEM_SCAN_CAP`), so planning a page does not
+  walk a large memtable on every request. Without feature bit 2 this happens only
+  after the page has collected an entry, and the client resumes after its last
+  entry. With feature bit 2 it can happen before, and a page that then ends empty
+  carries a `resume` key: the last memtable key examined, through which every run
+  has been examined too.
 - A truncated `Scan` / `BucketDigests` reply covers exactly `[lo, last_key]` (resp.
   `(after, resume]` with a resume key, else `(after, last_key]`): every entry the
   replica holds in that window is present. A `Scan` reply with a resume key (bit 3

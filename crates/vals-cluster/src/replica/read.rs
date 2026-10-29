@@ -268,6 +268,27 @@ impl<D: BlockDevice> VersionedStore<D> {
         )
     }
 
+    pub fn plan_resumable_bucket_digest_page(
+        &self,
+        num_buckets: u32,
+        ids: &[u32],
+        after: Option<&[u8]>,
+        max_bytes: usize,
+    ) -> Result<vals_store::DigestPagePlan, EngineError>
+    where
+        D: AsyncRead,
+    {
+        let want: std::collections::HashSet<u32> = ids.iter().copied().collect();
+        self.engine.plan_version_digest_page_covered_resumable(
+            &want,
+            move |k| crate::antientropy::bucket_of(k, num_buckets),
+            after,
+            max_bytes,
+            DIGEST_WIRE_OVERHEAD,
+            self.digest_cover(),
+        )
+    }
+
     pub async fn bucket_digest_page_from_plan(
         plan: vals_store::DigestPagePlan,
         num_buckets: u32,

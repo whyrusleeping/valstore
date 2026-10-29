@@ -49,6 +49,7 @@ struct DigestServeCheckpoint<'a, 'g, D: BlockDevice> {
     store: &'g RefCell<VersionedStore<D>>,
     generation: (u64, u64),
     deadline: Option<std::time::Instant>,
+    polled_at: &'g std::cell::Cell<std::time::Instant>,
 }
 
 impl<D: BlockDevice + AsyncRead> vals_store::DigestCheckpoint for DigestServeCheckpoint<'_, '_, D> {
@@ -58,11 +59,30 @@ impl<D: BlockDevice + AsyncRead> vals_store::DigestCheckpoint for DigestServeChe
     }
 
     fn expired(&self) -> bool {
-        self.deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        self.deadline.is_some_and(|deadline| {
+            let now = std::time::Instant::now();
+            now >= deadline || now.duration_since(self.polled_at.get()) >= digest_serve_hold_slice()
+        })
     }
 }
 
 pub(super) const AE_DIGEST_SERVE_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+const AE_DIGEST_SERVE_HOLD_SLICE: std::time::Duration = std::time::Duration::from_millis(5);
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static DIGEST_SERVE_TEST_HOLD_SLICE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn digest_serve_hold_slice() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(slice) = DIGEST_SERVE_TEST_HOLD_SLICE.with(std::cell::Cell::get) {
+        return slice;
+    }
+    AE_DIGEST_SERVE_HOLD_SLICE
+}
 
 static AE_DIGEST_SERVE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -131,10 +151,12 @@ pub(super) async fn serve_bucket_digests_inner<D: BlockDevice + AsyncRead>(
         }
         let generation = store.borrow().aggregate_generation();
         let accounted = store.borrow().accounted_epoch();
-        let plan = match store
-            .borrow()
-            .plan_bucket_digest_page(num_buckets, ids, after, SCAN_REPLY_BUDGET)
-        {
+        let planned = if deadline.is_some() {
+            store.borrow().plan_resumable_bucket_digest_page(num_buckets, ids, after, SCAN_REPLY_BUDGET)
+        } else {
+            store.borrow().plan_bucket_digest_page(num_buckets, ids, after, SCAN_REPLY_BUDGET)
+        };
+        let plan = match planned {
             Ok(p) => p,
             Err(e) => return Response::Err(format!("{e}")),
         };
@@ -143,13 +165,15 @@ pub(super) async fn serve_bucket_digests_inner<D: BlockDevice + AsyncRead>(
             crate::observe::counters().ae_digest_serve_rejections.inc();
             return Response::Busy;
         };
+        let polled_at = std::cell::Cell::new(std::time::Instant::now());
         let mut checkpoint = DigestServeCheckpoint {
             guard: &mut guard,
             store,
             generation,
             deadline,
+            polled_at: &polled_at,
         };
-        let result = VersionedStore::bucket_digest_page_from_plan_cooperative(
+        let page = VersionedStore::bucket_digest_page_from_plan_cooperative(
             plan,
             num_buckets,
             ids,
@@ -157,7 +181,12 @@ pub(super) async fn serve_bucket_digests_inner<D: BlockDevice + AsyncRead>(
             SCAN_REPLY_BUDGET,
             dev,
             &mut checkpoint,
-        )
+        );
+        let mut page = std::pin::pin!(page);
+        let result = std::future::poll_fn(|cx| {
+            polled_at.set(std::time::Instant::now());
+            page.as_mut().poll(cx)
+        })
         .await;
         drop(serve_guard);
         match result {

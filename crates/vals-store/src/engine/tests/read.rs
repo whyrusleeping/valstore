@@ -764,6 +764,110 @@ fn version_digest_page_byte_budget_pages_with_first_always_emitted() {
 }
 
 #[test]
+fn planned_digest_page_stops_after_a_bounded_memtable_scan() {
+    let dev = MemBlockDevice::new(4096, 4096);
+    let cfg = Config { seg_blocks: 16, reserved_blocks: 0, ordering: Ordering::Unsorted };
+    let mut e = Engine::create_prewiped(dev, cfg);
+    let total = super::digest::DIGEST_PLAN_MEM_SCAN_CAP * 2 + 100;
+    for i in 0..total {
+        e.put(format!("k{i:06}").as_bytes(), b"x", 1 + i as u128).unwrap();
+    }
+    let want = all_buckets();
+    let (full, more) = e.version_digest_page(&want, vdp_bucket, None, usize::MAX, 0).unwrap();
+    assert!(!more);
+    assert_eq!(full.len(), total);
+    let (first, more) = async_digest_page(&e, &want, None, usize::MAX);
+    assert!(more, "an unbudgeted page still ends after the memtable scan cap");
+    assert_eq!(first.len(), super::digest::DIGEST_PLAN_MEM_SCAN_CAP);
+    let (mut acc, mut pages) = (first, 1);
+    while let Some(after) = acc.last().map(|(key, _)| key.clone()) {
+        let (pg, more) = async_digest_page(&e, &want, Some(&after), usize::MAX);
+        assert!(!pg.is_empty(), "a page always makes progress");
+        acc.extend(pg);
+        pages += 1;
+        if !more {
+            break;
+        }
+    }
+    assert_eq!(pages, 3);
+    assert_eq!(acc, full, "the capped pages cover the unbounded result");
+}
+
+#[test]
+fn planned_digest_page_bounds_its_memtable_scan_past_a_sparse_match() {
+    struct Never;
+    impl super::digest::DigestCheckpoint for Never {
+        async fn checkpoint(&mut self) -> bool {
+            true
+        }
+    }
+    let cap = super::digest::DIGEST_PLAN_MEM_SCAN_CAP;
+    let dev = MemBlockDevice::new(4096, 4096);
+    let cfg = Config { seg_blocks: 16, reserved_blocks: 0, ordering: Ordering::Unsorted };
+    let mut e = Engine::create_prewiped(dev, cfg);
+    let total = cap * 3 + 100;
+    let key = |i: usize| format!("k{i:06}").into_bytes();
+    for i in 0..total {
+        e.put(&key(i), b"x", 1 + i as u128).unwrap();
+    }
+    let matches = [0usize, 2 * cap + 50];
+    let sparse = |k: &[u8]| u32::from(!matches.iter().any(|&i| key(i) == k));
+    let want = std::collections::HashSet::from([0u32]);
+    let examined = std::cell::Cell::new(0usize);
+    let counted = |k: &[u8]| {
+        examined.set(examined.get() + 1);
+        sparse(k)
+    };
+    let plan = e.plan_version_digest_page_covered(&want, counted, None, usize::MAX, 0, None).unwrap();
+    assert!(examined.get() <= cap + 1, "scanned {} memtable entries after the first match", examined.get());
+    let (page, more) = vals_rt::block_on(
+        Engine::version_digest_page_from_plan(plan, &want, sparse, None, usize::MAX, 0, e.device()),
+        || {},
+    )
+    .unwrap();
+    assert_eq!((page.len(), more), (1, true));
+    assert_eq!(page[0].0, key(matches[0]));
+
+    let (mut got, mut after, mut empty_pages) = (Vec::new(), Some(key(matches[0])), 0);
+    loop {
+        examined.set(0);
+        let plan = e
+            .plan_version_digest_page_covered_resumable(&want, counted, after.as_deref(), usize::MAX, 0, None)
+            .unwrap();
+        assert!(examined.get() <= cap, "a resumable plan scanned {} memtable entries", examined.get());
+        let (page, more, resume) = vals_rt::block_on(
+            Engine::version_digest_page_from_plan_cooperative(
+                plan,
+                &want,
+                sparse,
+                after.as_deref(),
+                usize::MAX,
+                0,
+                e.device(),
+                &mut Never,
+            ),
+            || {},
+        )
+        .unwrap()
+        .expect("a never-invalidated page completes");
+        if page.is_empty() && more {
+            empty_pages += 1;
+            let resume = resume.expect("an empty page that ends early carries a resume key");
+            assert!(after.as_ref().is_none_or(|a| resume > *a));
+            after = Some(resume);
+            continue;
+        }
+        got.extend(page);
+        if !more {
+            break;
+        }
+        after = got.last().map(|(k, _)| k.clone());
+    }
+    assert!(empty_pages >= 1, "the tail past the first match needs empty resumed pages");
+    assert_eq!(got.into_iter().map(|(k, _)| k).collect::<Vec<_>>(), vec![key(matches[1])]);
+}
+
+#[test]
 fn version_digest_page_argmax_across_two_runs_for_same_key() {
     let dev = MemBlockDevice::new(BS, 4096);
     let cfg = Config {
