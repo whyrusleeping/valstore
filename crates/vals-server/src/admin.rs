@@ -360,9 +360,16 @@ fn membership_gate(
     force: bool,
 ) -> Result<String, String> {
     if force {
-        return Ok("cleanup gate skipped (--force)".into());
+        return Ok(match change {
+            MembershipChange::Add(_) => "cleanup gate skipped (--force)",
+            MembershipChange::Remove(_) => "surviving-replica and cleanup gates skipped (--force)",
+        }
+        .into());
     }
     let view = pd.inspect().ok_or("pd inspection unavailable")?;
+    if let MembershipChange::Remove(node) = change {
+        refuse_sole_copy_removal(&view, node)?;
+    }
     check_membership_change(&view.members, &view.range_maps, change, incoming)
         .map(|settled| format!("cleanup gate: {settled}"))
         .map_err(|why| {
@@ -374,6 +381,36 @@ fn membership_gate(
                  (docs/backup-restore.md#consistency-contract)"
             )
         })
+}
+
+fn refuse_sole_copy_removal(
+    view: &vals_cluster::pd::PdInspection,
+    node: vals_cluster::NodeId,
+) -> Result<(), String> {
+    if !view.members.iter().any(|(member, _, _)| *member == node) {
+        return Ok(());
+    }
+    let mut zones = Vec::new();
+    if view.ring_rf == 1 {
+        zones.push("the default zone (ring rf 1)".to_string());
+    }
+    for id in view.zones.ids() {
+        let cfg = view.zones.get(id).expect("listed id");
+        if cfg.rf == 1 && cfg.scope.as_ref().is_none_or(|scope| scope.contains(&node)) {
+            zones.push(format!("zone {id} ({}, rf 1)", cfg.name));
+        }
+    }
+    if zones.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "membership change refused, nothing applied: removing node {node} would leave keys with no \
+         surviving replica in {}. remove-node does not copy a node's keys to their new owners first, \
+         so the keys it holds there would read as not found. Move nodes of an rf 1 zone with backup \
+         and restore, or rerun with --force to accept losing access to those keys \
+         (docs/growing.md#adding-data-nodes)",
+        zones.join(", ")
+    ))
 }
 
 fn id_list(ids: &[u64]) -> String {
@@ -727,6 +764,52 @@ mod tests {
         assert!(forced.starts_with("ok committed index="), "{forced}");
         assert!(forced.ends_with("cleanup gate skipped (--force)"), "{forced}");
         assert_eq!(handle_command(&pd, "members --force"), "err: --force applies only to add-node and remove-node");
+        pd.shutdown();
+    }
+
+    #[test]
+    fn remove_node_refuses_to_leave_keys_without_a_replica_unless_forced() {
+        let pd = spawn_pd();
+        assert!(handle_command(&pd, "add-node 2 1 --force").starts_with("ok committed index="));
+        let refused = handle_command(&pd, "remove-node 2");
+        assert!(refused.starts_with(
+            "err: membership change refused, nothing applied: removing node 2 would leave keys with no \
+             surviving replica in the default zone (ring rf 1)."
+        ), "{refused}");
+        assert!(refused.contains("--force"), "{refused}");
+        assert!(handle_command(&pd, "members").ends_with("\n1 1 -\n2 1 -"));
+        let absent = handle_command(&pd, "remove-node 3");
+        assert!(!absent.contains("surviving replica"), "a non-member is not checked: {absent}");
+        let forced = handle_command(&pd, "remove-node 2 --force");
+        assert!(forced.starts_with("ok committed index="), "{forced}");
+        assert!(forced.ends_with("surviving-replica and cleanup gates skipped (--force)"), "{forced}");
+        assert!(handle_command(&pd, "members").ends_with("\n1 1 -"));
+        pd.shutdown();
+
+        let engine =
+            Engine::create_prewiped(MemBlockDevice::new(4096, 16 * 1024), Config::default());
+        let pd = PdDaemon::spawn_single(
+            1,
+            engine,
+            RingConfig { vnodes: 128, rf: 2 },
+            Vec::new(),
+        )
+        .unwrap();
+        pd.bootstrap_members((1..=3).map(|node| (node, 1, Vec::new())).collect());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle_command(&pd, "members").ends_with("\n3 1 -") {
+            assert!(Instant::now() < deadline, "bootstrap membership not committed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let gated = handle_command(&pd, "remove-node 3");
+        assert!(gated.contains("has no data address"), "rf 2 passes on to the cleanup gate: {gated}");
+        assert!(!gated.contains("surviving replica"), "{gated}");
+        assert!(handle_command(&pd, "create-zone single 1 unsorted").starts_with("ok committed index="));
+        let refused = handle_command(&pd, "remove-node 3");
+        assert!(refused.contains("removing node 3 would leave keys with no surviving replica in zone 1 \
+                                  (single, rf 1)."), "{refused}");
+        assert!(handle_command(&pd, "remove-node 3 --force").starts_with("ok committed index="));
+        assert!(handle_command(&pd, "members").ends_with("\n2 1 -"));
         pd.shutdown();
     }
 

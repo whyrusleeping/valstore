@@ -926,7 +926,7 @@ access control; mutations still go through Raft.
 | `zones` | committed catalog: `id name rf ordering` per line |
 | `ranges <zone>` | committed range boundaries of a zone, one `hex=<bytes>` key per line |
 | `add-node <id> <weight> [<addr>,...] [--force]` | grow the cluster (the addresses make the node reachable cluster-wide, with no restarts anywhere) |
-| `remove-node <id> [--force]` | shrink the ring (data re-replicates through anti-entropy from the remaining replicas; at RF 1 there are none, so the removed node's keys become unreachable, see [`growing.md`](growing.md#adding-data-nodes)) |
+| `remove-node <id> [--force]` | shrink the ring (data re-replicates through anti-entropy from the remaining replicas; at RF 1 there are none, so the command refuses unless `--force`, see [`growing.md`](growing.md#adding-data-nodes)) |
 | `create-zone <name> <rf> <sorted\|unsorted> [presplit=K \| presplit=key,key,...]` | create a zone and push it to all nodes; a sorted zone can be presplit into K first-byte ranges or at explicit canonical key boundaries |
 | `drop-zone <id\|name>` | tear a zone down everywhere |
 | `split-zone <id\|name> <key> [canonical]` | split a sorted zone's range at `key`; `canonical` spreads an empty range only (populated ranges need a rehome) |
@@ -946,6 +946,12 @@ check fails, the command fails with `err: membership change
 refused, nothing applied`, naming the node, the zone and sample keys, or the
 member that did not answer. `--force` skips the check
 ([`backup-restore.md`](backup-restore.md#consistency-contract)).
+
+`remove-node` also refuses, with the same `err: membership change refused,
+nothing applied` prefix, when the ring RF is 1 or a zone that may place keys
+on the node has RF 1: nothing copies the node's keys to their new owners
+first, so they would read as not found. The reply names those zones.
+`--force` skips this check too and removes the node anyway.
 
 Each PD replica has its own socket, and only the current, caught-up leader
 accepts mutations. How to find the leader, what each reply and exit code means

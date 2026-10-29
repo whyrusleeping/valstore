@@ -177,8 +177,9 @@ cover the design-level ones.
   rejoining node whose peers report watermarks more than `gc_grace` ahead of
   its own discards its data and resyncs from them, and a peer clock running
   ahead can trigger that.
-- **Membership.** `remove-node` at RF 1 makes the removed node's keys
-  unreachable, because nothing drains them first. There is no supported way
+- **Membership.** `remove-node` refuses at RF 1 (unless `--force`, which makes
+  the removed node's keys unreachable), because nothing drains them first.
+  There is no supported way
   to raise a zone's RF in place, or to change the number of PD voters in
   place. Dead nodes are not evicted automatically.
 - **SPDK.** `scripts/build-spdk.sh` fetches SPDK by the tag `v24.09`, not by

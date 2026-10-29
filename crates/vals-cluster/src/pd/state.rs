@@ -90,6 +90,7 @@ pub struct PdInspection {
     pub status: PdStatus,
     pub authoritative: Option<u64>,
     pub members: AddressedMembers,
+    pub ring_rf: usize,
     pub zones: Catalog,
     pub range_maps: HashMap<ZoneId, RangeMap>,
     pub state: Option<Vec<(Vec<u8>, Vec<u8>)>>,

@@ -18,7 +18,7 @@ qualified once on hardware ([`backup-restore.md`](backup-restore.md#hardware-qua
 | One PD to three PD voters | [Backup and restore](#moving-to-three-pds-new-hosts-or-larger-regions) into a new three-voter cluster | Writes stop until clients use the new cluster |
 | Data nodes on new hosts or addresses | The same backup and restore, with the new addresses | Writes stop until clients use the new cluster |
 | Higher RF for data you already have | [Not supported](#replication-factor): create a new zone and copy the data in your application | Depends on your copy |
-| Removing a data node at RF 1 | [Not supported](#adding-data-nodes): its keys become unreachable | — |
+| Removing a data node at RF 1 | [Not supported](#adding-data-nodes): `remove-node` refuses; with `--force` its keys become unreachable | — |
 
 If you already know you will need high availability, start with the
 [three-PD reference deployment](deploy.md#three-pd-reference-deployment) and
@@ -176,8 +176,12 @@ What adding nodes does and does not change:
   removed node's keys anywhere first. In the smoke test, 105 of 200 keys read
   as not found right after `remove-node`, even with the removed node still
   running. With `gc_grace = 0s`, starting that node again and running
-  `add-node` with its old id brought them back. At RF 1, move nodes with
-  backup and restore instead.
+  `add-node` with its old id brought them back. So `remove-node` refuses with
+  `err: membership change refused, nothing applied: removing node N would
+  leave keys with no surviving replica ...` when the ring RF is 1 or a zone
+  that may place keys on the node has RF 1, and names those zones; `--force`
+  removes the node anyway and accepts losing access to its keys. At RF 1,
+  move nodes with backup and restore instead.
 
 ## Moving to three PDs, new hosts or larger regions
 

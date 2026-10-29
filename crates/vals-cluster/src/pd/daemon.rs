@@ -785,6 +785,7 @@ fn inspection<D: BlockDevice>(
         status: pd.status(),
         authoritative,
         members: pd.members_addressed(),
+        ring_rf: pd.global_rf(),
         zones: pd.zones(),
         range_maps: pd.range_maps(),
         state: (with_state && authoritative.is_some()).then(|| pd.state_entries()),

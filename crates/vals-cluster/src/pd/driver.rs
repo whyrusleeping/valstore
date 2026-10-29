@@ -104,6 +104,10 @@ impl<D: BlockDevice> PlacementDriver<D> {
         Ok(())
     }
 
+    pub(super) fn global_rf(&self) -> usize {
+        self.validation_global_rf
+    }
+
     pub fn new_single(id: u64, engine: Engine<D>) -> Result<Self, PartitionError> {
         Self::from_partition(Partition::new_single(id, engine)?)
     }
