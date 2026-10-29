@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use vals_cluster::reactor;
 use vals_cluster::{Coordinator, WriteConcern, NetTransport, Ring};
+use vals_cluster::coord::Transport;
 
 fn run<F: std::future::Future>(f: F) -> F::Output {
     vals_rt::block_on(f, reactor::poll_io)
@@ -396,10 +397,19 @@ fn three_node_cluster_with_pd_serves_zones_and_survives_restart() {
     });
 
     {
-        let mut conn = TcpStream::connect(metrics_addr).expect("metrics endpoint up");
-        conn.write_all(b"GET /metrics HTTP/1.0\r\n\r\n").unwrap();
-        let mut reply = String::new();
-        conn.read_to_string(&mut reply).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let reply = loop {
+            let mut conn = TcpStream::connect(metrics_addr).expect("metrics endpoint up");
+            conn.write_all(b"GET /metrics HTTP/1.0\r\n\r\n").unwrap();
+            let mut reply = String::new();
+            conn.read_to_string(&mut reply).unwrap();
+            let ops: u64 = reply.lines().find_map(|l| l.strip_prefix("vals_server_ops "))
+                .expect("vals_server_ops present").parse().unwrap();
+            if ops >= 100 { break reply; }
+            assert!(Instant::now() < deadline, "server_ops should reflect real traffic: {ops}");
+            run(coord.transport().read(1, vals_cluster::zone::DEFAULT_ZONE, b"key-000")).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+        };
         assert!(reply.starts_with("HTTP/1.0 200 OK"), "{reply}");
         assert!(
             reply.contains("vals_profile_info{profile=\"latency\"} 1"),

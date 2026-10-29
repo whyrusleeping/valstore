@@ -371,12 +371,9 @@ pub fn spawn_pool_lanes<D: BlockDevice + AsyncRead + 'static>(
             )
         },
     )));
-    let linger = if compact_lanes >= 2 { COVER_SCAN_LINGER } else { std::time::Duration::ZERO };
-    let scan_duty_limit = (compact_lanes == 1).then_some(COVER_SCAN_DUTY_CHUNKS);
-    let compact_dispatch = Arc::new(Mutex::new(
-        Dispatch::new(compact_rx, owners, cancel.clone(), dropped.clone())
-            .with_classes(job_class::<D>, 1, linger, scan_duty_limit),
-    ));
+    let compact_dispatch = Arc::new(Mutex::new(compaction_dispatch(
+        compact_rx, owners, cancel.clone(), dropped.clone(), compact_lanes,
+    )));
     for lane in 0..compact_lanes {
         let dispatch = compact_dispatch.clone();
         let lane_routes = routes.clone();
@@ -396,6 +393,19 @@ pub fn spawn_pool_lanes<D: BlockDevice + AsyncRead + 'static>(
     (handles, MaintJoin {
         joins, cancel, dropped, cancelled,
     })
+}
+
+fn compaction_dispatch<D: BlockDevice>(
+    rx: mpsc::Receiver<OwnedJob<D>>,
+    owners: usize,
+    cancel: Arc<AtomicBool>,
+    dropped: Arc<AtomicUsize>,
+    compact_lanes: usize,
+) -> Dispatch<MaintJob<D>> {
+    let linger = if compact_lanes >= 2 { COVER_SCAN_LINGER } else { std::time::Duration::ZERO };
+    let scan_duty_limit = (compact_lanes == 1).then_some(COVER_SCAN_DUTY_CHUNKS);
+    Dispatch::new(rx, owners, cancel, dropped)
+        .with_classes(job_class::<D>, 1, linger, scan_duty_limit)
 }
 
 pub struct MaintJoin {
@@ -1396,9 +1406,11 @@ mod tests {
 
     #[test]
     fn cover_scans_progress_while_merges_are_continuously_queued() {
-        const STALL: Duration = Duration::from_millis(40);
         const QUEUED_STALLS: usize = 8;
-        let (handle, _join) = spawn::<MemBlockDevice>();
+        let (tx, rx) = mpsc::channel();
+        let mut dispatch = compaction_dispatch(rx, 1, Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)), 2);
+        let cancel = AtomicBool::new(false);
+        let mut siblings = HashMap::new();
         let engine = RefCell::new(mem_engine());
         for round in 0..4u32 {
             for i in 0..200u32 {
@@ -1411,56 +1423,37 @@ mod tests {
         let runs = engine.borrow().key_filter_stats().uncovered_runs;
         assert_eq!(runs, 4);
         for n in 0..QUEUED_STALLS as u64 {
-            handle.submit(MaintJob::Stall(n, STALL)).unwrap();
+            tx.send((0, MaintJob::Stall(n, Duration::ZERO))).unwrap();
         }
-        std::thread::sleep(STALL / 4);
-        let ex = LocalExecutor::new();
-        let stalls_during_coverage = Cell::new(0usize);
-        ex.run_until(
-            async {
-                let mut next_stall = QUEUED_STALLS as u64;
-                let mut scan = engine.borrow_mut().cover_scan_plan();
-                handle.submit(MaintJob::CoverScan(0, Box::new(scan.take().unwrap()))).unwrap();
-                loop {
-                    handle.wake().notified().await;
-                    let mut finished = false;
-                    for done in handle.drain() {
-                        match done {
-                            MaintDone::Stalled(n) => {
-                                assert!(n < next_stall);
-                                stalls_during_coverage.set(stalls_during_coverage.get() + 1);
-                                handle.submit(MaintJob::Stall(next_stall, STALL)).unwrap();
-                                next_stall += 1;
-                            }
-                            MaintDone::CoverScanned(_, plan, res) => {
-                                if !res.expect("cover scan chunk ok") {
-                                    handle.submit(MaintJob::CoverScan(0, plan)).unwrap();
-                                    continue;
-                                }
-                                assert!(engine.borrow_mut().cover_scan_commit(*plan));
-                                match engine.borrow_mut().cover_scan_plan() {
-                                    Some(next) => handle.submit(MaintJob::CoverScan(0, Box::new(next))).unwrap(),
-                                    None => finished = true,
-                                }
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
-                    if finished {
-                        break;
-                    }
+        let mut next_stall = QUEUED_STALLS as u64;
+        let mut chunks = 0;
+        loop {
+            let Some(mut plan) = engine.borrow_mut().cover_scan_plan() else { break };
+            loop {
+                tx.send((0, MaintJob::CoverScan(0, Box::new(plan)))).unwrap();
+                let Pick::Job(owner, class, job) = dispatch.pick(1) else { panic!("merge lane idle") };
+                assert_eq!(class, CLASS_NORMAL, "merge lane keeps making progress");
+                let MaintDone::Stalled(n) = run_job(owner, job, &mut siblings, &cancel) else { panic!("merge lane did not run its job") };
+                assert!(n < next_stall);
+                tx.send((0, MaintJob::Stall(next_stall, Duration::ZERO))).unwrap();
+                next_stall += 1;
+                let Pick::Job(owner, class, job) = dispatch.pick(0) else { panic!("cover lane idle") };
+                assert_eq!(class, CLASS_COVER, "cover chunks precede the continuously queued merges");
+                let MaintDone::CoverScanned(_, scanned, res) = run_job(owner, job, &mut siblings, &cancel) else {
+                    panic!("cover lane did not scan")
+                };
+                chunks += 1;
+                assert!(chunks < 100, "cover scans must finish in bounded chunks");
+                if res.expect("cover scan chunk ok") {
+                    assert!(engine.borrow_mut().cover_scan_commit(*scanned));
+                    break;
                 }
-            },
-            poll_io_nonblocking,
-        );
+                plan = *scanned;
+            }
+        }
         let stats = engine.borrow().key_filter_stats();
         assert_eq!((stats.covered_runs, stats.uncovered_runs), (4, 0));
-        assert!(
-            stalls_during_coverage.get() <= 4,
-            "{} merge-lane jobs finished before 4 cover scans; FIFO would need >= {}",
-            stalls_during_coverage.get(),
-            4 * QUEUED_STALLS / 2
-        );
+        assert!(chunks >= 4);
     }
 
     #[test]

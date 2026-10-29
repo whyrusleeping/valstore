@@ -18,21 +18,21 @@ common when devbox's load average is high (about 50 or more, from other sessions
   `net::server::corrupt_read` `merge_rewrite_corruption_counts_logs_once_and_excludes_the_segment`
   and both `coord::range_delete_scan_cost_tests::head_of_queue_scan_cost_*` tests.
 - **Timing under load:** vals-cluster `node::tests` liveness_wipe and
-  `multidrive_*_liveness_*`, `pd::tests::rival_and_obsolete_pd_groups…`,
-  `maint::tests::cover_scans_progress_while_merges_are_continuously_queued` and
+  `multidrive_*_liveness_*`, `pd::tests::rival_and_obsolete_pd_groups…` and
   `net::tests::timed_out_network_write_releases_credits`. In vals-server: the pd_replace,
-  live_dump and backup tests, and `tests/daemon.rs`
-  `three_node_cluster_with_pd_serves_zones_and_survives_restart` (`ops >= 100` on node 1, line
-  ~416) when it runs alongside the full vals-cluster and vals-server suites. Rerun that one with
-  `--test daemon`.
-- **CPU saturation:** on 2026-10-29 `scripts/ci.sh` passed on devbox once unloaded and three
-  times beside `stress -c 48` (load averages 54 to 100). Beside `stress -c 160` (load about
-  167 on 192 cores) all three runs failed on timing tests: the maint cover-scan test above,
-  `antientropy::tests::cleanup_owner_probe_cuts_a_grown_window_when_the_peer_slows_down` ("one
-  pass took 784ms"), `net::tests::a_connection_silent_for_a_deadline_is_replaced_and_the_next_request_succeeds`
-  (QuorumFailed) and vals-server `tests/rehome_regroup.rs`
-  `knockout_whole_engine_invalidation_reseeds_peers_on_a_rehome` (timed out waiting for the
-  re-home).
+  live_dump and backup tests.
+- **CPU saturation (fixed in 0526):** beside `stress -c 160` on devbox (load about 167 on 192
+  cores) the maint cover-scan test, `antientropy::tests::cleanup_owner_probe_cuts_a_grown_window_when_the_peer_slows_down`,
+  `net::tests::a_connection_silent_for_a_deadline_is_replaced_and_the_next_request_succeeds`,
+  vals-server `rehome_regroup.rs` `knockout_whole_engine_invalidation_reseeds_peers_on_a_rehome`
+  and `daemon.rs` `three_node_cluster_with_pd_serves_zones_and_survives_restart` failed. Now:
+  the cover-scan test drives the production compaction dispatcher synchronously; the cleanup
+  probe uses a test-only virtual elapsed time (`CLEANUP_TEST_ELAPSED`); the silent-connection
+  test has a 5 s healthy-path deadline and still requires exactly one reconnect; the re-home
+  harness holds all seven port reservations while allocating (a retained timeout was node 2
+  and the PD metrics endpoint sharing a port); the daemon test polls node 1's op count while
+  sending it reads. All five passed 5/5 beside `stress -c 160` (targeted runs, not a full
+  `scripts/ci.sh` under stress).
 
 ## Long tests and `VALS_TEST_FULL`
 
@@ -78,6 +78,9 @@ common when devbox's load average is high (about 50 or more, from other sessions
   recovery, up to 9 cases per seed and test fail it after a reopen (4 at the default seed,
   none at seed 1; docs/formats.md §2.1). Starting new stores at epoch 0 again (before 0540's
   random epoch base) fails 364 of about 1,000 cases per test with old-store values.
+- A recovery change that moves log epochs must keep `Engine::tail_epochs` (the node flush
+  trigger) unchanged: vals-cluster `former_owner_tests` break when a reopen triggers an
+  immediate flush.
 
 ## Test seams and assertions
 
@@ -94,3 +97,17 @@ common when devbox's load average is high (about 50 or more, from other sessions
   count there is caused by the diff.
 - **Scan paging:** `server::set_zone_scan_reply_budget` forces resume-key pages
   deterministically, whatever the fold and flush state.
+- **Node cluster test reads:** a Read with epoch 0 gets `StaleEpoch` once any ring push has
+  happened, so a `_ => None` read helper makes absence asserts vacuous; use epoch `u64::MAX`
+  and panic on non-Read replies. After a cleanup lap that keeps nothing, the zone is not lapped
+  again until a placement change or a CleanupStatus recheck (at most once per
+  `min(gc_grace/2, 10 min)`), so data planted after a clean lap needs a SetMembers push first.
+- **Tombstone GC paths:** `VersionedStore::compact_step` is a no-op once the engine has any
+  run, and in sorted zones a range delete creates a fence run, so GC through `compact_step`
+  only happens on stores that never flushed and never took a range delete; everything else
+  collects through `compact_runs`. The sorted-zone GC sim (vals-cluster
+  `src/netsim_gc_tests.rs`, about 2 s per seed in debug) checks the persisted-cutoff invariant
+  on every compaction.
+- **Faking engine fullness** via `alloc.allocate()` needs orphan reclaim disabled.
+- **SPDK async races** can't be hit by file-backed repros; use forced `yield_now` plus counter
+  A/Bs.

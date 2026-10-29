@@ -51,6 +51,15 @@ pub const CLEANUP_MAX_PAGE_RESTARTS: usize = 3;
 #[cfg(test)]
 thread_local! {
     static CLEANUP_PAGE_REBORROW_HOOK: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+    static CLEANUP_TEST_ELAPSED: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
+fn cleanup_elapsed(started: std::time::Instant) -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(elapsed) = CLEANUP_TEST_ELAPSED.with(|clock| clock.get()) {
+        return elapsed;
+    }
+    started.elapsed()
 }
 #[cfg(test)]
 fn cleanup_page_reborrow_hook() {
@@ -1059,7 +1068,7 @@ async fn cleanup_with<D: BlockDevice + vals_spdk::AsyncRead, T: Transport, G: Fo
             placed.push(place(&keys[i].0));
         }
         if probing && i >= probed_to && placed[i].is_some() {
-            if handoff_started.elapsed() >= CLEANUP_HANDOFF_WALL_BUDGET {
+            if cleanup_elapsed(handoff_started) >= CLEANUP_HANDOFF_WALL_BUDGET {
                 probing = false;
             } else {
                 let mut end = i;
@@ -1082,7 +1091,7 @@ async fn cleanup_with<D: BlockDevice + vals_spdk::AsyncRead, T: Transport, G: Fo
                     vals_rt::Either::Right(()) => probing = false,
                 }
                 probed_to = end;
-                probe_window = if window_started.elapsed() < CLEANUP_HANDOFF_WALL_BUDGET / 8 {
+                probe_window = if cleanup_elapsed(window_started) < CLEANUP_HANDOFF_WALL_BUDGET / 8 {
                     (probe_window * 2).min(CLEANUP_PROBE_MAX_KEYS)
                 } else {
                     (probe_window / 2).max(CLEANUP_PROBE_MIN_KEYS)
@@ -1145,7 +1154,7 @@ async fn cleanup_with<D: BlockDevice + vals_spdk::AsyncRead, T: Transport, G: Fo
         for (owner_i, &owner) in owners.iter().enumerate() {
             let remaining = owners.len() - owner_i;
             let only_refused = confirms == 0 && refusals == owner_i;
-            if handoff_started.elapsed() >= CLEANUP_HANDOFF_WALL_BUDGET
+            if cleanup_elapsed(handoff_started) >= CLEANUP_HANDOFF_WALL_BUDGET
                 || (confirms.saturating_add(remaining) < need && !only_refused)
             {
                 progress.deferred = true;
@@ -1177,7 +1186,7 @@ async fn cleanup_with<D: BlockDevice + vals_spdk::AsyncRead, T: Transport, G: Fo
             if key_failed && confirms >= need {
                 break;
             }
-            if handoff_started.elapsed() >= CLEANUP_HANDOFF_WALL_BUDGET {
+            if cleanup_elapsed(handoff_started) >= CLEANUP_HANDOFF_WALL_BUDGET {
                 progress.deferred = true;
             }
         }
@@ -1200,7 +1209,7 @@ async fn cleanup_with<D: BlockDevice + vals_spdk::AsyncRead, T: Transport, G: Fo
             }
         }
         completed_cursor = Some(key);
-        if key_failed || handoff_started.elapsed() >= CLEANUP_HANDOFF_WALL_BUDGET {
+        if key_failed || cleanup_elapsed(handoff_started) >= CLEANUP_HANDOFF_WALL_BUDGET {
             progress.next_cursor = completed_cursor.clone();
             if local.borrow().engine().ordering() == vals_store::Ordering::Sorted {
                 if let Some(past) = progress.next_cursor.as_mut() {
@@ -1282,7 +1291,7 @@ struct ProbeCutoff<'a, S: Fn() -> bool> {
 impl<S: Fn() -> bool> std::future::Future for ProbeCutoff<'_, S> {
     type Output = ();
     fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        if (self.stop)() || self.started.elapsed() >= CLEANUP_HANDOFF_WALL_BUDGET {
+        if (self.stop)() || cleanup_elapsed(self.started) >= CLEANUP_HANDOFF_WALL_BUDGET {
             std::task::Poll::Ready(())
         } else {
             std::task::Poll::Pending
@@ -2574,12 +2583,21 @@ mod tests {
         use crate::coord::{RingView, Transport, TransportError};
         use crate::zone::Catalog;
         use std::cell::Cell;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
+
+        struct TestClock;
+        impl Drop for TestClock {
+            fn drop(&mut self) {
+                CLEANUP_TEST_ELAPSED.with(|clock| clock.set(None));
+            }
+        }
+        let _clock = TestClock;
 
         struct SlowsDown {
             fast: usize,
             digests: Cell<usize>,
             stop_at: usize,
+            slow_completed: Cell<usize>,
         }
         impl Transport for SlowsDown {
             async fn apply(
@@ -2600,10 +2618,11 @@ mod tests {
             ) -> Result<Option<Stored>, TransportError> {
                 self.digests.set(self.digests.get() + 1);
                 if self.digests.get() > self.fast {
-                    let until = Instant::now() + Duration::from_millis(10);
-                    while Instant::now() < until {
-                        vals_rt::yield_now().await;
+                    if self.stop_at == usize::MAX {
+                        CLEANUP_TEST_ELAPSED.with(|clock| clock.set(Some(CLEANUP_HANDOFF_WALL_BUDGET)));
                     }
+                    vals_rt::yield_now().await;
+                    self.slow_completed.set(self.slow_completed.get() + 1);
                 }
                 Ok(Some(Stored { version: v(100, 9), value: Some(b"v".to_vec()) }))
             }
@@ -2619,6 +2638,7 @@ mod tests {
         let count = 6000;
         let fast = 3 * CLEANUP_PROBE_MAX_KEYS;
         for stop_at in [usize::MAX, fast + 3] {
+            CLEANUP_TEST_ELAPSED.with(|clock| clock.set(Some(Duration::ZERO)));
             let engine = Engine::create_prewiped(
                 MemBlockDevice::new(4096, 512),
                 Config { seg_blocks: 4, reserved_blocks: 0, ordering: Ordering::Unsorted },
@@ -2628,16 +2648,16 @@ mod tests {
                 source.apply(format!("grow-{i:06}").as_bytes(), Some(b"v"), v(100, 9)).unwrap();
             }
             let source = RefCell::new(source);
-            let peer = SlowsDown { fast, digests: Cell::new(0), stop_at };
-            let started = Instant::now();
+            let peer = SlowsDown { fast, digests: Cell::new(0), stop_at, slow_completed: Cell::new(0) };
             let progress = run(cleanup_scoped(
                 &source, &peer, &ring, 9, 1, (0, 1), None, None,
                 || true, || true, || peer.digests.get() >= peer.stop_at,
             ))
             .unwrap();
-            let took = started.elapsed();
-            assert!(took < CLEANUP_HANDOFF_WALL_BUDGET + Duration::from_millis(300), "one pass took {took:?}");
-            if stop_at != usize::MAX {
+            assert!(peer.digests.get() > fast, "the probe must grow its window before the peer slows");
+            if stop_at == usize::MAX {
+                assert_eq!(peer.slow_completed.get(), 0, "the deadline cancels the in-flight window");
+            } else {
                 assert!(peer.digests.get() <= stop_at + 1, "{} digests after a stop at {stop_at}", peer.digests.get());
             }
             assert!(peer.digests.get() < fast + CLEANUP_PROBE_MAX_KEYS / 2, "{} digests", peer.digests.get());

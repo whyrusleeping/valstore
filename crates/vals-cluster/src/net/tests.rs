@@ -898,7 +898,7 @@ fn a_connection_silent_for_a_deadline_is_replaced_and_the_next_request_succeeds(
     let ring = Ring::from_members(1, 64, [1]);
     let server = ReplicaServer::spawn(replica(1)).unwrap();
     let proxy = BlackholeProxy::spawn(server);
-    let t = NetTransport::connect(&[(1, proxy.addr)]).with_rpc_deadline(Duration::from_millis(300));
+    let t = NetTransport::connect(&[(1, proxy.addr)]).with_rpc_deadline(Duration::from_secs(5));
     let coord = Coordinator::new(9, ring, 1, t);
     run(coord.write_in(DEFAULT_ZONE, b"k", b"v", WriteConcern::All)).unwrap();
 

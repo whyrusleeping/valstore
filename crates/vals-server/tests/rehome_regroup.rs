@@ -16,10 +16,6 @@ fn run<F: std::future::Future>(f: F) -> F::Output {
     vals_rt::block_on(f, reactor::poll_io)
 }
 
-fn free_addr() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
-}
-
 fn wait_listening(addr: SocketAddr) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while TcpStream::connect(addr).is_err() {
@@ -163,9 +159,10 @@ fn rehome_under_load(tag: &str, span_regroup: bool) -> Deltas {
     std::fs::write(dir.join("secret"), "regroup-test-secret\n").unwrap();
     let mut cluster = Cluster { dir: dir.clone(), children: Vec::new() };
 
-    let addrs: Vec<SocketAddr> = (0..3).map(|_| free_addr()).collect();
-    let metrics: Vec<SocketAddr> = (0..3).map(|_| free_addr()).collect();
-    let pd_metrics = free_addr();
+    let ports: Vec<TcpListener> = (0..7).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+    let addrs: Vec<SocketAddr> = ports[..3].iter().map(|p| p.local_addr().unwrap()).collect();
+    let metrics: Vec<SocketAddr> = ports[3..6].iter().map(|p| p.local_addr().unwrap()).collect();
+    let pd_metrics = ports[6].local_addr().unwrap();
     let admin_sock = dir.join("pd-admin.sock");
     for id in 1..=3u32 {
         let peers: String = (1..=3u32)
@@ -198,6 +195,7 @@ fn rehome_under_load(tag: &str, span_regroup: bool) -> Deltas {
         ),
     )
     .unwrap();
+    drop(ports);
     for id in 1..=3 {
         cluster.spawn("node", &dir.join(format!("node{id}.conf")));
     }
@@ -371,6 +369,6 @@ fn single_range_rehome_under_load_starts_no_peer_seed() {
 #[test]
 fn knockout_whole_engine_invalidation_reseeds_peers_on_a_rehome() {
     let d = rehome_under_load("off", false);
-    assert_eq!(d.regroups, vec![0; 3], "{d:?}");
     assert!(d.seed_starts.iter().sum::<u64>() >= 2, "the pre-0377 path reseeds owner stores: {d:?}");
+    assert_eq!(d.regroups, vec![0; 3], "{d:?}");
 }
