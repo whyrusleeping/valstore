@@ -2,7 +2,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
+#[cfg(target_env = "gnu")]
 static LAST_TRIM_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_env = "gnu")]
 static LAST_SEED_EVENT_MS: AtomicU64 = AtomicU64::new(0);
 static ORIGIN: OnceLock<Instant> = OnceLock::new();
 
@@ -82,13 +84,11 @@ pub(super) fn shed() {
 }
 
 pub(super) fn trim_after_seed() {
-    if std::env::var_os("VALS_AE_SEED_TRIM").is_some_and(|value| value == "0") {
-        return;
-    }
-    #[cfg(not(target_env = "gnu"))]
-    { return; }
     #[cfg(target_env = "gnu")]
     {
+        if std::env::var_os("VALS_AE_SEED_TRIM").is_some_and(|value| value == "0") {
+            return;
+        }
         let now = now_ms();
         LAST_SEED_EVENT_MS.store(now, Ordering::Relaxed);
         let mut last = LAST_TRIM_MS.load(Ordering::Relaxed);

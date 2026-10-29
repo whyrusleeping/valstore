@@ -10,6 +10,7 @@ members = [
     "crates/vals-bench",
     "crates/vals-server",
 ]
+exclude = ["vendor"]
 
 [workspace.lints.clippy]
 type_complexity = "allow"
@@ -22,6 +23,11 @@ edition = "2021"
 license = "MIT"
 publish = false
 repository = "https://github.com/whyrusleeping/valstore"
+
+# raft-proto with its protobuf code checked in: the crates.io build script
+# needs a protoc 3.x, which macOS on Apple Silicon lacks (vendor/raft-proto).
+[patch.crates-io]
+raft-proto = { path = "vendor/raft-proto" }
 
 # Build the engine in release for any IOPS-sensitive measurement.
 [profile.release]

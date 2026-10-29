@@ -1,6 +1,7 @@
 use super::*;
 
 use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -66,9 +67,7 @@ fn process_rss() -> u64 {
 }
 
 fn trimmed_rss() -> u64 {
-    unsafe {
-        libc::malloc_trim(0);
-    }
+    malloc_trim();
     process_rss()
 }
 
@@ -211,8 +210,13 @@ fn flush_daemon_path(store: &mut vals_cluster::VersionedStore<FileBlockDevice>) 
 fn evict_file(path: &str) {
     let file = std::fs::File::open(path).expect("open capacity image for cache eviction");
     file.sync_all().expect("sync capacity image before cache eviction");
-    let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
-    assert_eq!(rc, 0, "posix_fadvise(DONTNEED) failed");
+    #[cfg(target_os = "linux")]
+    {
+        let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        assert_eq!(rc, 0, "posix_fadvise(DONTNEED) failed");
+    }
+    #[cfg(not(target_os = "linux"))]
+    panic!("capacity cache eviction uses posix_fadvise(DONTNEED), which needs Linux");
 }
 
 fn exceeds_lateness(now: Instant, due: Instant, budget: Duration) -> bool {

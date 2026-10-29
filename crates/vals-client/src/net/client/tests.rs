@@ -256,8 +256,14 @@
         let mut cx = Context::from_waker(&waker);
 
         assert!(rpc.as_mut().poll(&mut cx).is_pending());
-        flush_dirty();
-        hello_read_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            flush_dirty();
+            if hello_read_rx.recv_timeout(Duration::from_millis(10)).is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the hello never reached the server");
+        }
         assert!(rpc.as_mut().poll(&mut cx).is_pending());
         wake_count.0.store(0, Ordering::Relaxed);
         for _ in 0..8 {

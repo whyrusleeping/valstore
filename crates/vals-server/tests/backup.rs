@@ -472,6 +472,7 @@ fn restore_drill_rebuilds_an_exact_fenced_copy_from_a_backup() {
             .collect();
         logs.contains(&format!("push carries {source_incarnation}")).then_some(())
     });
+    eventually("the obsolete PD's admin socket", || UnixStream::connect(&source.admin_sock).ok().map(|_| ()));
     let rogue = admin(&source.admin_sock, "create-zone rogue 2 unsorted");
     assert!(rogue.starts_with("ok"), "{rogue}");
     std::thread::sleep(Duration::from_secs(2));

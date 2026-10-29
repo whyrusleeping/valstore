@@ -1212,6 +1212,7 @@ pub fn pd_range_map_endpoint_metrics() -> Vec<PdRangeMapEndpointMetrics> {
 }
 
 const ALLOCATOR_SAMPLE_INTERVAL_MS: u64 = 4_000;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 static ALLOCATOR_SAMPLED_AT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg_attr(not(all(target_os = "linux", target_env = "gnu")), allow(dead_code))]

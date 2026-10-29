@@ -1,0 +1,17 @@
+[package]
+name = "raft-proto"
+version = "0.7.0"
+authors = ["The TiKV Project Developers"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/pingcap/raft-rs"
+description = "raft-proto 0.7.0 with its rust-protobuf code pre-generated, so building needs no protoc."
+publish = false
+
+[features]
+default = ["protobuf-codec"]
+protobuf-codec = ["bytes", "protobuf/bytes"]
+
+[dependencies]
+bytes = { version = "1", optional = true }
+protobuf = "2"

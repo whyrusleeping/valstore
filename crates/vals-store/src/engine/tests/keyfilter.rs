@@ -1445,6 +1445,7 @@ pub(super) fn process_rss() -> u64 {
     process_status_bytes("VmRSS:")
 }
 
+#[cfg(target_os = "linux")]
 fn process_anon_rss() -> u64 {
     process_status_bytes("RssAnon:")
 }
@@ -1456,6 +1457,7 @@ fn process_status_bytes(field: &str) -> u64 {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn rebuilt_filter_has_scaled_resident_and_compound_fpr_bounds() {
     if isolated_env_test(&[]) { return; }
     let n = if full_lane() { 50_000_000u64 } else { 4_000_000 };

@@ -3,6 +3,13 @@ use super::*;
 pub(super) const BLOCK_SIZE: usize = 4096;
 pub(super) const SEG_BLOCKS: u64 = 256;
 
+pub(super) fn malloc_trim() {
+    #[cfg(target_env = "gnu")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 pub(super) fn bench_config(ordering: Ordering) -> Config {
     Config {
         seg_blocks: SEG_BLOCKS,

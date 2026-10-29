@@ -27,3 +27,22 @@ jobs:
           name: software-ci-logs
           path: target/ci-logs/
           if-no-files-found: warn
+
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          channel=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal -c clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build every target
+        run: cargo build --locked --workspace --all-targets
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Runtime, engine, raft and client tests
+        run: cargo test --locked -p vals-rt -p vals-store -p vals-raft -p vals-client

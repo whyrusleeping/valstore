@@ -153,9 +153,7 @@ pub(super) fn workload_recover(backend: &str, path: &str, n: usize, vsize: usize
 }
 
 fn rss_now() -> u64 {
-    unsafe {
-        libc::malloc_trim(0);
-    }
+    malloc_trim();
     vals_cluster::observe::process_resident_bytes().unwrap_or(0)
 }
 

@@ -48,9 +48,13 @@ Every crate has `publish = false` and there is no API freeze, so keep all vals
 crates, and the servers your clients talk to, on one revision. The code is
 MIT licensed (`LICENSE`).
 
-**Platforms.** Linux only. The software lane runs on x86-64 (GitHub's
+**Platforms.** Linux. The software lane runs on x86-64 (GitHub's
 `ubuntu-latest` and the developer machine below) with the Rust toolchain
-pinned in `rust-toolchain.toml`. The file backend was measured on ext4. The
+pinned in `rust-toolchain.toml`. macOS on Apple Silicon is a development
+platform only: CI builds and lints the workspace there and runs part of the
+tests ([`ci.md`](ci.md#macos)), the README quick start works on an Apple M1,
+and nothing in these docs was measured on it. The file backend was measured
+on ext4. The
 SPDK backend was tested with SPDK v24.09 built by `scripts/build-spdk.sh`, run
 as root on hosts with an IOMMU, on Samsung PM9A3, 990 PRO and 9100 PRO
 drives. Other architectures, filesystems, SPDK versions and drives are

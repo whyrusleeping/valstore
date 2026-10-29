@@ -2749,6 +2749,7 @@ fn raft_conn_open(s: &TcpStream) -> bool {
     s.set_nonblocking(false).is_ok() && open
 }
 
+#[cfg(target_os = "linux")]
 const RAFT_CONN_USER_TIMEOUT: Duration = Duration::from_millis(1000);
 const RAFT_PEER_QUEUE: usize = 1024;
 
@@ -2825,6 +2826,7 @@ fn raft_connect(addr: SocketAddr) -> Option<TcpStream> {
     let mut s = TcpStream::connect_timeout(&addr, RAFT_SEND_TIMEOUT).ok()?;
     let _ = s.set_nodelay(true);
     let _ = s.set_write_timeout(Some(RAFT_SEND_TIMEOUT));
+    #[cfg(target_os = "linux")]
     let _ = socket2::SockRef::from(&s).set_tcp_user_timeout(Some(RAFT_CONN_USER_TIMEOUT));
     let token = crate::auth::token();
     let ver = crate::proto::PROTO_VERSION.to_le_bytes();

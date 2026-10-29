@@ -34,6 +34,19 @@ version differs from the pinned channel. It unsets `VALS_SPDK_LINK` and
 logs the names (not the values) of any other `VALS_*` variables left in the
 environment. CI uploads the logs even when a step fails.
 
+## macOS
+
+A second GitHub Actions job runs on `macos-14` (Apple Silicon) with the same
+pinned toolchain. It builds every workspace target, runs
+`cargo clippy --locked --workspace --all-targets -- -D warnings`, and runs the
+`vals-rt`, `vals-store`, `vals-raft` and `vals-client` tests. It does not run
+`scripts/ci.sh`. The `vals-cluster` and `vals-server` tests also pass on an
+Apple M1, except that their timing-sensitive tests occasionally fail there
+(for example an anti-entropy seed's foreground share or a PD leadership
+check right after an election), so the job leaves them to the Linux lane.
+On macOS the client and server reactor uses kqueue instead of epoll, timerfd
+and eventfd.
+
 ## Hardware is a separate gate
 
 A green software CI run covers the in-memory and file backends. It says

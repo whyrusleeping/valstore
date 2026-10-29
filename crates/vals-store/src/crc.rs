@@ -37,8 +37,10 @@ fn has_sse42() -> bool {
     *OK.get_or_init(|| std::arch::is_x86_feature_detected!("sse4.2"))
 }
 
+#[cfg(any(target_arch = "x86_64", test))]
 const LANE: usize = 1024;
 
+#[cfg(any(target_arch = "x86_64", test))]
 fn zshift_tables() -> &'static [[u32; 256]; 4] {
     static ZSHIFT: OnceLock<[[u32; 256]; 4]> = OnceLock::new();
     ZSHIFT.get_or_init(|| {
@@ -67,6 +69,7 @@ fn zshift_tables() -> &'static [[u32; 256]; 4] {
     })
 }
 
+#[cfg(any(target_arch = "x86_64", test))]
 #[inline]
 fn zshift(t: &[[u32; 256]; 4], s: u32) -> u32 {
     t[0][(s & 0xFF) as usize]

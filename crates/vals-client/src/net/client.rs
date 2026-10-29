@@ -416,6 +416,20 @@ impl ConnState {
         let Some(sock) = self.sock.take() else {
             return false;
         };
+        #[cfg(not(target_os = "linux"))]
+        if self.negotiated.is_none() && self.sent_total == 0 {
+            match connect_progress(&sock) {
+                ConnectProgress::Connected => {}
+                ConnectProgress::Pending => {
+                    self.sock = Some(sock);
+                    return self.has_sendable_bytes();
+                }
+                ConnectProgress::Failed => {
+                    self.reset_failed(wake);
+                    return false;
+                }
+            }
+        }
         let mut ok = true;
         let write_end = self.send_end();
         let pos_before = self.out_pos;
@@ -720,6 +734,27 @@ pub fn connect_nonblocking(addr: SocketAddr) -> io::Result<TcpStream> {
         Err(e) => return Err(e),
     }
     Ok(sock.into())
+}
+
+#[cfg(not(target_os = "linux"))]
+enum ConnectProgress {
+    Connected,
+    Pending,
+    Failed,
+}
+
+#[cfg(not(target_os = "linux"))]
+fn connect_progress(sock: &super::Sock) -> ConnectProgress {
+    let super::Sock::Tcp(s) = sock else {
+        return ConnectProgress::Connected;
+    };
+    if s.peer_addr().is_ok() {
+        return ConnectProgress::Connected;
+    }
+    match s.take_error() {
+        Ok(None) => ConnectProgress::Pending,
+        _ => ConnectProgress::Failed,
+    }
 }
 
 

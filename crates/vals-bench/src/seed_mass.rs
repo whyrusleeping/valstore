@@ -87,7 +87,7 @@ pub(super) fn workload_seed_mass(path: &str, keys: usize, stores: usize, threads
     let retained = rss();
     let trimmed = if std::env::var_os("VALS_SEED_MASS_TRIM").is_some() {
         let trim_started = Instant::now();
-        let after = std::thread::spawn(|| { unsafe { libc::malloc_trim(0); } rss() }).join().unwrap();
+        let after = std::thread::spawn(|| { malloc_trim(); rss() }).join().unwrap();
         println!("SEED_MASS_TRIM before={retained} after={after} wall_ms={:.3}", trim_started.elapsed().as_secs_f64() * 1000.0);
         Some(after)
     } else { None };

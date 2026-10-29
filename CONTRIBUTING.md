@@ -9,7 +9,10 @@ instead of filing a public issue.
 ## Building and testing
 
 You need Linux, [rustup](https://rustup.rs/), and Python 3.10 or newer.
-`rust-toolchain.toml` pins the Rust version, and CI checks it.
+`rust-toolchain.toml` pins the Rust version, and CI checks it. The workspace
+also builds on macOS (Apple Silicon); a separate CI job checks that and runs
+part of the tests there ([`docs/ci.md`](docs/ci.md#macos)), but
+`scripts/ci.sh` and the hardware work are Linux only.
 
 ```sh
 cargo build --workspace

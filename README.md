@@ -17,7 +17,8 @@ in-memory or file-backed storage.
 ## Status
 
 vals is young. The version is 0.0.1, it is not on crates.io, and its APIs may
-still change. It runs on Linux only. A shared secret can protect control
+still change. It runs on Linux; it also builds and runs on macOS (Apple
+Silicon) for development, without SPDK. A shared secret can protect control
 operations, but it is off unless you set `secret_file`, and without it
 control operations are open too. Data traffic is never authenticated or
 encrypted, so run vals on a private network; [`SECURITY.md`](SECURITY.md)
@@ -61,9 +62,9 @@ to measure your own, see [`docs/benchmarks.md`](docs/benchmarks.md).
 
 ## Quick start
 
-You need Linux and [rustup](https://rustup.rs/). The repository pins its Rust
-toolchain in `rust-toolchain.toml`, and rustup uses that version
-automatically.
+You need Linux or macOS and [rustup](https://rustup.rs/). The repository
+pins its Rust toolchain in `rust-toolchain.toml`, and rustup uses that
+version automatically.
 
 ```sh
 git clone https://github.com/whyrusleeping/valstore
