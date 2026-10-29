@@ -72,7 +72,7 @@ pub use pace::{
 };
 pub use run::{RunBuildOpts, RunHandle, SidecarVersions};
 pub use snapshot::SnapshotEntry;
-pub use snapshot_io::{load_manifest, write_manifest, LiveSnapshot, SnapshotError};
+pub use snapshot_io::{load_manifest, manifest_rebuild_total, write_manifest, LiveSnapshot, SnapshotError};
 pub use vlog::{
     vlog_replay_skip_totals, vlog_stall_totals, vlog_sync_totals, ReadPlan, Record, RecordKind, SpanReadPlan,
 };

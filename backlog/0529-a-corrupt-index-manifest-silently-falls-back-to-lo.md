@@ -1,7 +1,7 @@
 ---
 id: "0529"
 title: A corrupt index manifest silently falls back to log replay, dropping every run and freeing their segments
-status: todo
+status: done
 priority: 2
 created: "2026-10-29"
 updated: "2026-10-29"
@@ -10,6 +10,7 @@ spec_refs: []
 ---
 
 ## Description
+
 Found in the 2026-10-29 project review. `load_latest_chain` maps payload checksum failures to `Ok(None)` (vals-store engine snapshot/manifest loading), and `open_inner` (crates/vals-store/src/engine/recovery.rs ~195–200) maps every error other than Io/Unsupported to "no manifest" (`Err(_) => None`). The test `corrupt_manifest_still_falls_back_to_log_replay` makes the fallback deliberate. Review repro: a 1-bit flip in the manifest payload, reopen → `runs = 0`, used segments 16→14 (run segments freed for reuse), no error. Values that vlog rewrites moved into non-tail segments are reachable only through runs, so they are lost too (not reproduced; check).
 
 Acceptance:
@@ -18,6 +19,8 @@ Acceptance:
 - The previous-manifest scrub (zeroing old header blocks with `let _ = write_at`, no flush) is reviewed so the fail-closed rule cannot pick a stale generation.
 - `corrupt_manifest_still_falls_back_to_log_replay` is replaced by tests for the new behaviour that fail with the fix reverted; docs updated.
 
-## Acceptance criteria
+## Outcome
 
-## Work log
+Open fails with ManifestLost when the newest valid manifest head does not load/decode, or no head is valid but rewrite segments exist; no fallback. Head header is written only after the chain payload is flushed (crash at any write leaves a loadable generation). Older heads found at open join live.segs and are wiped by the next manifest write. Rebuild needs VALS_STORE_REBUILD_LOST_MANIFEST=1 or Engine::open_rebuilding_lost_manifest; it warns, counts vals_manifest_rebuilds_total, replays rewrite segments, and the next manifest supersedes the lost generation. valsd dump's range-tombstone read propagates ManifestLost (retries 4x for live races) unless the env is set. Old fallback test replaced by tests that fail with the fix reverted; docs formats.md §2.4, configuration.md. vals-store/cluster/server tests pass; two reviewers accepted.
+
+Commit: 0529: a damaged manifest fails open (ManifestLost) instead of silently replaying the log; head header written after a flushed payload; stale heads retire with the next manifest; explicit, counted VALS_STORE_REBUILD_LOST_MANIFEST rebuild

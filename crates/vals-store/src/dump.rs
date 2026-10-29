@@ -108,6 +108,20 @@ pub struct VlogScanStats {
     pub bytes: u64,
 }
 
+fn load_manifest_settled<D: BlockDevice>(
+    dev: &D,
+    alloc: &Allocator,
+) -> Result<Option<(crate::manifest::Manifest, crate::snapshot_io::LiveSnapshot)>, SnapshotError> {
+    const ATTEMPTS: u32 = 5;
+    for _ in 1..ATTEMPTS {
+        match crate::snapshot_io::load_manifest(dev, alloc) {
+            Err(SnapshotError::ManifestLost { .. }) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            result => return result,
+        }
+    }
+    crate::snapshot_io::load_manifest(dev, alloc)
+}
+
 pub fn read_range_tombstones<D: BlockDevice>(
     dev: &D,
     cfg: &Config,
@@ -120,11 +134,14 @@ pub fn read_range_tombstones<D: BlockDevice>(
             pacer.wait_for_bytes(bytes);
         }
     };
-    let manifest = match crate::snapshot_io::load_manifest(dev, &alloc) {
+    let manifest = match load_manifest_settled(dev, &alloc) {
         Ok(found) => found.map(|(man, _)| man),
         Err(SnapshotError::Io(e)) => return Err(EngineError::Io(e)),
-        Err(e @ SnapshotError::Unsupported(_)) => return Err(e.into()),
-        Err(_) => None,
+        Err(e @ SnapshotError::ManifestLost { .. }) if crate::snapshot_io::rebuild_lost_manifest_requested() => {
+            log::warn!("read range tombstones: {e}; continuing without the runs' range tombstones as requested");
+            None
+        }
+        Err(e) => return Err(e.into()),
     };
     let mut records: Vec<RtRecord> = Vec::new();
     if let Some(man) = &manifest {

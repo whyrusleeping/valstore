@@ -10,6 +10,22 @@ const CHAIN_VERSION: u16 = 1;
 const CHAIN_HDR_LEN: usize = 46;
 const NO_NEXT: u64 = u64::MAX;
 
+pub const REBUILD_LOST_MANIFEST_ENV: &str = "VALS_STORE_REBUILD_LOST_MANIFEST";
+
+static MANIFEST_REBUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn manifest_rebuild_total() -> u64 {
+    MANIFEST_REBUILDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn note_manifest_rebuild() {
+    MANIFEST_REBUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn rebuild_lost_manifest_requested() -> bool {
+    std::env::var(REBUILD_LOST_MANIFEST_ENV).is_ok_and(|v| v.trim() == "1")
+}
+
 #[derive(Debug)]
 pub enum SnapshotError {
     Io(BlockError),
@@ -17,6 +33,10 @@ pub enum SnapshotError {
     Corrupt(&'static str),
     Unsupported(&'static str),
     EncodeIntegrity(Box<crate::run::EncodeIntegrityError>),
+    ManifestLost {
+        generation: Option<u64>,
+        why: &'static str,
+    },
 }
 
 impl std::fmt::Display for SnapshotError {
@@ -31,6 +51,17 @@ impl std::fmt::Display for SnapshotError {
                  (written by a newer release?); refusing to open"
             ),
             SnapshotError::EncodeIntegrity(e) => write!(f, "{e}"),
+            SnapshotError::ManifestLost { generation, why } => {
+                match generation {
+                    Some(g) => write!(f, "manifest generation {g} is damaged: {why}")?,
+                    None => write!(f, "manifest is missing: {why}")?,
+                }
+                write!(
+                    f,
+                    "; refusing to open, because rebuilding from the value log drops every run \
+                     (set {REBUILD_LOST_MANIFEST_ENV}=1 to rebuild anyway)"
+                )
+            }
         }
     }
 }
@@ -155,7 +186,7 @@ pub(crate) fn write_chain(
         .map(|i| if i + 1 < n { segs[i + 1].0 } else { NO_NEXT })
         .collect();
 
-    let write_seg = |i: usize| -> Result<(), SnapshotError> {
+    let seg_image = |i: usize| -> Vec<u8> {
         let start = i * cap;
         let end = (start + cap).min(bytes.len());
         let chunk = &bytes[start..end];
@@ -170,19 +201,25 @@ pub(crate) fn write_chain(
         let mut buf = vec![0u8; seg_bytes];
         buf[0..CHAIN_HDR_LEN].copy_from_slice(&encode_chain_header(&hdr, magic));
         buf[CHAIN_HDR_LEN..CHAIN_HDR_LEN + chunk.len()].copy_from_slice(chunk);
+        buf
+    };
+    let write = |lba: u64, buf: &[u8]| -> Result<(), SnapshotError> {
         crate::attribution::write_bytes(5, buf.len());
-        dev.write_at(seg_lbas[i], &buf)?;
+        dev.write_at(lba, buf)?;
         Ok(())
     };
 
     let write_phase = || -> Result<(), SnapshotError> {
         for i in (1..n).rev() {
-            write_seg(i)?;
+            write(seg_lbas[i], &seg_image(i))?;
         }
-        if n > 1 {
-            dev.flush()?;
-        }
-        write_seg(0)?;
+        let mut head = seg_image(0);
+        let head_header: [u8; CHAIN_HDR_LEN] = head[..CHAIN_HDR_LEN].try_into().unwrap();
+        head[..CHAIN_HDR_LEN].fill(0);
+        write(seg_lbas[0], &head)?;
+        dev.flush()?;
+        head[..CHAIN_HDR_LEN].copy_from_slice(&head_header);
+        write(seg_lbas[0], &head[..dev.block_size()])?;
         dev.flush()?;
         Ok(())
     };
@@ -228,24 +265,36 @@ pub fn load_manifest(
     dev: &impl BlockDevice,
     alloc: &Allocator,
 ) -> Result<Option<(crate::manifest::Manifest, LiveSnapshot)>, SnapshotError> {
+    Ok(load_manifest_chain(dev, alloc)?.latest)
+}
+
+pub(crate) fn load_manifest_chain(
+    dev: &impl BlockDevice,
+    alloc: &Allocator,
+) -> Result<ChainLoad<crate::manifest::Manifest>, SnapshotError> {
     load_latest_chain(dev, alloc, MAN_CHAIN_MAGIC, |b| match crate::manifest::decode(b) {
-        Ok(m) => Ok(Some(m)),
+        Ok(m) => Ok(m),
         Err(crate::manifest::UNSUPPORTED_VERSION) => Err(SnapshotError::Unsupported("manifest version")),
-        Err(_) => Ok(None),
+        Err(why) => Err(SnapshotError::Corrupt(why)),
     })
+}
+
+pub(crate) struct ChainLoad<T> {
+    pub(crate) latest: Option<(T, LiveSnapshot)>,
+    pub(crate) stale_heads: Vec<SegmentId>,
 }
 
 pub(crate) fn load_latest_chain<T>(
     dev: &impl BlockDevice,
     alloc: &Allocator,
     magic: u32,
-    parse: impl Fn(&[u8]) -> Result<Option<T>, SnapshotError>,
-) -> Result<Option<(T, LiveSnapshot)>, SnapshotError> {
+    parse: impl Fn(&[u8]) -> Result<T, SnapshotError>,
+) -> Result<ChainLoad<T>, SnapshotError> {
     let block_size = dev.block_size();
     let num_segs = alloc.num_segments();
 
     let mut headers: HashMap<SegmentId, ChainHeader> = HashMap::new();
-    let mut heads_by_gen: HashMap<u64, SegmentId> = HashMap::new();
+    let mut heads: Vec<(u64, SegmentId)> = Vec::new();
     let mut unknown_head_gen: Option<u64> = None;
     const BATCH: usize = 4096;
     let mut bufs: Vec<Vec<u8>> = (0..BATCH.min(num_segs.max(1) as usize))
@@ -270,7 +319,7 @@ pub(crate) fn load_latest_chain<T>(
                 ChainHeaderDecode::Header(h) => {
                     let seg = SegmentId(s + i as u64);
                     if h.seg_index == 0 {
-                        heads_by_gen.entry(h.generation).or_insert(seg);
+                        heads.push((h.generation, seg));
                     }
                     headers.insert(seg, h);
                 }
@@ -283,23 +332,23 @@ pub(crate) fn load_latest_chain<T>(
         s += n as u64;
     }
 
-    let mut gens: Vec<u64> = heads_by_gen.keys().copied().collect();
-    gens.sort_unstable_by(|a, b| b.cmp(a));
-    for gen in gens {
-        if unknown_head_gen.is_some_and(|u| u >= gen) {
+    let Some(&(gen, head)) = heads.iter().min_by_key(|(g, seg)| (std::cmp::Reverse(*g), *seg)) else {
+        if unknown_head_gen.is_some() {
             return Err(SnapshotError::Unsupported("chain header version"));
         }
-        let head = heads_by_gen[&gen];
-        if let Some((payload, live)) = load_chain(dev, alloc, &headers, head, gen)? {
-            if let Some(v) = parse(&payload)? {
-                return Ok(Some((v, live)));
-            }
-        }
-    }
-    if unknown_head_gen.is_some() {
+        return Ok(ChainLoad { latest: None, stale_heads: Vec::new() });
+    };
+    if unknown_head_gen.is_some_and(|u| u >= gen) {
         return Err(SnapshotError::Unsupported("chain header version"));
     }
-    Ok(None)
+    let lost = |why| SnapshotError::ManifestLost { generation: Some(gen), why };
+    let (payload, live) = load_chain(dev, alloc, &headers, head, gen)?.map_err(lost)?;
+    let value = parse(&payload).map_err(|e| match e {
+        SnapshotError::Corrupt(why) => lost(why),
+        e => e,
+    })?;
+    let stale_heads = heads.iter().filter(|(g, _)| *g < gen).map(|(_, seg)| *seg).collect();
+    Ok(ChainLoad { latest: Some((value, live)), stale_heads })
 }
 
 fn load_chain(
@@ -308,7 +357,7 @@ fn load_chain(
     headers: &HashMap<SegmentId, ChainHeader>,
     head: SegmentId,
     gen: u64,
-) -> Result<Option<(Vec<u8>, LiveSnapshot)>, SnapshotError> {
+) -> Result<Result<(Vec<u8>, LiveSnapshot), &'static str>, SnapshotError> {
     let head_hdr = headers[&head];
     let seg_count = head_hdr.seg_count as usize;
     let block_size = dev.block_size();
@@ -320,22 +369,22 @@ fn load_chain(
     let mut buf = vec![0u8; seg_bytes];
     for expected_index in 0..seg_count {
         let Some(h) = headers.get(&cur) else {
-            return Ok(None);
+            return Ok(Err("a chain segment has no valid header"));
         };
         if h.generation != gen || h.seg_index as usize != expected_index {
-            return Ok(None);
+            return Ok(Err("a chain segment belongs to another generation or position"));
         }
         let (lba, _) = alloc.segment_range(cur);
         dev.read_at(lba, &mut buf)?;
         let chunk_len = h.chunk_len as usize;
         if CHAIN_HDR_LEN + chunk_len > buf.len() {
-            return Ok(None);
+            return Ok(Err("a chain chunk overruns its segment"));
         }
         payload.extend_from_slice(&buf[CHAIN_HDR_LEN..CHAIN_HDR_LEN + chunk_len]);
         segs.push(cur);
         if h.next_seg == NO_NEXT {
             if expected_index + 1 != seg_count {
-                return Ok(None);
+                return Ok(Err("the chain ends early"));
             }
             break;
         }
@@ -343,9 +392,9 @@ fn load_chain(
     }
 
     if payload.len() as u64 != head_hdr.total_len || segs.len() != seg_count {
-        return Ok(None);
+        return Ok(Err("the chain length does not match its head"));
     }
-    Ok(Some((
+    Ok(Ok((
         payload,
         LiveSnapshot {
             generation: gen,
@@ -478,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_head_chunk_falls_back() {
+    fn corrupt_newest_payload_fails_closed_instead_of_falling_back() {
         let (dev, mut alloc) = dev_alloc(512, 16);
         let m1 = manifest_with(3);
         write_manifest(&dev, &mut alloc, &m1, 1, None).unwrap();
@@ -491,9 +540,103 @@ mod tests {
         buf[CHAIN_HDR_LEN + 4] ^= 0xff;
         dev.write_at(lba, &buf).unwrap();
 
-        let (loaded, loaded_live) = load_manifest(&dev, &alloc).unwrap().expect("falls back");
-        assert_eq!(loaded, m1);
-        assert_eq!(loaded_live.generation, 1);
+        let err = load_manifest(&dev, &alloc).unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::ManifestLost { generation: Some(2), why: "crc mismatch" }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn newest_chain_missing_a_segment_fails_closed() {
+        let (dev, mut alloc) = dev_alloc(512, 2);
+        write_manifest(&dev, &mut alloc, &manifest_with(3), 1, None).unwrap();
+        let live2 = write_manifest(&dev, &mut alloc, &manifest_with(200), 2, None).unwrap();
+        assert!(live2.segs.len() > 1);
+        let zero = vec![0u8; BS];
+        dev.write_at(alloc.segment_range(live2.segs[1]).0, &zero).unwrap();
+
+        let err = load_manifest(&dev, &alloc).unwrap_err();
+        assert!(matches!(err, SnapshotError::ManifestLost { generation: Some(2), .. }), "{err}");
+    }
+
+    #[test]
+    fn older_heads_are_reported_stale() {
+        let (dev, mut alloc) = dev_alloc(512, 16);
+        let live1 = write_manifest(&dev, &mut alloc, &manifest_with(3), 1, None).unwrap();
+        let m2 = manifest_with(4);
+        let live2 = write_manifest(&dev, &mut alloc, &m2, 2, None).unwrap();
+        let load = load_manifest_chain(&dev, &alloc).unwrap();
+        let (loaded, loaded_live) = load.latest.expect("a manifest");
+        assert_eq!((loaded, loaded_live), (m2, live2));
+        assert_eq!(load.stale_heads, vec![live1.segs[0]]);
+    }
+
+    struct CrashDevice {
+        inner: MemBlockDevice,
+        writes: std::sync::atomic::AtomicUsize,
+        crash_at: usize,
+        crashed: std::sync::atomic::AtomicBool,
+    }
+    impl BlockDevice for CrashDevice {
+        fn block_size(&self) -> usize {
+            self.inner.block_size()
+        }
+        fn num_blocks(&self) -> u64 {
+            self.inner.num_blocks()
+        }
+        fn read_at(&self, lba: u64, buf: &mut [u8]) -> vals_spdk::Result<()> {
+            self.inner.read_at(lba, buf)
+        }
+        fn write_at(&self, lba: u64, buf: &[u8]) -> vals_spdk::Result<()> {
+            use std::sync::atomic::Ordering::Relaxed;
+            if self.crashed.load(Relaxed) {
+                return Err(BlockError::Io(std::io::Error::other("crashed")));
+            }
+            if self.writes.fetch_add(1, Relaxed) + 1 == self.crash_at {
+                self.crashed.store(true, Relaxed);
+                self.inner.write_at(lba, &buf[..self.inner.block_size()])?;
+                return Err(BlockError::Io(std::io::Error::other("crashed mid-write")));
+            }
+            self.inner.write_at(lba, buf)
+        }
+        fn flush(&self) -> vals_spdk::Result<()> {
+            if self.crashed.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(BlockError::Io(std::io::Error::other("crashed")));
+            }
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn a_crash_tearing_any_chain_write_leaves_a_loadable_generation() {
+        for (seg_blocks, runs) in [(16u64, 200usize), (2, 200)] {
+            let mut crash_at = 1;
+            loop {
+                let inner = MemBlockDevice::new(BS, 1024);
+                let mut alloc = Allocator::new(1024, seg_blocks, 0);
+                let m1 = manifest_with(3);
+                let live1 = write_manifest(&inner, &mut alloc, &m1, 1, None).unwrap();
+                let dev = CrashDevice { inner, writes: Default::default(), crash_at, crashed: Default::default() };
+                let m2 = manifest_with(runs);
+                let committed = write_manifest(&dev, &mut alloc, &m2, 2, Some(&live1)).is_ok();
+                let fresh = Allocator::new(1024, seg_blocks, 0);
+                let (loaded, live) = load_manifest(&dev.inner, &fresh)
+                    .unwrap_or_else(|e| panic!("seg_blocks {seg_blocks}, crash at chain write {crash_at}: {e}"))
+                    .expect("a manifest");
+                if committed {
+                    assert_eq!((loaded, live.generation), (m2, 2));
+                    break;
+                }
+                assert!(
+                    (live.generation == 1 && loaded == m1) || (live.generation == 2 && loaded == m2),
+                    "seg_blocks {seg_blocks}, crash at chain write {crash_at}: loaded generation {}",
+                    live.generation,
+                );
+                crash_at += 1;
+            }
+            assert!(crash_at > 2, "the crash points cover the payload and header writes");
+        }
     }
 
     fn write_unknown_version_head(dev: &MemBlockDevice, alloc: &mut Allocator, generation: u64) {
@@ -556,8 +699,9 @@ mod tests {
             .unwrap()
             .expect("manifest present");
         assert_eq!(loaded, m);
-        let (payload, _) = load_latest_chain(&dev, &alloc, TEST_MAGIC, |b| Ok(Some(b.to_vec())))
+        let (payload, _) = load_latest_chain(&dev, &alloc, TEST_MAGIC, |b| Ok(b.to_vec()))
             .unwrap()
+            .latest
             .expect("foreign chain present");
         assert_eq!(payload, b"foreign payload");
     }

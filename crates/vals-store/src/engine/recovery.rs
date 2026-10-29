@@ -178,11 +178,26 @@ impl<D: BlockDevice> Engine<D> {
     /// is no "is this a store" check: a device with no store on it (for
     /// example, all zeroes) opens as an empty store, so keep track yourself of
     /// which devices hold data.
+    ///
+    /// A damaged manifest (a valid chain head whose contents do not decode, or
+    /// value-log rewrite segments with no manifest at all) fails the open with
+    /// [`SnapshotError::ManifestLost`], unless the environment variable
+    /// `VALS_STORE_REBUILD_LOST_MANIFEST` is `1`, which makes the open behave
+    /// like [`open_rebuilding_lost_manifest`](Self::open_rebuilding_lost_manifest).
     pub fn open(dev: D, cfg: Config) -> Result<Self, EngineError> {
-        Self::open_inner(dev, cfg)
+        Self::open_inner(dev, cfg, snapshot_io::rebuild_lost_manifest_requested())
     }
 
-    fn open_inner(dev: D, cfg: Config) -> Result<Self, EngineError> {
+    /// Like [`open`](Self::open), but a lost manifest does not fail the open:
+    /// the store is rebuilt from every value-log segment on the device,
+    /// including rewrite segments. Every run is dropped, so data and deletes
+    /// held only by runs are lost and deleted keys may come back. Each rebuild
+    /// is logged and counted in [`manifest_rebuild_total`](crate::manifest_rebuild_total).
+    pub fn open_rebuilding_lost_manifest(dev: D, cfg: Config) -> Result<Self, EngineError> {
+        Self::open_inner(dev, cfg, true)
+    }
+
+    fn open_inner(dev: D, cfg: Config, rebuild_lost_manifest: bool) -> Result<Self, EngineError> {
         let block_size = dev.block_size();
         let mut alloc = Allocator::new(dev.num_blocks(), cfg.seg_blocks, cfg.reserved_blocks);
         let mut index = new_index(cfg.ordering);
@@ -192,11 +207,30 @@ impl<D: BlockDevice> Engine<D> {
         let mut log_segs = crate::dump::scan_log_segments(&dev, &alloc, block_size)?;
         log_segs.sort_by_key(|(_, ep, _)| *ep);
 
-        let manifest = match snapshot_io::load_manifest(&dev, &alloc) {
-            Ok(m) => m,
-            Err(snapshot_io::SnapshotError::Io(e)) => return Err(EngineError::Io(e)),
-            Err(e @ snapshot_io::SnapshotError::Unsupported(_)) => return Err(e.into()),
-            Err(_) => None,
+        let loaded = match snapshot_io::load_manifest_chain(&dev, &alloc) {
+            Ok(load) if load.latest.is_none() && log_segs.iter().any(|(_, _, not_tail)| *not_tail) => {
+                Err(SnapshotError::ManifestLost {
+                    generation: None,
+                    why: "no manifest chain head is valid, but value-log rewrite segments exist and only a \
+                          manifest's runs reference them",
+                })
+            }
+            Ok(load) => Ok(load),
+            Err(SnapshotError::Io(e)) => return Err(EngineError::Io(e)),
+            Err(e) => Err(e),
+        };
+        let (manifest, stale_heads, lost_generation) = match loaded {
+            Ok(load) => (load.latest, load.stale_heads, None),
+            Err(SnapshotError::ManifestLost { generation, why }) if rebuild_lost_manifest => {
+                snapshot_io::note_manifest_rebuild();
+                log::warn!(
+                    "engine: manifest {} is lost ({why}); rebuilding the store from the value log as requested: \
+                     every run is dropped, so data and deletes held only by runs are lost",
+                    generation.map_or_else(|| "(no valid head)".to_string(), |g| format!("generation {g}")),
+                );
+                (None, Vec::new(), Some(generation.unwrap_or(0)))
+            }
+            Err(e) => return Err(e.into()),
         };
 
         let max_epoch_all: Option<u64> = log_segs.iter().map(|(_, e, _)| *e).max();
@@ -205,7 +239,7 @@ impl<D: BlockDevice> Engine<D> {
         let mut runs: Vec<OpenRun<D>> = Vec::new();
         let (min_replay_epoch, covered_seq, manifest_gen, live_manifest, manifest_driven) =
             match manifest {
-                Some((man, live)) => {
+                Some((man, mut live)) => {
                     let covered_epoch = man.covered_epoch;
                     let covered_seq = man.covered_seq;
                     let generation = live.generation;
@@ -237,6 +271,11 @@ impl<D: BlockDevice> Engine<D> {
                             allocated.insert(*seg);
                         }
                     }
+                    for s in stale_heads {
+                        if allocated.insert(s) {
+                            live.segs.push(s);
+                        }
+                    }
                     for s in &allocated {
                         alloc
                             .mark_allocated(*s)
@@ -255,7 +294,7 @@ impl<D: BlockDevice> Engine<D> {
                         manifest_driven,
                     )
                 }
-                None => (None, None, 0, None, false),
+                None => (None, None, lost_generation.unwrap_or(0), None, false),
             };
 
         let mut winners: Winners = std::collections::HashMap::new();
@@ -269,6 +308,7 @@ impl<D: BlockDevice> Engine<D> {
             &mut replayed_rts,
             min_replay_epoch,
             /* mark */ !manifest_driven,
+            /* include_rewrites */ lost_generation.is_some(),
         )?;
         let replay_cover = (!replayed_rts.is_empty()).then(|| FragmentSet::from_records(replayed_rts.iter().map(|(r, _)| r)));
         let rts = RtState::recover(
@@ -355,6 +395,7 @@ impl<D: BlockDevice> Engine<D> {
         rts: &mut Vec<(RtRecord, ValuePtr)>,
         min_replay_epoch: Option<u64>,
         mark: bool,
+        include_rewrites: bool,
     ) -> Result<(Option<u64>, Option<u64>), EngineError> {
         let mut max_seq: Option<u64> = None;
         let mut max_epoch: Option<u64> = None;
@@ -365,7 +406,7 @@ impl<D: BlockDevice> Engine<D> {
                     .expect("recover: segment marked twice");
             }
             max_epoch = Some(max_epoch.map_or(*seg_epoch, |m| m.max(*seg_epoch)));
-            if *not_tail {
+            if *not_tail && !include_rewrites {
                 continue;
             }
             if min_replay_epoch.is_some_and(|min| *seg_epoch < min) {

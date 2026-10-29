@@ -289,6 +289,9 @@ fn render() -> String {
     out.push_str("# HELP vals_vlog_replay_skipped_bytes_total Bytes in the damaged value-log regions counted by vals_vlog_replay_skips_total (process-wide).\n");
     out.push_str("# TYPE vals_vlog_replay_skipped_bytes_total counter\n");
     out.push_str(&format!("vals_vlog_replay_skipped_bytes_total {replay_skipped_bytes}\n"));
+    out.push_str("# HELP vals_manifest_rebuilds_total Engine opens that found the run manifest lost and rebuilt the store from the value log because VALS_STORE_REBUILD_LOST_MANIFEST=1 (process-wide).\n");
+    out.push_str("# TYPE vals_manifest_rebuilds_total counter\n");
+    out.push_str(&format!("vals_manifest_rebuilds_total {}\n", vals_store::manifest_rebuild_total()));
     let (drain_count, drain_us, tail_count, tail_us) = vals_store::vlog_sync_totals();
     let (verify_bytes, verify_failures) = vals_store::run::run_build_verify_totals();
     out.push_str(&format!(

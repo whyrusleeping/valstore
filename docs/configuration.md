@@ -319,6 +319,19 @@ ownership checks in `vals-spdk/src/spdk.rs`. This is an incident escape hatch
 and safety tripwire, not an endorsed way to run cross-thread serving I/O. Leave
 it on.
 
+`VALS_STORE_REBUILD_LOST_MANIFEST` is unset by default. A store whose run
+manifest is damaged fails to open with an error naming the manifest
+generation, so the node does not start. Setting the variable to exactly `1`
+for one restart makes such a store rebuild from its value log instead: every
+run is dropped, data and deletes held only by runs are lost, and deleted keys
+can come back. Each rebuild logs a
+warning and counts in `vals_manifest_rebuilds_total`; stores with an intact
+manifest are unaffected. On a replicated zone, prefer replacing the node so its
+replicas are copied from healthy peers. Unset the variable once the node is
+back: while it is set, a later manifest loss rebuilds instead of stopping the
+store. See
+[formats.md §2.4](formats.md#24-run-manifest-vman--vals-store).
+
 ## Test, benchmark and build-only inputs
 
 These do not configure `valsd`. Their defaults live in the harness or build

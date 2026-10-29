@@ -606,12 +606,50 @@ selection** for the decoupled vlog reclaim (task 0069; a run predating `v4` deco
 for it until the run is next rewritten). The engine writes `v4` on every fresh
 manifest.
 
-Recovery loads the newest complete chain whose payload decodes. A CRC-valid payload
-with an unknown `VMAN` version, or a CRC-valid chain head (`seg_index = 0`) with an
-unknown chain-header version and a generation at least that of every loadable
-chain, fails `Engine::open` (`SnapshotError::Unsupported`) rather than falling back
-to an older generation or to "no manifest" (0450). CRC-invalid or incomplete chains
-still fall back.
+The manifest is stored as a chain of whole segments, each starting with a 46-byte
+chain header: `magic("VMNC") | version(2) | generation(8) | seg_index(4) |
+seg_count(4) | total_len(8) | next_seg(8) | chunk_len(4) | crc32c(4)` (the CRC
+covers the header only; the payload carries its own). A write puts the non-head
+segments and the head segment's payload on the device with the head's header
+still zero, flushes, then writes the head's first block again with its header
+and flushes (0529). A CRC-valid head header therefore proves the whole chain was
+durable before it, so a crash during the write leaves the previous generation as
+the newest valid head, never a valid head over a missing payload. After the
+commit, the first block of every previous-generation segment is zeroed without a flush. An
+`Engine::open` that still finds an older head in a free segment, left by a crash
+between the commit and the next flush, keeps that segment allocated as part of
+the live chain, so the next manifest write zeroes and frees it like the
+previous generation's segments. Opening writes nothing, and no stale generation
+survives a reopen to be picked later.
+
+Recovery loads the newest chain head and nothing else. If that head's chain does
+not load (a missing or mismatched segment) or its payload does not decode (for
+example a CRC mismatch), `Engine::open` fails with `SnapshotError::ManifestLost`
+instead of falling back to an older generation, whose runs' segments may since
+have been freed and reused, or to "no manifest", which would drop every run,
+free their segments and lose any value only a run still referenced (0529). It
+also fails that way when no head is valid but value-log rewrite segments
+(`SEG_FLAG_NOT_TAIL`) exist, because only a manifest's runs reference those.
+Rebuilding from the value log anyway takes an explicit operator action:
+`VALS_STORE_REBUILD_LOST_MANIFEST=1` in the environment of the opening process
+(or `Engine::open_rebuilding_lost_manifest`) replays every value-log segment,
+rewrite segments included, logs a warning and counts the rebuild in
+`vals_manifest_rebuilds_total`. Deletes and data held only by runs are lost, and
+deleted keys can come back. The rebuilt store's next manifest takes the lost
+generation plus one, and until it is written every open fails the same way
+again. With the same variable set, `valsd dump` proceeds without the runs' range
+tombstones instead of failing. A live dump retries a lost-manifest load four
+times, 20 ms apart, because a manifest write running at the same time can free
+and reuse the chain the dump just found. A head written by a release before 0529 could
+still be torn by a crash into a valid header over a missing payload; such a
+store needs the same explicit rebuild.
+
+A CRC-valid payload with an unknown `VMAN` version, or a CRC-valid chain head
+(`seg_index = 0`) with an unknown chain-header version and a generation at least
+that of the newest valid head, fails `Engine::open` (`SnapshotError::Unsupported`)
+rather than falling back (0450); the rebuild variable does not override it.
+Incomplete chains whose head was never written (non-head segments of a
+generation with no head) are ignored.
 
 ---
 
