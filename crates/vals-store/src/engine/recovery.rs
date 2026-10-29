@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) const RECOVERY_EPOCH_GAP: u64 = 1 << 32;
+
 struct EngineState<D: BlockDevice> {
     runs: Vec<OpenRun<D>>,
     manifest_gen: u64,
@@ -36,6 +38,7 @@ impl<D: BlockDevice> Engine<D> {
             live_manifest: state.live_manifest,
             last_flush_epoch: state.last_flush_epoch,
             last_flush_seq: state.last_flush_seq,
+            tail_epoch_gap: (0, 0),
             mutable_tombstones: None,
             gc_fold_cursor: 0,
             flush_in_flight: false,
@@ -325,8 +328,12 @@ impl<D: BlockDevice> Engine<D> {
             (a, b) => a.or(b),
         };
         let next_seq = max_seq.map_or(0, |m| m + 1);
-        let next_epoch = resume_next_epoch(max_epoch_all, min_replay_epoch);
+        let next_epoch = resume_next_epoch(max_epoch_all, min_replay_epoch).saturating_add(RECOVERY_EPOCH_GAP);
+        let flushed_epoch = min_replay_epoch.unwrap_or(0);
+        let tail_count = log_segs.iter().filter(|(_, ep, not_tail)| !*not_tail && *ep > flushed_epoch).count() as u64;
+        let tail_epoch_gap = next_epoch.saturating_sub(1).saturating_sub(flushed_epoch).saturating_sub(tail_count);
         let mut log = ValueLog::new(block_size, cfg.seg_blocks, next_seq, next_epoch);
+        log.require_epoch_fence();
         {
             let watermark = min_replay_epoch.unwrap_or(0);
             log.seed_tail_segs(
@@ -354,6 +361,7 @@ impl<D: BlockDevice> Engine<D> {
             },
         );
         engine.mutable_tombstones = mutable_tombstones;
+        engine.tail_epoch_gap = (flushed_epoch, tail_epoch_gap);
         engine.refresh_data_reserve();
         engine.build_range_tombstone_max_trees();
         if winner_directory_requested() {
@@ -449,12 +457,14 @@ impl<D: BlockDevice> Engine<D> {
         if let Some(directory) = self.winner_directory.as_mut() {
             directory.clear();
         }
-        self.log = ValueLog::new(
+        let mut fresh_log = ValueLog::new(
             self.block_size,
             self.alloc.blocks_per_segment(),
             self.log.next_seq(),
             self.log.next_epoch(),
         );
+        fresh_log.carry_epoch_fence(&self.log);
+        self.log = fresh_log;
         self.manifest_gen += 1;
         self.bump_storage_generation();
         self.bump_mutable_generation();

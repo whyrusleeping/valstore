@@ -1479,6 +1479,7 @@ use super::*;
 
 mod attribution;
 mod basic;
+mod crash_points;
 mod flush;
 mod frozen_garbage;
 mod dealloc;

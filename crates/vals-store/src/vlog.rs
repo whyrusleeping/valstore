@@ -849,6 +849,7 @@ pub struct ValueLog {
     cur_epoch: u64,
     inflight: RefCell<Vec<WriteHandle>>,
     tail_segs: Vec<(u64, SegmentId)>,
+    epoch_fence_pending: bool,
 }
 
 impl ValueLog {
@@ -873,7 +874,16 @@ impl ValueLog {
             cur_epoch: 0,
             inflight: RefCell::new(Vec::new()),
             tail_segs: Vec::new(),
+            epoch_fence_pending: false,
         }
+    }
+
+    pub fn require_epoch_fence(&mut self) {
+        self.epoch_fence_pending = true;
+    }
+
+    pub fn carry_epoch_fence(&mut self, from: &ValueLog) {
+        self.epoch_fence_pending |= from.epoch_fence_pending;
     }
 
     fn reap(&self) -> Result<(), LogError> {
@@ -1281,6 +1291,11 @@ impl ValueLog {
         self.tail_segs.push((epoch, seg));
         let hdr = encode_seg_header(epoch, self.block_size as u32);
         self.append_bytes(dev, &hdr)?;
+        if self.epoch_fence_pending {
+            self.flush_tail(dev)?;
+            dev.flush()?;
+            self.epoch_fence_pending = false;
+        }
         Ok(())
     }
 

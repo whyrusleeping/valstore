@@ -2,10 +2,12 @@ use super::*;
 
 impl<D: BlockDevice> Engine<D> {
     pub fn tail_epochs(&self) -> u64 {
+        let (gap_above, gap) = self.tail_epoch_gap;
         self.log
             .next_epoch()
             .saturating_sub(1)
             .saturating_sub(self.last_flush_epoch)
+            .saturating_sub(if self.last_flush_epoch == gap_above { gap } else { 0 })
     }
 
     pub fn next_log_seq(&self) -> u64 {

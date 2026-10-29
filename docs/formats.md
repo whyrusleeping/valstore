@@ -447,6 +447,29 @@ accepts a record only when its epoch equals the segment header's, so that stale
 chain can never be walked into — even when the new data ends exactly at a block
 boundary and a prior-generation record starts right there.
 
+That binding holds only while no segment is opened twice under the same epoch.
+A crash can lose the header block of a segment opened since the last device
+flush and keep later blocks of the same segment, so recovery does not see the
+newest epochs. Before 0532 the new log reused those epochs, and the next open
+after a crash could replay unsynced records that the first open had not seen.
+Recovery now does two things (0532):
+
+- `Engine::open` resumes 2^32 epochs past the highest epoch it finds (in a
+  segment header or the manifest's `covered_epoch`). No store opens 2^32
+  segments between two device flushes, so this skips every epoch the crash may
+  have hidden.
+- The first log segment the recovered store opens (including through
+  value-log GC or `truncate`) has its header block written and the device
+  flushed before any record goes into it. `Engine::open` itself never writes.
+  The next recovery therefore sees that epoch and skips past it, even if a
+  second crash hides every later header.
+
+The skipped epochs do not count toward `Engine::tail_epochs`, the count of
+unflushed log segments that the node's `flush_tail_epochs` setting is compared
+with. Two cases remain open (0540): a format restarts epochs at 0, so a reused
+device can hold records of a reused epoch, and value-rewrite epochs that a
+merge reserves before the recovered store's first log segment are not fenced.
+
 ### 2.2 Segment header
 
 Each segment begins with a 22-byte header, then packed records, then zero padding

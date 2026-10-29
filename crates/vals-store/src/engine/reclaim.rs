@@ -230,6 +230,7 @@ impl<D: BlockDevice> Engine<D> {
             self.log.next_seq(),
             self.log.next_epoch(),
         );
+        newlog.carry_epoch_fence(&self.log);
 
         let (mut stats, updates, gc_dropped) =
             match self.copy_live_records(&mut newlog, &old_used, drop_live) {
@@ -618,6 +619,7 @@ impl<D: BlockDevice> Engine<D> {
             newlog.next_seq(),
             newlog.next_epoch(),
         );
+        self.log.carry_epoch_fence(&newlog);
         self.log.seed_tail_segs(carried_tail);
 
         if wiped {
