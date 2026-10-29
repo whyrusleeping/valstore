@@ -919,6 +919,69 @@
     }
 
     #[test]
+    fn ae_fills_a_co_owner_with_values_older_than_the_gc_grace() {
+        let ring = Ring::from_members(2, 64, [1, 2]);
+        let now = physical_now_ms();
+        let grace = 60_000u64;
+        let recent = now - 1_000;
+
+        let mut s1 = store(1);
+        for i in 0..10u32 {
+            s1.apply(format!("k{i}").as_bytes(), Some(b"v"), ver(recent, 1)).unwrap();
+        }
+        let mut s2 = store(2);
+        s2.apply(b"aged", Some(b"a"), ver(now - 600_000, 2)).unwrap();
+        s2.apply(b"young", Some(b"y"), ver(recent, 2)).unwrap();
+
+        let (l1, a1) = Node::bind().unwrap();
+        let (l2, a2) = Node::bind().unwrap();
+        let peers = vec![(1, a1), (2, a2)];
+        let interval = Duration::from_millis(25);
+        let mut nodes = Vec::new();
+        for (n, l, s) in [(1, l1, s1), (2, l2, s2)] {
+            let log = MemLivenessLog::new();
+            log.store(recent).unwrap();
+            nodes.push(crate::testutil::running(Node::serve_with_liveness(
+                n,
+                l,
+                s,
+                ring.clone(),
+                peers.clone(),
+                interval,
+                grace,
+                log,
+            )));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while read_from(a1, b"young").is_none() || read_from(a2, b"k9").is_none() {
+            assert!(Instant::now() < deadline, "anti-entropy did not run");
+            thread::sleep(Duration::from_millis(20));
+        }
+        while read_from(a1, b"aged").is_none() {
+            assert!(Instant::now() < deadline, "the co-owner never received the value older than the grace");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(read_from(a1, b"aged").as_deref(), Some(&b"a"[..]));
+        let client_write = rpc(
+            a1,
+            &Request::Apply {
+                epoch: 0,
+                zone_id: DEFAULT_ZONE,
+                key: b"late",
+                value: Some(b"l"),
+                version: ver(now - 600_000, 9),
+            },
+        );
+        assert_eq!(
+            client_write,
+            Response::Apply(crate::replica::Applied::Rejected),
+            "a write older than the grace is still refused"
+        );
+        drop(nodes);
+    }
+
+    #[test]
     fn liveness_born_fenced_node_holds_fence_until_membership_push_then_wipes() {
         let now = physical_now_ms();
         let grace = 60_000u64;

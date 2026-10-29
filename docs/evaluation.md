@@ -109,8 +109,8 @@ failure before treating it as a regression.
   faulty, so a software cause has not been ruled out. If you see such an
   abort on ECC hardware, please report it.
 - **Backup and restore at scale.** It was qualified once, with tombstone GC
-  off and 4.85 million records. With `gc_grace > 0`, restore has the limit
-  described under [Known limitations](#known-limitations).
+  off and 4.85 million records. With `gc_grace > 0` on the target, restore
+  is covered by a local test only.
 - **Upgrades.** No upgrade from one revision to a later one has been
   exercised as a release procedure.
 - **Security.** There is no authentication or encryption of data traffic;
@@ -167,11 +167,13 @@ cover the design-level ones.
   benchmark). After a burst of writes, anti-entropy catch-up can stall reads
   for about 1.2 s every sweep for seconds to minutes
   ([`benchmarks.md`](benchmarks.md)).
-- **Tombstone GC (`gc_grace > 0`).** Every node refuses a put older than its
-  newest data minus the grace. Values older than that therefore never reach a
-  new replica: not by anti-entropy after `add-node`, not by a range re-home,
-  and not by `backup load`. Keep `gc_grace = 0s` if you will grow the cluster
-  or restore backups of old data. With GC on, keep clocks synchronized: a
+- **Tombstone GC (`gc_grace > 0`).** Every node refuses a client write or
+  cleanup handoff older than its newest data minus the grace. Anti-entropy
+  between owners, range re-homes and `backup load` still copy older values,
+  but a membership change that gives a key only new owners (for example at
+  RF 1) leaves its older values on the former owner, and the PD then refuses
+  further membership changes until that is resolved. With GC on, keep
+  clocks synchronized: a
   rejoining node whose peers report watermarks more than `gc_grace` ahead of
   its own discards its data and resyncs from them, and a peer clock running
   ahead can trigger that.

@@ -1083,6 +1083,14 @@ they are load-bearing and worth recording. Full rationale is in `ARCHITECTURE.md
   forgotten it yet, an aborted re-home target, a sloppy fallback) may hold a put whose newer
   tombstone every owner has collected. The owners' admission floor refuses that put on every
   path that writes it to them (cleanup handoff, read repair). AE does not pull it at all.
+  **Copies from owners** (0517) skip the floor: AE pulls from the peer shard that owns the key
+  under the committed placement (pulls from a pending re-home target or another shard keep the
+  floor), re-home
+  copies from the current owner and `valsd backup load` (`BatchApply` flag bit 1, `fill`)
+  apply with `LiveFloor::Waive`, so a put older than the grace still reaches a new replica. That rests on
+  the liveness invariant: an owner received every delete within the grace, so an old put it
+  still holds has no newer collected tombstone. A re-home copy counts only `Won` and `Lost` as
+  copied; a refused entry keeps the range from completing.
   `valsd backup create` reads every replica directly, so its merge applies the floor itself.
   A put held only by non-owners (or only by a pending re-home target) is merged only if its
   physical time is at or above the `GcFloor` of every owner shard, read after that owner's stream

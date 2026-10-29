@@ -1229,6 +1229,7 @@
                     epoch: 0,
                     zone_id: DEFAULT_ZONE,
                     sync: false,
+                    fill: false,
                     writes: vec![
                         (b"b".to_vec(), Some(b"v".to_vec()), v(101, 1)),
                         (b"z".to_vec(), Some(b"v".to_vec()), v(102, 1)),
@@ -1431,6 +1432,7 @@
                 epoch: 0,
                 zone_id: DEFAULT_ZONE,
                 sync: false,
+                fill: false,
                 writes: &[(b"cold", Some(b"batch-stale"), v(0, 3))],
             },
         );
@@ -1479,6 +1481,7 @@
                 epoch: 0,
                 zone_id: DEFAULT_ZONE,
                 sync: false,
+                fill: false,
                 writes: &[(b"batch-cold", Some(b"stale"), v(0, 9))],
             },
         );
@@ -2147,6 +2150,7 @@
                 &writes,
                 false,
                 ApplyMode::Legacy,
+                LiveFloor::Enforce,
                 None,
             ),
             crate::reactor::poll_io,
@@ -2220,6 +2224,7 @@
                         &writes,
                         true,
                         ApplyMode::Blind,
+                        LiveFloor::Enforce,
                         None,
                     )
                     .await,
@@ -2344,6 +2349,7 @@
                 version,
                 0,
                 ApplyMode::Blind,
+                LiveFloor::Enforce,
             )
             .unwrap();
         let StagedApply::Done(applied) = staged else {
@@ -2576,6 +2582,7 @@
             epoch: 1,
             zone_id: 7,
             sync: false,
+            fill: false,
             writes: vec![
                 (b"aa-new".to_vec(), Some(b"owner".to_vec()), v(32, 1)),
                 (boundary, Some(b"former".to_vec()), v(33, 1)),
@@ -3620,6 +3627,7 @@
             epoch: 0,
             zone_id: DEFAULT_ZONE,
             sync: false,
+            fill: false,
             writes: vec![(b"ram-batch".to_vec(), Some(b"v".to_vec()), v(101, 1))],
         };
         assert!(matches!(serve_request(&shared, batch), Response::Busy));

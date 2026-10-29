@@ -1,11 +1,12 @@
 ---
 id: "0518"
 title: A stale former-owner copy resurrects when a membership change makes its holder an owner again
-status: proposed
+status: todo
 priority: 2
 created: "2026-10-28"
-updated: "2026-10-28"
-depends_on: []
+updated: "2026-10-29"
+depends_on:
+    - "0517"
 spec_refs: []
 ---
 
@@ -32,3 +33,6 @@ Acceptance: a deterministic regression in which a former owner holding a stale p
 ## Acceptance criteria
 
 ## Work log
+
+- 2026-10-29: owner accepted (backlog triage), after 0517: 0517 decides which copies to refuse and this task decides which to trust, so the two share one design.
+- 2026-10-29 (from 0517): the floor is now waived (`LiveFloor::Waive`) for AE pulls from the peer shard that owns the key under the committed placement, for re-home copies from the current owner and for `backup load` (`BatchApply` `fill` flag); pulls from a pending re-home target or a sibling shard, client writes, read repair, hint replay and cleanup handoffs keep it. Consequences for this task: (1) a stale copy on a node that becomes an owner again (or one admitted by an owner whose floor is still 0) now also spreads to its co-owners by AE, not only through that node's reads; (2) a cleanup handoff of a disjoint move (RF 1, or two quick membership changes) still refuses values older than the grace, so they stay on the former owner and the PD gate refuses the next change — the trust rule for handoffs from a recent former owner belongs here too.

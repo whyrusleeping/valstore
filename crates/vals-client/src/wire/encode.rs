@@ -346,12 +346,13 @@ pub fn encode_request_payload(req: &Request) -> Vec<u8> {
             epoch,
             zone_id,
             sync,
+            fill,
             writes,
         } => {
             b.push(OP_BATCH_APPLY);
             put_u64(&mut b, epoch);
             put_u32(&mut b, zone_id);
-            b.push(sync as u8);
+            b.push(sync as u8 | (fill as u8) << 1);
             put_list(&mut b, writes, |b, &(key, value, version)| {
                 put_version(b, version);
                 put_bytes(b, key);

@@ -67,6 +67,7 @@
             epoch: 11,
             zone_id: DEFAULT_ZONE,
             sync: true,
+            fill: false,
             writes: &writes,
         });
         assert_eq!(
@@ -1129,6 +1130,7 @@
             epoch: 5,
             zone_id: DEFAULT_ZONE,
             sync: true,
+            fill: false,
             writes,
         });
         assert_eq!(
@@ -1137,6 +1139,7 @@
                 epoch: 5,
                 zone_id: DEFAULT_ZONE,
                 sync: true,
+                fill: false,
                 writes: vec![
                     (b"k1".to_vec(), Some(b"v1".to_vec()), v(10, 1)),
                     (b"k2".to_vec(), Some(Vec::new()), v(11, 1)),
@@ -1144,15 +1147,19 @@
                 ],
             }
         );
-        let nosync = encode_request(&Request::BatchApply {
-            epoch: 0,
-            zone_id: DEFAULT_ZONE,
-            sync: false,
-            writes: &[(b"k", Some(&b"v"[..]), v(1, 1))],
-        });
-        match decode_request(payload(&nosync)).unwrap() {
-            OwnedRequest::BatchApply { sync, .. } => assert!(!sync),
-            _ => panic!("expected batch apply"),
+        for (sync, fill, flags) in [(false, false, 0u8), (true, false, 1), (false, true, 2), (true, true, 3)] {
+            let frame = encode_request(&Request::BatchApply {
+                epoch: 0,
+                zone_id: DEFAULT_ZONE,
+                sync,
+                fill,
+                writes: &[(b"k", Some(&b"v"[..]), v(1, 1))],
+            });
+            assert_eq!(payload(&frame)[13], flags);
+            match decode_request(payload(&frame)).unwrap() {
+                OwnedRequest::BatchApply { sync: s, fill: f, .. } => assert_eq!((s, f), (sync, fill)),
+                _ => panic!("expected batch apply"),
+            }
         }
     }
 

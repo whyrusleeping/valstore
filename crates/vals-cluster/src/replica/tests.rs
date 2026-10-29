@@ -1623,6 +1623,7 @@
                 v(10, 1),
                 0,
                 ApplyMode::Blind,
+                LiveFloor::Enforce,
             )
             .unwrap(),
             Applied::Won
@@ -1653,13 +1654,13 @@
         let mut legacy = build();
         assert_eq!(
             blind
-                .apply_unconditional_at(b"k", Some(b"stale"), v(10, 1), 0, ApplyMode::Blind)
+                .apply_unconditional_at(b"k", Some(b"stale"), v(10, 1), 0, ApplyMode::Blind, LiveFloor::Enforce)
                 .unwrap(),
             Applied::Won
         );
         assert_eq!(
             legacy
-                .apply_unconditional_at(b"k", Some(b"stale"), v(10, 1), 0, ApplyMode::Legacy)
+                .apply_unconditional_at(b"k", Some(b"stale"), v(10, 1), 0, ApplyMode::Legacy, LiveFloor::Enforce)
                 .unwrap(),
             Applied::Lost(v(20, 1))
         );
@@ -1667,13 +1668,13 @@
 
         assert_eq!(
             blind
-                .apply_unconditional_at(b"k", None, v(30, 1), 0, ApplyMode::Blind)
+                .apply_unconditional_at(b"k", None, v(30, 1), 0, ApplyMode::Blind, LiveFloor::Enforce)
                 .unwrap(),
             Applied::Won
         );
         assert_eq!(
             legacy
-                .apply_unconditional_at(b"k", None, v(30, 1), 0, ApplyMode::Legacy)
+                .apply_unconditional_at(b"k", None, v(30, 1), 0, ApplyMode::Legacy, LiveFloor::Enforce)
                 .unwrap(),
             Applied::Won
         );

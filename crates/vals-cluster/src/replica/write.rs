@@ -72,15 +72,36 @@ impl<D: BlockDevice> VersionedStore<D> {
         version: Version,
         wall_ms: u64,
     ) -> Result<Applied, EngineError> {
+        self.apply_at_with(key, value, version, wall_ms, LiveFloor::Enforce)
+    }
+
+    fn below_live_floor(
+        &self,
+        value: Option<&[u8]>,
+        version: Version,
+        wall_ms: u64,
+        floor: LiveFloor,
+    ) -> bool {
+        self.advance_live_admission_cutoff(wall_ms);
+        floor == LiveFloor::Enforce
+            && self.gc_grace_ms != 0
+            && value.is_some()
+            && version.physical_ms() < self.live_admission_cutoff_ms.get()
+    }
+
+    pub(crate) fn apply_at_with(
+        &mut self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        version: Version,
+        wall_ms: u64,
+        floor: LiveFloor,
+    ) -> Result<Applied, EngineError> {
         let skew = self.hlc.max_skew_ms();
         if skew != 0 && version.physical_ms() > wall_ms.saturating_add(skew) {
             return Ok(Applied::Rejected);
         }
-        self.advance_live_admission_cutoff(wall_ms);
-        if self.gc_grace_ms != 0
-            && value.is_some()
-            && version.physical_ms() < self.live_admission_cutoff_ms.get()
-        {
+        if self.below_live_floor(value, version, wall_ms, floor) {
             return Ok(Applied::Rejected);
         }
         self.note_version(version);
@@ -127,10 +148,11 @@ impl<D: BlockDevice> VersionedStore<D> {
         version: Version,
         wall_ms: u64,
         mode: ApplyMode,
+        floor: LiveFloor,
     ) -> Result<Applied, EngineError> {
         match mode {
-            ApplyMode::Legacy => self.apply_at(key, value, version, wall_ms),
-            ApplyMode::Blind => self.apply_blind_at(key, value, version, wall_ms),
+            ApplyMode::Legacy => self.apply_at_with(key, value, version, wall_ms, floor),
+            ApplyMode::Blind => self.apply_blind_with(key, value, version, wall_ms, floor),
         }
     }
 
@@ -141,16 +163,23 @@ impl<D: BlockDevice> VersionedStore<D> {
         version: Version,
         wall_ms: u64,
     ) -> Result<Applied, EngineError> {
+        self.apply_blind_with(key, value, version, wall_ms, LiveFloor::Enforce)
+    }
+
+    pub(crate) fn apply_blind_with(
+        &mut self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        version: Version,
+        wall_ms: u64,
+        floor: LiveFloor,
+    ) -> Result<Applied, EngineError> {
         let skew = self.hlc.max_skew_ms();
         if skew != 0 && version.physical_ms() > wall_ms.saturating_add(skew) {
             crate::observe::counters().blind_rejected_skew.inc();
             return Ok(Applied::Rejected);
         }
-        self.advance_live_admission_cutoff(wall_ms);
-        if self.gc_grace_ms != 0
-            && value.is_some()
-            && version.physical_ms() < self.live_admission_cutoff_ms.get()
-        {
+        if self.below_live_floor(value, version, wall_ms, floor) {
             crate::observe::counters().blind_rejected_gc_floor.inc();
             return Ok(Applied::Rejected);
         }
@@ -244,15 +273,25 @@ impl<D: BlockDevice> VersionedStore<D> {
     where
         D: AsyncRead,
     {
+        self.apply_stage_with(key, value, version, wall_ms, LiveFloor::Enforce)
+    }
+
+    pub(crate) fn apply_stage_with(
+        &mut self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        version: Version,
+        wall_ms: u64,
+        floor: LiveFloor,
+    ) -> Result<StagedApply, EngineError>
+    where
+        D: AsyncRead,
+    {
         let skew = self.hlc.max_skew_ms();
         if skew != 0 && version.physical_ms() > wall_ms.saturating_add(skew) {
             return Ok(StagedApply::Done(Applied::Rejected));
         }
-        self.advance_live_admission_cutoff(wall_ms);
-        if self.gc_grace_ms != 0
-            && value.is_some()
-            && version.physical_ms() < self.live_admission_cutoff_ms.get()
-        {
+        if self.below_live_floor(value, version, wall_ms, floor) {
             return Ok(StagedApply::Done(Applied::Rejected));
         }
         self.note_version(version);
@@ -284,14 +323,15 @@ impl<D: BlockDevice> VersionedStore<D> {
         version: Version,
         wall_ms: u64,
         mode: ApplyMode,
+        floor: LiveFloor,
     ) -> Result<StagedApply, EngineError>
     where
         D: AsyncRead,
     {
         match mode {
-            ApplyMode::Legacy => self.apply_stage(key, value, version, wall_ms),
+            ApplyMode::Legacy => self.apply_stage_with(key, value, version, wall_ms, floor),
             ApplyMode::Blind => self
-                .apply_blind_at(key, value, version, wall_ms)
+                .apply_blind_with(key, value, version, wall_ms, floor)
                 .map(StagedApply::Done),
         }
     }

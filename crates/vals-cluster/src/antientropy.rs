@@ -186,7 +186,7 @@ pub async fn reconcile<D: BlockDevice + AsyncRead, P: AePeer>(
         None,
         None,
         None,
-        |_| true,
+        |_| Some(crate::replica::LiveFloor::Waive),
     )
     .await
     .map(|(applied, _)| applied)
@@ -211,6 +211,7 @@ pub async fn reconcile_scoped<D: BlockDevice + AsyncRead, P: AePeer>(
         local_node,
         counterpart,
         shard,
+        (0, 1),
         resume,
         None,
     )
@@ -226,6 +227,7 @@ pub(crate) async fn reconcile_scoped_gate<D: BlockDevice + AsyncRead, P: AePeer>
     local_node: NodeId,
     counterpart: NodeId,
     shard: (usize, usize),
+    peer_shard: (usize, usize),
     resume: Option<&[u8]>,
     gate: Option<&ReadGate>,
 ) -> Result<(usize, Option<Vec<u8>>), TransportError> {
@@ -245,15 +247,15 @@ pub(crate) async fn reconcile_scoped_gate<D: BlockDevice + AsyncRead, P: AePeer>
         |key| {
             let owners = ring.replicas(key);
             if !owners.contains(&local_node) || !owners.contains(&counterpart) {
-                return false;
+                return None;
             }
             if shard_count > 1 {
                 let s = (crate::ring::hash64(key) % shard_count as u64) as usize;
                 if s != shard_index {
-                    return false;
+                    return None;
                 }
             }
-            true
+            Some(owner_floor(true, key, peer_shard))
         },
     )
     .await
@@ -286,6 +288,7 @@ pub async fn reconcile_scoped_zone<D: BlockDevice + AsyncRead, P: AePeer>(
         scope,
         range_map,
         shard,
+        (0, 1),
         resume,
         None,
     )
@@ -305,6 +308,7 @@ pub(crate) async fn reconcile_scoped_zone_gate<D: BlockDevice + AsyncRead, P: Ae
     scope: Option<&BTreeSet<NodeId>>,
     range_map: Option<&RangeMap>,
     shard: (usize, usize),
+    peer_shard: (usize, usize),
     resume: Option<&[u8]>,
     gate: Option<&ReadGate>,
 ) -> Result<(usize, Option<Vec<u8>>), TransportError> {
@@ -326,14 +330,18 @@ pub(crate) async fn reconcile_scoped_zone_gate<D: BlockDevice + AsyncRead, P: Ae
                 Some(m) => m.range_token(key),
                 None => key,
             };
+            let committed = match range_map {
+                Some(m) => m.replicas_of_range(ring, zone_id, m.range_index(key), rf, scope),
+                None => ring.replicas_in_zone(zone_id, place, rf, scope),
+            };
             let owners = match range_map {
                 Some(m) => m.replicas_for_key_while_rehoming(
                     ring, zone_id, key, rf, scope
                 ),
-                None => ring.replicas_in_zone(zone_id, place, rf, scope),
+                None => committed.clone(),
             };
             if !owners.contains(&local_node) || !owners.contains(&counterpart) {
-                return false;
+                return None;
             }
             if shard_count > 1 {
                 let current = (crate::ring::hash64(place) % shard_count as u64) as usize;
@@ -341,13 +349,22 @@ pub(crate) async fn reconcile_scoped_zone_gate<D: BlockDevice + AsyncRead, P: Ae
                     .and_then(|m| m.pending_for_key(key))
                     .map(|token| (crate::ring::hash64(token) % shard_count as u64) as usize);
                 if current != shard_index && pending != Some(shard_index) {
-                    return false;
+                    return None;
                 }
             }
-            true
+            Some(owner_floor(committed.contains(&counterpart), place, peer_shard))
         },
     )
     .await
+}
+
+fn owner_floor(committed_owner: bool, place: &[u8], (peer_index, peer_count): (usize, usize)) -> crate::replica::LiveFloor {
+    let peer_count = peer_count.max(1);
+    if committed_owner && (crate::ring::hash64(place) % peer_count as u64) as usize == peer_index {
+        crate::replica::LiveFloor::Waive
+    } else {
+        crate::replica::LiveFloor::Enforce
+    }
 }
 
 #[cfg(test)]
@@ -410,6 +427,7 @@ async fn local_apply<D: BlockDevice + AsyncRead>(
     value: Option<&[u8]>,
     version: Version,
     gate: Option<&ReadGate>,
+    floor: crate::replica::LiveFloor,
 ) -> Result<Applied, TransportError> {
     local_apply_mode(
         local,
@@ -418,6 +436,7 @@ async fn local_apply<D: BlockDevice + AsyncRead>(
         version,
         gate,
         crate::replica::unconditional_apply_mode(),
+        floor,
     )
     .await
 }
@@ -429,12 +448,13 @@ async fn local_apply_mode<D: BlockDevice + AsyncRead>(
     version: Version,
     gate: Option<&ReadGate>,
     mode: crate::replica::ApplyMode,
+    floor: crate::replica::LiveFloor,
 ) -> Result<Applied, TransportError> {
     let wall_ms = crate::hlc::physical_now_ms();
     if mode == crate::replica::ApplyMode::Blind {
         return local
             .borrow_mut()
-            .apply_unconditional_at(key, value, version, wall_ms, mode)
+            .apply_unconditional_at(key, value, version, wall_ms, mode, floor)
             .map_err(|e| TransportError::Engine(e.to_string()));
     }
     for _ in 0..8 {
@@ -444,7 +464,7 @@ async fn local_apply_mode<D: BlockDevice + AsyncRead>(
         };
         let staged = local
             .borrow_mut()
-            .apply_unconditional_stage(key, value, version, wall_ms, mode)
+            .apply_unconditional_stage(key, value, version, wall_ms, mode, floor)
             .map_err(|e| TransportError::Engine(e.to_string()))?;
         let (probe, gen) = match staged {
             crate::replica::StagedApply::Done(applied) => return Ok(applied),
@@ -492,7 +512,7 @@ async fn reconcile_with<D: BlockDevice + AsyncRead, P: AePeer>(
     local_node: Option<NodeId>,
     counterpart: Option<NodeId>,
     gate: Option<&ReadGate>,
-    keep: impl Fn(&[u8]) -> bool,
+    keep: impl Fn(&[u8]) -> Option<crate::replica::LiveFloor>,
 ) -> Result<(usize, Option<Vec<u8>>), TransportError> {
     let counters = crate::observe::counters();
 
@@ -560,7 +580,7 @@ async fn reconcile_with<D: BlockDevice + AsyncRead, P: AePeer>(
 
         let mut need: Vec<Vec<u8>> = Vec::new();
         for (key, peer_version) in digests {
-            if !keep(&key) {
+            if keep(&key).is_none() {
                 continue;
             }
             let behind = match local_version(local, &key, gate).await? {
@@ -588,15 +608,16 @@ async fn reconcile_with<D: BlockDevice + AsyncRead, P: AePeer>(
                 req.last().cloned()
             };
             for (key, stored) in entries {
-                if !keep(&key) {
+                let Some(floor) = keep(&key) else {
                     continue;
-                }
+                };
                 let acknowledged = local_apply(
                     local,
                     &key,
                     stored.value.as_deref(),
                     stored.version,
                     gate,
+                    floor,
                 )
                 .await?;
                 if apply_is_acknowledged(acknowledged) {
@@ -1423,6 +1444,7 @@ mod tests {
             v(10, 2),
             None,
             crate::replica::ApplyMode::Blind,
+            crate::replica::LiveFloor::Waive,
         ))
         .unwrap();
         let legacy_ack = run(local_apply_mode(
@@ -1432,6 +1454,7 @@ mod tests {
             v(10, 2),
             None,
             crate::replica::ApplyMode::Legacy,
+            crate::replica::LiveFloor::Waive,
         ))
         .unwrap();
         assert_eq!(blind_ack, Applied::Won);
@@ -1454,6 +1477,7 @@ mod tests {
             remote.version,
             None,
             crate::replica::ApplyMode::Blind,
+            crate::replica::LiveFloor::Waive,
         ))
         .unwrap();
         assert!(apply_is_acknowledged(accepted));
@@ -2030,6 +2054,68 @@ mod tests {
             saw_mine && saw_sibling,
             "the key set must land on both shard 1 and its sibling"
         );
+    }
+
+    #[test]
+    fn ae_waives_the_gc_floor_only_for_the_peer_shard_that_owns_the_key() {
+        let now = crate::hlc::physical_now_ms();
+        let at = |ms: u64| Version { hlc: ms << crate::hlc::COUNTER_BITS, node: 9 };
+        let zone = 11;
+        let ring = Ring::from_members(2, 64, [1, 2]);
+        let map = RangeMap::from_splits([b"m".to_vec()]);
+        let sorted = |node: u32| {
+            let engine = Engine::create_prewiped(
+                MemBlockDevice::new(512, 4096),
+                Config { seg_blocks: 16, reserved_blocks: 0, ordering: Ordering::Sorted },
+            );
+            let s = VersionedStore::new(engine, node).unwrap().with_gc_grace_ms(60_000);
+            let (ring, map) = (ring.clone(), map.clone());
+            s.set_placement(std::sync::Arc::new(move |key| {
+                map.replicas_for_key_while_rehoming(&ring, zone, key, 2, None)
+            }));
+            s
+        };
+        let (zombie, aged) = (&b"m/zombie"[..], &b"m/aged"[..]);
+        let owning_shard = (hash64(map.range_token(zombie)) % 2) as usize;
+        let mut local = sorted(1);
+        local.apply_at(zombie, Some(b"old"), at(now - 600_000), now).unwrap();
+        local.apply_at(zombie, None, at(now - 500_000), now).unwrap();
+        local.apply_at(b"anchor", Some(b"a"), at(now), now).unwrap();
+        local.advance_durable_gc_watermark(now);
+        local.compact(now).unwrap();
+        assert_eq!(local.get_versioned(zombie).unwrap(), None, "the delete was collected");
+        let mut stale_sibling = sorted(2);
+        stale_sibling.apply_at(zombie, Some(b"old"), at(now - 600_000), now).unwrap();
+        let mut owner_shard = sorted(2);
+        owner_shard.apply_at(aged, Some(b"aged"), at(now - 600_000), now).unwrap();
+        let local = RefCell::new(local);
+        let pull = |peer: &VersionedStore<MemBlockDevice>, peer_index: usize| {
+            run(reconcile_scoped_zone_gate(
+                &local,
+                &LocalPeer(peer),
+                DEFAULT_BUCKETS,
+                &ring,
+                1,
+                2,
+                zone,
+                2,
+                None,
+                Some(&map),
+                (owning_shard, 2),
+                (peer_index, 2),
+                None,
+                None,
+            ))
+            .unwrap()
+        };
+        pull(&stale_sibling, 1 - owning_shard);
+        assert_eq!(
+            local.borrow().get_versioned(zombie).unwrap(),
+            None,
+            "a peer shard that does not own the key is not trusted past the floor"
+        );
+        pull(&owner_shard, owning_shard);
+        assert_eq!(local.borrow().get(aged).unwrap().as_deref(), Some(&b"aged"[..]));
     }
 
     #[test]
@@ -3571,7 +3657,7 @@ mod tests {
             None,
             None,
             None,
-            |_| true,
+            |_| Some(crate::replica::LiveFloor::Waive),
         ))
         .unwrap();
         assert_eq!(applied, 1, "only the one divergent key applied");
@@ -3599,7 +3685,7 @@ mod tests {
             None,
             None,
             None,
-            |_| true,
+            |_| Some(crate::replica::LiveFloor::Waive),
         ))
         .unwrap();
         assert_eq!(applied2, 0);
@@ -3658,7 +3744,7 @@ mod tests {
             None,
             None,
             None,
-            |_| true,
+            |_| Some(crate::replica::LiveFloor::Waive),
         ))
         .unwrap();
         assert_eq!(applied, 1, "only the one divergent key applied");
@@ -3765,7 +3851,7 @@ mod tests {
                 None,
                 None,
                 None,
-                |_| true,
+                |_| Some(crate::replica::LiveFloor::Waive),
             ))
             .unwrap();
             assert!(
@@ -3876,7 +3962,7 @@ mod tests {
                 None,
                 None,
                 None,
-                |_| true,
+                |_| Some(crate::replica::LiveFloor::Waive),
             ))
             .unwrap();
             assert!(peer.calls.get() - calls <= 2, "pass {passes} exceeded its digest page cap");

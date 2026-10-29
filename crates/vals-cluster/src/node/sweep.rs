@@ -916,6 +916,7 @@ pub(super) async fn sweep_loop<D: BlockDevice + AsyncRead + 'static>(
                                 node_id,
                                 *peer_node,
                                 shared.shard(),
+                                (i, peer_shard_count),
                                 resume,
                                 Some(shared.read_gate()),
                             )
@@ -934,6 +935,7 @@ pub(super) async fn sweep_loop<D: BlockDevice + AsyncRead + 'static>(
                                 cfg.scope.as_ref(),
                                 range_map.as_deref(),
                                 shared.shard(),
+                                (i, peer_shard_count),
                                 resume,
                                 Some(shared.read_gate()),
                             )

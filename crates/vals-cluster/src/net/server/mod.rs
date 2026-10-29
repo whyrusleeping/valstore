@@ -131,7 +131,7 @@ use crate::coord::{BatchAck, BatchEntry, Transport};
 use crate::net::NetTransport;
 use crate::partition::RangeMap;
 use crate::reactor::{self, Interest};
-use crate::replica::{unconditional_apply_mode, ApplyMode, StagedApply, VersionedStore};
+use crate::replica::{unconditional_apply_mode, ApplyMode, LiveFloor, StagedApply, VersionedStore};
 use crate::ring::{NodeId, Ring};
 use vals_client::types::{Applied, MixedReadReply, MixedReadRole, Stored};
 use crate::wire::{self, MixedReadResult, OwnedRequest, Response};

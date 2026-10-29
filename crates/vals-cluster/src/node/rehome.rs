@@ -33,7 +33,7 @@ pub(super) async fn rehome_copy_apply<D: BlockDevice + AsyncRead>(
         value,
         version,
         wall_ms,
-        crate::replica::ApplyRetryMode::Standard,
+        crate::replica::ApplyRetryMode::Fill,
         || {
             #[cfg(test)]
             rehome_copy_commit_hook();
@@ -364,7 +364,7 @@ pub(super) async fn rehome_copy_loop<D: BlockDevice + AsyncRead + 'static>(
                                 stored.version,
                             )
                             .await,
-                            Ok(Some(_))
+                            Ok(Some(crate::replica::Applied::Won | crate::replica::Applied::Lost(_)))
                         ) {
                             copied = false;
                             break;

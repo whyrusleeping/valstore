@@ -255,6 +255,7 @@ pub enum Request<'a> {
         epoch: u64,
         zone_id: ZoneId,
         sync: bool,
+        fill: bool,
         writes: &'a [WireWrite<'a>],
     },
     MixedBatchRead {
@@ -370,6 +371,7 @@ pub enum OwnedRequest {
         epoch: u64,
         zone_id: ZoneId,
         sync: bool,
+        fill: bool,
         writes: Vec<OwnedWrite>,
     },
     MixedBatchRead {

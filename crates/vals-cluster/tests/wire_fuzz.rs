@@ -301,6 +301,7 @@ fn gen_owned_request(r: &mut Rng) -> OwnedRequest {
             epoch: r.next_u64(),
             zone_id: r.next_u64() as u32,
             sync: r.bool(),
+            fill: r.bool(),
             writes: {
                 let n = r.below(6) as usize;
                 (0..n)
@@ -626,6 +627,7 @@ fn encode_owned_req(o: &OwnedRequest) -> Vec<u8> {
             epoch,
             zone_id,
             sync,
+            fill,
             writes,
         } => {
             let ww: Vec<WireWrite> = writes
@@ -636,6 +638,7 @@ fn encode_owned_req(o: &OwnedRequest) -> Vec<u8> {
                 epoch: *epoch,
                 zone_id: *zone_id,
                 sync: *sync,
+                fill: *fill,
                 writes: &ww,
             })
         }

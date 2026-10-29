@@ -142,13 +142,18 @@ Not captured:
 
   Inside the cluster, the same floor keeps cleanup handoff and read repair from
   bringing such a copy back, and anti-entropy pulls only keys both peers own.
+  Anti-entropy from the owning shard of a current owner (not from a pending
+  re-home target or another shard), re-home copies and `load` skip the
+  floor, because their sender is a current owner or the backup, so a value
+  older than the grace still reaches a new replica or a restore target.
   Remaining assumptions:
   - Every owner that was an owner when the delete was written received the
     tombstone within `gc_grace`
     ([`../ARCHITECTURE.md`](../ARCHITECTURE.md#deletes-and-tombstones)).
   - An owner that has seen no data progress yet (an empty node that just
     became an owner or a pending re-home target) has floor 0. Until its first
-    write it would accept such a copy from a cleanup handoff.
+    write it would accept such a copy from a cleanup handoff, and anti-entropy
+    would then copy it to the other owners.
   - A re-home to a node that still holds such a copy does not complete. For
     each page, the target checks its own entries in the page's window. A value
     the source lacks, and older than half the grace, holds the copy, so the PD
@@ -157,7 +162,7 @@ Not captured:
     Delete the key on the target, or let the move stay aborted.
   - A membership change (`add-node`, `remove-node`, a weight change) can make
     a node that holds such a copy an owner again, and an owner serves what it
-    holds. The PD therefore refuses the change unless every member that stays
+    holds and anti-entropy copies it to its co-owners. The PD therefore refuses the change unless every member that stays
     answers `CleanupStatus`, has adopted the current membership, and has
     finished an over-replication cleanup lap of every zone, started after the
     check began, that released every copy of a key it does not own. The check
@@ -187,6 +192,9 @@ Not captured:
   stale holder, and a pending then aborted re-home whose target holds the
   stale copy), `pd::cleanup_gate::tests`,
   `net::tests::rehome_copy_holds_while_the_target_keeps_an_old_leftover_the_source_lacks`,
+  `net::tests::rehome_copy_carries_values_older_than_the_gc_grace_to_the_new_owner`,
+  `node::tests::ae_fills_a_co_owner_with_values_older_than_the_gc_grace`,
+  `antientropy::tests::ae_waives_the_gc_floor_only_for_the_peer_shard_that_owns_the_key`,
   and the `valsd` drill
   `a_former_owner_copy_whose_delete_aged_out_is_neither_backed_up_nor_restored`.
   `compare` applies no fence: a non-owner copy on the target shows up as a
@@ -339,12 +347,14 @@ error.
   with another, and checks that `load` and `compare` refuse that group. A
   third test reseeds all three voters identically and checks that the restore
   then succeeds.
-- **Tombstone GC on the target (`gc_grace > 0`) is not qualified.** Such a
-  node refuses a put older than its own newest data minus `gc_grace`, even
-  from `load`. A backup whose data spans more than `gc_grace` may therefore
-  fail to load. The error then blames clock skew, which is misleading. This is
-  open as backlog task 0517, together with the same limit on anti-entropy fill
-  and re-home copies.
+- **Tombstone GC on the target (`gc_grace > 0`) is tested locally only.**
+  `load` marks its batches as restore copies (`BatchApply` flag `fill`), so
+  the target applies a put older than its own newest data minus `gc_grace`
+  instead of refusing it. A local `valsd` test loads such a value into nodes
+  with `gc_grace = 60s`; no hardware run has used GC on the target. A target
+  node from before this change ignores the flag and refuses such a put, and
+  `load` then fails, naming the key, with a message that also offers clock
+  skew as the cause.
 - **Former-owner copies.** A put held only by a node that no longer owns the
   key is fenced as described in the
   [Consistency contract](#consistency-contract). That protection rests on the

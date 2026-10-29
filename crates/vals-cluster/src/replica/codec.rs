@@ -12,6 +12,12 @@ pub(crate) enum ApplyMode {
     Blind,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LiveFloor {
+    Enforce,
+    Waive,
+}
+
 pub fn configure_blind_append(enabled: bool) -> Result<(), bool> {
     match BLIND_APPEND.set(enabled) {
         Ok(()) => Ok(()),

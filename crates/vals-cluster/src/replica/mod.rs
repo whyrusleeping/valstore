@@ -23,7 +23,7 @@ pub enum StagedApplyOutcome {
 }
 
 pub(crate) enum ApplyRetryMode {
-    Standard,
+    Fill,
     Unconditional(ApplyMode),
 }
 
@@ -59,13 +59,13 @@ where
     for _ in 0..MAX_ATTEMPTS {
         let _guard = gate.acquire().await;
         let staged = match mode {
-            ApplyRetryMode::Standard => store
+            ApplyRetryMode::Fill => store
                 .borrow_mut()
-                .apply_stage(key, value, version, wall_ms)
+                .apply_stage_with(key, value, version, wall_ms, LiveFloor::Waive)
                 .map_err(ApplyRetryError::Apply)?,
             ApplyRetryMode::Unconditional(mode) => store
                 .borrow_mut()
-                .apply_unconditional_stage(key, value, version, wall_ms, mode)
+                .apply_unconditional_stage(key, value, version, wall_ms, mode, LiveFloor::Enforce)
                 .map_err(ApplyRetryError::Apply)?,
         };
         let (probe, gen) = match staged {
@@ -74,7 +74,7 @@ where
         };
         let probe_timer = vals_store::attribution::Timer::new(&vals_store::attribution::APPLY_PROBE_WALL, None);
         let run_old = match mode {
-            ApplyRetryMode::Standard => VersionedStore::version_from_probe(probe, dev)
+            ApplyRetryMode::Fill => VersionedStore::version_from_probe(probe, dev)
                 .await
                 .map_err(ApplyRetryError::Probe)?,
             ApplyRetryMode::Unconditional(_) => {
@@ -342,7 +342,7 @@ pub use codec::{
 pub use version_index::LeafDigestError;
 pub(crate) use codec::{
     adopt_blob, decode_read, execute_read_plan_checked, pack_version, unconditional_apply_mode,
-    unpack_version, ApplyMode,
+    unpack_version, ApplyMode, LiveFloor,
 };
 pub use lifecycle::{
     ensure_seeded_cooperative_cell, ensure_tree_ready_cooperative,

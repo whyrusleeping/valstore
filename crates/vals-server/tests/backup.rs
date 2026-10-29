@@ -532,10 +532,14 @@ fn a_former_owner_copy_whose_delete_aged_out_is_neither_backed_up_nor_restored()
     let addr = |node: u32| source.addrs[node as usize - 1];
     let now = now_ms();
     for &owner in &owners {
-        eventually("owner serves the zone", || {
-            let reply = raw_request(addr(owner), &apply_request(sessions, b"anchor", Some(b"a"), at_ms(now)));
+        eventually("owner takes an old value before any newer write", || {
+            let reply = raw_request(addr(owner), &apply_request(sessions, b"zz-aged", Some(b"aged"), at_ms(now - 3_600_000)));
             (reply == Response::Apply(Applied::Won)).then_some(())
         });
+    }
+    for &owner in &owners {
+        let anchored = raw_request(addr(owner), &apply_request(sessions, b"anchor", Some(b"a"), at_ms(now)));
+        assert!(matches!(anchored, Response::Apply(Applied::Won | Applied::Lost(_))), "{anchored:?}");
         let reply = raw_request(addr(owner), &apply_request(sessions, &zombie, None, at_ms(now - 3_000_000)));
         assert_eq!(reply, Response::Apply(Applied::Won), "a delete older than the grace is acknowledged");
         assert_eq!(value_on(addr(owner), sessions, &zombie), None);
@@ -572,12 +576,13 @@ fn a_former_owner_copy_whose_delete_aged_out_is_neither_backed_up_nor_restored()
     let got = read_backup(&bk);
     assert!(!got[&sessions].contains_key(&zombie), "the backup holds the stale copy: {created}");
     assert_eq!(got[&sessions].get(&fresh).map(|(_, v)| v.clone()), Some(Some(b"fresh".to_vec())));
+    assert_eq!(got[&sessions].get(&b"zz-aged"[..]).map(|(_, v)| v.clone()), Some(Some(b"aged".to_vec())));
     source.stop_all();
 
     let target_dir = std::env::temp_dir().join(format!("valsd-former-owner-target-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&target_dir);
     let target_addrs: Vec<SocketAddr> = (0..3).map(|_| free_addr()).collect();
-    write_configs_with(&target_dir, &target_addrs, "sweep = 3600s\n", "zone = sessions 2 unsorted\n");
+    write_configs_with(&target_dir, &target_addrs, "sweep = 3600s\ngc_grace = 60s\n", "zone = sessions 2 unsorted\n");
     let target_conf = target_dir.join("pd.conf");
     ok(&valsd(&["backup", "restore-pd", "-c", target_conf.to_str().unwrap(), bk_arg]), "restore-pd");
     let target = Cluster::launch(target_dir, target_addrs);
@@ -595,6 +600,11 @@ fn a_former_owner_copy_whose_delete_aged_out_is_neither_backed_up_nor_restored()
     });
     assert_eq!(run(coord.read_in(sessions, &zombie)).unwrap().and_then(|s| s.value), None, "deleted stays deleted");
     assert_eq!(run(coord.read_in(sessions, &fresh)).unwrap().and_then(|s| s.value), Some(b"fresh".to_vec()));
+    assert_eq!(
+        run(coord.read_in(sessions, b"zz-aged")).unwrap().and_then(|s| s.value),
+        Some(b"aged".to_vec()),
+        "a value older than the target's tombstone-GC grace is restored"
+    );
     drop(target);
 }
 

@@ -216,6 +216,7 @@ impl<D: BlockDevice + AsyncRead + 'static> ConnDriver<D> {
                     version,
                     wall_ms,
                     mode,
+                    crate::replica::LiveFloor::Enforce,
                 );
                 match staged {
                     Ok(StagedApply::Done(a)) => {
@@ -297,6 +298,7 @@ impl<D: BlockDevice + AsyncRead + 'static> ConnDriver<D> {
             Ok(OwnedRequest::BatchApply {
                 zone_id,
                 sync,
+                fill,
                 writes,
                 ..
             }) => {
@@ -365,6 +367,7 @@ impl<D: BlockDevice + AsyncRead + 'static> ConnDriver<D> {
                         &writes,
                         sync,
                         mode,
+                        if fill { LiveFloor::Waive } else { LiveFloor::Enforce },
                         fenced.as_ref(),
                     )
                     .await;

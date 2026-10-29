@@ -405,7 +405,7 @@ pub fn decode_request(payload: &[u8]) -> Result<OwnedRequest, WireError> {
         OP_BATCH_APPLY => {
             let epoch = r.u64()?;
             let zone_id = r.u32()?;
-            let sync = r.u8()? != 0;
+            let flags = r.u8()?;
             let writes = r.list(|r| {
                 let version = r.version()?;
                 let key = r.bytes()?.to_vec();
@@ -415,7 +415,8 @@ pub fn decode_request(payload: &[u8]) -> Result<OwnedRequest, WireError> {
             Ok(OwnedRequest::BatchApply {
                 epoch,
                 zone_id,
-                sync,
+                sync: flags & !2 != 0,
+                fill: flags & 2 != 0,
                 writes,
             })
         }

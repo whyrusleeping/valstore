@@ -193,7 +193,7 @@ fn a_range_tombstone_landing_during_the_probe_await_wins_at_commit() {
             Some(b"late"),
             v(25),
             WALL,
-            ApplyRetryMode::Standard,
+            ApplyRetryMode::Fill,
             || {
                 store.borrow_mut().apply_range_delete(Some(b"m"), Some(b"n"), v(30), WALL).unwrap();
             },

@@ -461,9 +461,10 @@ pub(super) async fn serve_mirrored_batch_apply<D: BlockDevice + AsyncRead>(
     writes: &[crate::wire::OwnedWrite],
     sync: bool,
     mode: ApplyMode,
+    floor: LiveFloor,
     fenced: Option<&FencedWrites>,
 ) -> Response {
-    let response = serve_batch_apply(
+    let response = serve_batch_apply_with(
         Some(shared.as_ref()),
         zone_id,
         store,
@@ -472,11 +473,13 @@ pub(super) async fn serve_mirrored_batch_apply<D: BlockDevice + AsyncRead>(
         writes,
         sync,
         mode,
+        floor,
     )
     .await;
     mirror_batch_response(shared, zone_id, writes, response, sync, fenced).await
 }
 
+#[cfg(test)]
 pub(super) async fn serve_batch_apply<D: BlockDevice + AsyncRead>(
     shared: Option<&ServerShared<D>>,
     zone_id: ZoneId,
@@ -486,6 +489,21 @@ pub(super) async fn serve_batch_apply<D: BlockDevice + AsyncRead>(
     writes: &[crate::wire::OwnedWrite],
     sync: bool,
     mode: ApplyMode,
+) -> Response {
+    serve_batch_apply_with(shared, zone_id, store, dev, gate, writes, sync, mode, LiveFloor::Enforce).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn serve_batch_apply_with<D: BlockDevice + AsyncRead>(
+    shared: Option<&ServerShared<D>>,
+    zone_id: ZoneId,
+    store: &RefCell<VersionedStore<D>>,
+    dev: &D,
+    gate: &ReadGate,
+    writes: &[crate::wire::OwnedWrite],
+    sync: bool,
+    mode: ApplyMode,
+    floor: LiveFloor,
 ) -> Response {
     let started = std::time::Instant::now();
     let wall_ms = crate::hlc::physical_now_ms();
@@ -499,7 +517,7 @@ pub(super) async fn serve_batch_apply<D: BlockDevice + AsyncRead>(
         {
             let mut s = store.borrow_mut();
             for (key, value, version) in writes {
-                match s.apply_blind_at(key, value.as_deref(), *version, wall_ms) {
+                match s.apply_blind_with(key, value.as_deref(), *version, wall_ms, floor) {
                     Ok(a) => results.push(a),
                     Err(e) if e.is_backpressure() || e.is_device_full() => {
                         return engine_space_rejection(s.engine());
@@ -563,7 +581,7 @@ pub(super) async fn serve_batch_apply<D: BlockDevice + AsyncRead>(
             let mut s = store.borrow_mut();
             for &idx in &pending {
                 let (key, value, version) = &writes[idx];
-                match s.apply_stage(key, value.as_deref(), *version, wall_ms) {
+                match s.apply_stage_with(key, value.as_deref(), *version, wall_ms, floor) {
                     Ok(StagedApply::Done(a)) => results[idx] = Some(a),
                     Ok(StagedApply::NeedsRunRead { probe, gen }) => {
                         cold.push(Cold { idx, gen });

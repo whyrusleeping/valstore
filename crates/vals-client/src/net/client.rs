@@ -1185,82 +1185,7 @@ impl Transport for NetTransport {
         sync: bool,
         writes: &[BatchEntry<'_>],
     ) -> Vec<BatchAck> {
-        if self.conn(node, 0).is_err() {
-            return vec![BatchAck::Unreachable; writes.len()];
-        }
-        let by_shard =
-            self.group_by_data_shard(node, zone_id, writes.iter().map(|entry| entry.key));
-        let shard_ids: Vec<usize> = by_shard.keys().copied().collect();
-        let futs = shard_ids
-            .iter()
-            .map(|&shard| {
-                let wire_writes: Vec<wire::WireWrite> = by_shard[&shard]
-                    .iter()
-                    .map(|&i| (writes[i].key, writes[i].value, writes[i].version))
-                    .collect();
-                async move {
-                    let reply = self
-                        .rpc(
-                            node,
-                            shard,
-                            &Request::BatchApply {
-                                epoch: self.route_epoch.get(),
-                                zone_id,
-                                sync,
-                                writes: &wire_writes,
-                            },
-                            wire_writes.len(),
-                        )
-                        .await;
-                    (shard, reply)
-                }
-            })
-            .collect();
-        let replies = vals_rt::join_all(futs).await;
-
-        let mut out: Vec<BatchAck> = vec![BatchAck::Unreachable; writes.len()];
-        for (shard, reply) in replies {
-            let indices = &by_shard[&shard];
-            let reply = reply.map(|reply| reply.response);
-            match reply {
-                Ok(Response::Batch(results)) => {
-                    for (j, &i) in indices.iter().enumerate() {
-                        if let Some(&a) = results.get(j) {
-                            out[i] = BatchAck::Applied(a);
-                        } else {
-                            out[i] = BatchAck::Remote;
-                        }
-                    }
-                }
-                Ok(Response::StaleEpoch(e)) => {
-                    for &i in indices {
-                        out[i] = BatchAck::Stale(e);
-                    }
-                }
-                Ok(Response::Busy) => {
-                    for &i in indices {
-                        out[i] = BatchAck::Busy;
-                    }
-                }
-                Err(TransportError::Timeout) => {
-                    for &i in indices {
-                        out[i] = BatchAck::Timeout;
-                    }
-                }
-                Err(TransportError::Unavailable) => {}
-                Err(TransportError::Overloaded) => {
-                    for &i in indices {
-                        out[i] = BatchAck::Overloaded;
-                    }
-                }
-                Err(_) | Ok(_) => {
-                    for &i in indices {
-                        out[i] = BatchAck::Remote;
-                    }
-                }
-            }
-        }
-        out
+        self.batch_apply_rpc(node, zone_id, sync, false, writes).await
     }
 
     async fn read_mixed(
@@ -1648,6 +1573,104 @@ impl Transport for NetTransport {
 }
 
 impl NetTransport {
+    #[doc(hidden)]
+    pub async fn apply_batch_fill(
+        &self,
+        node: NodeId,
+        zone_id: ZoneId,
+        sync: bool,
+        writes: &[BatchEntry<'_>],
+    ) -> Vec<BatchAck> {
+        self.batch_apply_rpc(node, zone_id, sync, true, writes).await
+    }
+
+    async fn batch_apply_rpc(
+        &self,
+        node: NodeId,
+        zone_id: ZoneId,
+        sync: bool,
+        fill: bool,
+        writes: &[BatchEntry<'_>],
+    ) -> Vec<BatchAck> {
+        if self.conn(node, 0).is_err() {
+            return vec![BatchAck::Unreachable; writes.len()];
+        }
+        let by_shard =
+            self.group_by_data_shard(node, zone_id, writes.iter().map(|entry| entry.key));
+        let shard_ids: Vec<usize> = by_shard.keys().copied().collect();
+        let futs = shard_ids
+            .iter()
+            .map(|&shard| {
+                let wire_writes: Vec<wire::WireWrite> = by_shard[&shard]
+                    .iter()
+                    .map(|&i| (writes[i].key, writes[i].value, writes[i].version))
+                    .collect();
+                async move {
+                    let reply = self
+                        .rpc(
+                            node,
+                            shard,
+                            &Request::BatchApply {
+                                epoch: self.route_epoch.get(),
+                                zone_id,
+                                sync,
+                                fill,
+                                writes: &wire_writes,
+                            },
+                            wire_writes.len(),
+                        )
+                        .await;
+                    (shard, reply)
+                }
+            })
+            .collect();
+        let replies = vals_rt::join_all(futs).await;
+
+        let mut out: Vec<BatchAck> = vec![BatchAck::Unreachable; writes.len()];
+        for (shard, reply) in replies {
+            let indices = &by_shard[&shard];
+            let reply = reply.map(|reply| reply.response);
+            match reply {
+                Ok(Response::Batch(results)) => {
+                    for (j, &i) in indices.iter().enumerate() {
+                        if let Some(&a) = results.get(j) {
+                            out[i] = BatchAck::Applied(a);
+                        } else {
+                            out[i] = BatchAck::Remote;
+                        }
+                    }
+                }
+                Ok(Response::StaleEpoch(e)) => {
+                    for &i in indices {
+                        out[i] = BatchAck::Stale(e);
+                    }
+                }
+                Ok(Response::Busy) => {
+                    for &i in indices {
+                        out[i] = BatchAck::Busy;
+                    }
+                }
+                Err(TransportError::Timeout) => {
+                    for &i in indices {
+                        out[i] = BatchAck::Timeout;
+                    }
+                }
+                Err(TransportError::Unavailable) => {}
+                Err(TransportError::Overloaded) => {
+                    for &i in indices {
+                        out[i] = BatchAck::Overloaded;
+                    }
+                }
+                Err(_) | Ok(_) => {
+                    for &i in indices {
+                        out[i] = BatchAck::Remote;
+                    }
+                }
+            }
+        }
+        out
+    }
+
     #[doc(hidden)]
     pub async fn range_delete(
         &self,

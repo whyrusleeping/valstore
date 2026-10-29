@@ -174,7 +174,7 @@ Payload = `[u8 opcode]` then the fields below (`wire.rs:815`). Opcodes (`wire.rs
 | `SyncBucketDigests` | 4 | `[u32 zone][u32 num_buckets][u32 id_count][u32 × id_count][opt<bytes> after]` |
 | `SetMembers` | 5 | `[bytes auth][u64 epoch][u32 vnodes][u32 rf][u32 count]` then `[u32 id][u32 weight] × count`, then `addr-list`, then the optional incarnation trailer |
 | `Members` | 6 | *(none)* |
-| `BatchApply` | 7 | `[u64 epoch][u32 zone][u8 sync][u32 count]` then `[version][bytes key][opt<bytes> value] × count` |
+| `BatchApply` | 7 | `[u64 epoch][u32 zone][u8 flags][u32 count]` then `[version][bytes key][opt<bytes> value] × count` |
 | `SetZones` | 8 | `[bytes auth][u64 epoch][u32 count]` then `zone-entry × count`, then the optional incarnation trailer |
 | `Zones` | 9 | *(none)* |
 | `GetWatermark` | 10 | *(none)* |
@@ -210,9 +210,13 @@ node and shard (committed or pending re-home target), as writes are; the stamp
 `u64::MAX` (`INSPECT_EPOCH`) exempts a read from both fences and is meant for
 diagnostics that list a shard's physical contents. A `StaleEpoch`
 refusal also applies to a whole `BatchApply` (the reply replaces `Batch`;
-nothing was applied). `BatchApply.sync=0` requests buffered acknowledgement;
-`sync=1` delays acknowledgement until the coalesced shard/zone device-sync
-barrier. Protocol-v1 `Apply` is always buffered, so an explicitly
+nothing was applied). `BatchApply.flags` bit 0 (`sync`) clear requests buffered
+acknowledgement; set, it delays acknowledgement until the coalesced shard/zone
+device-sync barrier. Bit 1 (`fill`, task 0517) marks a restore copy (`valsd backup
+load`): the replica applies its puts without the tombstone-GC admission floor. A
+decoder treats any set bit other than bit 1 as `sync`; a node from before 0517 reads
+the whole byte as `sync != 0`, so it takes a `fill` batch as synced and keeps the
+floor. Protocol-v1 `Apply` is always buffered, so an explicitly
 device-persistent single write is sent as a one-entry `BatchApply(sync=1)`.
 
 `RangeDelete` applies one range tombstone at `version` per slice and replies

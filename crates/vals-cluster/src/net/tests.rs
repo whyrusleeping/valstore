@@ -5086,6 +5086,7 @@ fn a_store_at_its_reserve_floor_answers_apply_and_batchapply_busy() {
             epoch: 0,
             zone_id: DEFAULT_ZONE,
             sync: true,
+            fill: false,
             writes: vec![(
                 b"batchkey".to_vec(),
                 Some(vec![9u8; 200]),
@@ -5492,6 +5493,125 @@ fn rehome_copy_holds_while_the_target_keeps_an_old_leftover_the_source_lacks() {
             let (_, stats) = range_stats(addr(target));
             stats.iter().any(|s| s.zone_id == zone_id && s.lower_bound == boundary && s.rehome_copy_complete_epoch >= 12)
         }),
+    );
+    drop(handles);
+}
+
+#[test]
+fn rehome_copy_carries_values_older_than_the_gc_grace_to_the_new_owner() {
+    use crate::liveness::{LivenessLog, MemLivenessLog};
+    use crate::node::Node;
+    use crate::replica::{Applied, Stored};
+    use crate::zonestore::{MemZoneStore, ZoneGeom};
+
+    let zone_id = 11;
+    let cfg = ZoneConfig { name: "aged".into(), rf: 1, ordering: Ordering::Sorted, scope: None };
+    let ring = Ring::from_members(1, 64, [1, 2, 3]);
+    let mut boundary = b"m".to_vec();
+    while ring.replicas_in_zone(zone_id, b"", 1, None) == ring.replicas_in_zone(zone_id, &boundary, 1, None) {
+        boundary.push(b'x');
+    }
+    let source = ring.replicas_in_zone(zone_id, b"", 1, None)[0];
+    let target = ring.replicas_in_zone(zone_id, &boundary, 1, None)[0];
+    let binds: Vec<_> = (0..3).map(|_| crate::node::Node::bind().unwrap()).collect();
+    let peers: Vec<(NodeId, SocketAddr)> =
+        binds.iter().enumerate().map(|(i, (_, addr))| ((i + 1) as NodeId, *addr)).collect();
+    let now = crate::hlc::physical_now_ms();
+    let version = |ms: u64| crate::hlc::Version { hlc: ms << crate::hlc::COUNTER_BITS, node: 9 };
+    let young = [boundary.as_slice(), b"/a-young"].concat();
+    let aged = [boundary.as_slice(), b"/b-aged"].concat();
+    let mut handles = Vec::new();
+    for (i, (listener, _)) in binds.into_iter().enumerate() {
+        let node = (i + 1) as NodeId;
+        let provider = MemZoneStore::new(node, ZoneGeom {
+            block_size: 256,
+            seg_blocks: 4,
+            reserved_blocks: 0,
+            region_blocks: 8192,
+        });
+        if node == source {
+            let mut zone = provider.open(zone_id, Ordering::Sorted).unwrap();
+            zone.apply(&aged, Some(b"aged"), version(now - 600_000)).unwrap();
+            zone.apply(&young, Some(b"young"), version(now)).unwrap();
+            zone.sync().unwrap();
+        }
+        let zone0 = provider.open(DEFAULT_ZONE, Ordering::Unsorted).unwrap();
+        let mut catalog = Catalog::new();
+        catalog.insert(zone_id, cfg.clone());
+        let log = MemLivenessLog::new();
+        log.store(now - 1_000).unwrap();
+        handles.push(crate::testutil::running(Node::serve_zoned_with_liveness_and_settings(
+            node,
+            listener,
+            zone0,
+            provider,
+            catalog,
+            ring.clone(),
+            peers.clone(),
+            Duration::from_secs(3600),
+            60_000,
+            log,
+            None,
+            crate::node_settings::NodeSettings { rehome_copy_page_entries: 64, ..Default::default() },
+        )));
+    }
+    for (_, addr) in &peers {
+        push_members_full(*addr, 1, &peers);
+    }
+    let addr = |node: NodeId| peers[(node - 1) as usize].1;
+    let map = |token: &[u8], pending: Option<&[u8]>| {
+        RangeMap::from_splits_tokens_and_pending(
+            vec![boundary.clone()],
+            vec![Vec::new(), token.to_vec()],
+            vec![None, pending.map(<[u8]>::to_vec)],
+        )
+        .unwrap()
+    };
+    let push = |epoch: u64, map: &RangeMap| {
+        for (_, a) in &peers {
+            push_range_map_full(*a, epoch, zone_id, map);
+        }
+    };
+    let apply = |node: NodeId, key: &[u8], value: &[u8], ms: u64| {
+        rpc_request(addr(node), &Request::Apply { epoch: u64::MAX, zone_id, key, value: Some(value), version: version(ms) })
+    };
+    let read = |node: NodeId, key: &[u8]| match rpc_request(
+        addr(node),
+        &Request::Read { epoch: wire::INSPECT_EPOCH, zone_id, key },
+    ) {
+        Response::Read(stored) => stored,
+        other => panic!("read failed: {other:?}"),
+    };
+    let eventually = |what: &str, mut ok: Box<dyn FnMut() -> bool + '_>| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ok() {
+            assert!(Instant::now() < deadline, "timed out: {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    push(10, &map(b"", None));
+    eventually("the source serves the range", Box::new(|| read(source, &aged).is_some()));
+
+    push(11, &map(b"", Some(&boundary)));
+    eventually(
+        "the copy completes",
+        Box::new(|| {
+            let (_, stats) = range_stats(addr(target));
+            stats.iter().any(|s| s.zone_id == zone_id && s.lower_bound == boundary && s.rehome_copy_complete_epoch >= 11)
+        }),
+    );
+    push(12, &map(&boundary, None));
+    assert_eq!(read(target, &young), Some(Stored { version: version(now), value: Some(b"young".to_vec()) }));
+    assert_eq!(
+        read(target, &aged),
+        Some(Stored { version: version(now - 600_000), value: Some(b"aged".to_vec()) }),
+        "the new owner lacks a value older than the grace after cutover"
+    );
+    let late = [boundary.as_slice(), b"/c-late"].concat();
+    eventually(
+        "the new owner refuses a client write older than the grace",
+        Box::new(|| apply(target, &late, b"late", now - 600_000) == Response::Apply(Applied::Rejected)),
     );
     drop(handles);
 }

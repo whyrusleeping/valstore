@@ -968,6 +968,20 @@ collected under a **grace period (`gc_grace`)**:
   `add-node`/`remove-node` until every member that stays has a clean
   cleanup lap and a joining node is empty (`--force` overrides;
   [`docs/backup-restore.md`](docs/backup-restore.md#consistency-contract)).
+- **Copies from owners.** The GC floor applies to puts from coordinators
+  (client writes, read repair, hint replay) and to cleanup handoffs. It is
+  waived where the sender is a current owner of the key or a fenced backup:
+  anti-entropy pulls from the peer shard that owns the key under the
+  committed placement (a pending re-home target or a sibling shard is not
+  trusted), re-home copies from
+  the current owner, and `valsd backup load` (`BatchApply` with the `fill`
+  flag). Under the liveness invariant above, an owner that still holds a put
+  older than the grace has no newer delete anywhere, so a new replica, a
+  wiped node or a restore target gets values of any age. A re-home copy
+  counts only `Won`/`Lost` as copied, so an entry the target refuses keeps
+  the range from cutting over. Cleanup handoffs keep the floor, so a move
+  that gives a key only new owners (for example at RF 1) leaves its values
+  older than the grace on the former owner (backlog 0518).
 - ✅ Built: `VersionedStore::with_gc_grace_ms` + `VersionedStore::compact(wall_ms)`,
   over a new `Engine::compact_filtered(drop_live)` seam (a versioned tombstone is an
   opaque live `Put` to the engine, so only the cluster layer can decide it is

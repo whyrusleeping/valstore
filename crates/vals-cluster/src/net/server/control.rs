@@ -293,6 +293,7 @@ pub(super) fn serve_request_mode<D: BlockDevice>(
                 version,
                 crate::hlc::physical_now_ms(),
                 mode,
+                LiveFloor::Enforce,
             );
             match r {
                 Ok(a) => {
@@ -357,6 +358,7 @@ pub(super) fn serve_request_mode<D: BlockDevice>(
         OwnedRequest::BatchApply {
             zone_id,
             sync,
+            fill,
             writes,
             ..
         } => {
@@ -390,6 +392,7 @@ pub(super) fn serve_request_mode<D: BlockDevice>(
                     *version,
                     wall_ms,
                     mode,
+                    if fill { LiveFloor::Waive } else { LiveFloor::Enforce },
                 ) {
                     Ok(a) => results.push(a),
                     Err(e) if e.is_backpressure() || e.is_device_full() => {

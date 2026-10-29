@@ -285,7 +285,7 @@ fn load_batch(coord: &Coordinator<NetTransport>, zone_id: ZoneId, records: &[Rec
                         version: records[i].version,
                     })
                     .collect();
-                async move { coord.transport().apply_batch(node, zone_id, true, &entries).await }
+                async move { coord.transport().apply_batch_fill(node, zone_id, true, &entries).await }
             })
             .collect();
         let replies = run(vals_rt::join_all(sends));
@@ -308,7 +308,9 @@ fn load_batch(coord: &Coordinator<NetTransport>, zone_id: ZoneId, records: &[Rec
                     }
                     Some(BatchAck::Applied(Applied::Rejected)) => {
                         return Err(format!(
-                            "node {node} refused zone {zone_id} key {} at version {:?} on clock skew",
+                            "node {node} refused zone {zone_id} key {} at version {:?}: the version is further ahead \
+                             of its clock than the allowed clock skew, or the node predates restore loads and applied \
+                             its tombstone-GC admission floor (upgrade it)",
                             key_text(&record.key),
                             record.version
                         ))
