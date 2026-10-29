@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use super::{decode_block_body, encode_block_body, BlockedBloom, Cursor, RtLocator, SUFFIX_TOMB_BIT};
+use super::{decode_block_body, encode_block_body, BlockedBloom, Cursor, EntryKey, RtLocator};
 use crate::range_tombstone::{decode_rt_block, encode_rt_block, RtRecord};
 use crate::crc;
 use crate::index::{
@@ -213,19 +213,18 @@ struct Raw<'a> {
     version: u128,
 }
 
-fn read_raw<'a>(c: &mut Cursor<'a>) -> Result<Raw<'a>, &'static str> {
-    let shared = c.u32()? as usize;
-    let suffix_field = c.u32()?;
-    let suffix = c.take((suffix_field & !SUFFIX_TOMB_BIT) as usize)?;
+fn read_raw<'a>(c: &mut Cursor<'a>, prev_len: usize) -> Result<Raw<'a>, &'static str> {
+    let EntryKey { shared, suffix, tombstone } = c.entry_key(prev_len)?;
+    let f = c.entry_fields()?;
     Ok(Raw {
         shared,
-        tombstone: suffix_field & SUFFIX_TOMB_BIT != 0,
+        tombstone,
         suffix,
-        segment: c.u64()?,
-        offset: c.u32()?,
-        len: c.u32()?,
-        seq: c.u64()?,
-        version: c.u128()?,
+        segment: f.ptr.segment.0,
+        offset: f.ptr.offset,
+        len: f.ptr.len,
+        seq: f.seq,
+        version: f.version,
     })
 }
 
@@ -347,11 +346,9 @@ impl EncodeCheck {
         let mut max_hlc = 0u64;
         for j in 0..count {
             let at = self.entries;
-            let r = read_raw(&mut c).map_err(|why| self.decode_fail(at, src_first, why))?;
+            let prev_len = if j == 0 { 0 } else { self.key.len() };
+            let r = read_raw(&mut c, prev_len).map_err(|why| self.decode_fail(at, src_first, why))?;
             max_hlc = max_hlc.max(crate::range_tombstone::version_hlc(r.version));
-            if (j == 0 && r.shared != 0) || r.shared > self.key.len() {
-                return Err(self.decode_fail(at, src_first, "shared prefix longer than the previous key"));
-            }
             if knock & KNOCK_ORDER == 0 && at > 0 && &self.key[r.shared..] >= r.suffix {
                 let mut next = self.key[..r.shared].to_vec();
                 next.extend_from_slice(r.suffix);

@@ -584,7 +584,7 @@ change.** See `crates/vals-store/tests/format_fence.rs` and `docs/deploy.md`.
 
 ### 2.2a Run file — `vals-store`
 
-A run is one immutable sorted file written across whole segments (`run.rs`). In
+A run is one immutable sorted file written across whole segments (`run.rs` and `run/`). In
 order:
 
 ```
