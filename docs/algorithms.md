@@ -1186,8 +1186,10 @@ they are load-bearing and worth recording. Full rationale is in `ARCHITECTURE.md
   any replica is contacted. `Persistence::Buffered` (the default, also for a bare
   `WriteConcern`) permits each replica acknowledgement after the write is installed
   in memory; `Persistence::Device` (`WriteOptions::device_durable`) delays it until
-  device sync. Full vlog blocks submit
-  asynchronously (queue depth > 1), reads serve the partial tail from memory, and
+  device sync. Full vlog blocks are coalesced into contiguous writes of up to
+  16 KiB and submitted asynchronously (queue depth > 1); a sync writes the remaining
+  staged blocks and the partial tail together in one write, and every read drains
+  staged blocks first. Reads serve the partial tail from memory, and
   concurrent device-persistent single/batch requests on one shard and zone join one
   barrier after installing their writes. The leader issues one engine sync, then
   releases all joined requests with the same success/failure result, so N in-flight

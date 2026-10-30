@@ -8,6 +8,12 @@ use crate::alloc::{Allocator, SegmentId};
 
 const MAX_INFLIGHT_WRITES: usize = 64;
 
+/// Full value-log blocks are coalesced into contiguous writes of up to this
+/// many bytes (one SPDK pooled DMA slot) instead of one 4 KiB write per block:
+/// a drive in steady state serves 16 KiB writes ~3x faster than 4 KiB ones at
+/// the same queue depth (task 0544).
+const COALESCE_BYTES: usize = 16 * 1024;
+
 static VLOG_STALLS: AtomicU64 = AtomicU64::new(0);
 static VLOG_STALL_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static VLOG_SYNC_DRAIN_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -890,6 +896,11 @@ pub struct ValueLog {
     next_epoch: u64,
     cur_epoch: u64,
     inflight: RefCell<Vec<WriteHandle>>,
+    /// Full blocks appended but not yet submitted, contiguous from `staged_lba`.
+    /// Submitted before any wait for in-flight writes, so readers and syncs
+    /// (which drain first) never miss them.
+    staged: RefCell<Vec<u8>>,
+    staged_lba: std::cell::Cell<u64>,
     tail_segs: Vec<(u64, SegmentId)>,
     epoch_fence_pending: bool,
 }
@@ -915,6 +926,8 @@ impl ValueLog {
             next_epoch: start_epoch,
             cur_epoch: 0,
             inflight: RefCell::new(Vec::new()),
+            staged: RefCell::new(Vec::new()),
+            staged_lba: std::cell::Cell::new(0),
             tail_segs: Vec::new(),
             epoch_fence_pending: false,
         }
@@ -971,7 +984,67 @@ impl ValueLog {
         Ok(())
     }
 
+    /// Adds full blocks starting at `lba` to the coalescing buffer, submitting
+    /// it whenever it fills or `lba` does not continue it.
+    fn stage_blocks<D: BlockDevice>(
+        &self,
+        dev: &D,
+        mut lba: u64,
+        mut buf: &[u8],
+    ) -> Result<(), LogError> {
+        let bs = self.block_size as u64;
+        let pending = self.staged.borrow().len() as u64;
+        if pending > 0 && self.staged_lba.get() + pending / bs != lba {
+            self.submit_staged(dev)?;
+        }
+        while !buf.is_empty() {
+            let n = {
+                let mut staged = self.staged.borrow_mut();
+                if staged.is_empty() {
+                    self.staged_lba.set(lba);
+                }
+                let n = (COALESCE_BYTES.max(self.block_size) - staged.len()).min(buf.len());
+                staged.extend_from_slice(&buf[..n]);
+                n
+            };
+            buf = &buf[n..];
+            lba += n as u64 / bs;
+            if self.staged.borrow().len() >= COALESCE_BYTES {
+                self.submit_staged(dev)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Submits the coalescing buffer as one write. On failure the buffer is
+    /// kept, so a later drain submits it again.
+    fn submit_staged<D: BlockDevice>(&self, dev: &D) -> Result<(), LogError> {
+        let mut buf = std::mem::take(&mut *self.staged.borrow_mut());
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let submitted = self.submit_block(dev, self.staged_lba.get(), &buf);
+        if submitted.is_ok() {
+            buf.clear();
+        }
+        *self.staged.borrow_mut() = buf;
+        submitted
+    }
+
+    /// Waits for every in-flight write, then writes the coalescing buffer
+    /// synchronously: on failure it is kept, so a retried drain writes it again.
     fn drain_inflight<D: BlockDevice>(&self, dev: &D) -> Result<(), LogError> {
+        self.wait_inflight(dev)?;
+        let mut staged = self.staged.borrow_mut();
+        if !staged.is_empty() {
+            crate::attribution::write_bytes(0, staged.len());
+            dev.write_at(self.staged_lba.get(), &staged)?;
+            staged.clear();
+        }
+        Ok(())
+    }
+
+    fn wait_inflight<D: BlockDevice>(&self, dev: &D) -> Result<(), LogError> {
         while !self.inflight.borrow().is_empty() {
             if dev.poll_writes() > 0 || self.head_done() {
                 self.reap()?;
@@ -981,6 +1054,7 @@ impl ValueLog {
     }
 
     pub(crate) fn quiesce<D: BlockDevice>(&self, dev: &D) {
+        let _ = self.submit_staged(dev);
         while !self.inflight.borrow().is_empty() {
             if dev.poll_writes() > 0 || self.head_done() {
                 let _ = self.reap();
@@ -1297,24 +1371,26 @@ impl ValueLog {
 
     pub fn drain_and_flush_tail<D: BlockDevice>(&mut self, dev: &D) -> Result<(), LogError> {
         let started = std::time::Instant::now();
-        let drained = self.drain_inflight(dev);
+        let drained = self.wait_inflight(dev);
         VLOG_SYNC_DRAIN_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         VLOG_SYNC_DRAIN_COUNT.fetch_add(1, Ordering::Relaxed);
         drained?;
-        if self.tail_dirty {
-            let started = std::time::Instant::now();
-            let flushed = self.flush_tail(dev);
-            VLOG_SYNC_TAIL_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            VLOG_SYNC_TAIL_COUNT.fetch_add(1, Ordering::Relaxed);
-            flushed?;
+        if !self.tail_dirty {
+            return self.drain_inflight(dev);
         }
-        Ok(())
+        let started = std::time::Instant::now();
+        let flushed = self.flush_staged_and_tail(dev);
+        VLOG_SYNC_TAIL_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        VLOG_SYNC_TAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+        flushed
     }
 
     fn roll<D: BlockDevice>(&mut self, dev: &D, alloc: &mut Allocator) -> Result<(), LogError> {
         if self.tail_dirty {
             self.flush_tail(dev)?;
         }
+        // After the synchronous tail write, so its error still surfaces here.
+        self.submit_staged(dev)?;
         let seg = alloc.allocate_data().ok_or_else(|| {
             if alloc.maint_reserve() > 0 {
                 LogError::Backpressure
@@ -1357,7 +1433,7 @@ impl ValueLog {
             rest = &rest[n..];
             if off + n == bs {
                 let block_idx = self.write_off as u64 / bs as u64 - 1;
-                self.submit_block(dev, self.cur_seg_start + block_idx, &self.tail)?;
+                self.stage_blocks(dev, self.cur_seg_start + block_idx, &self.tail)?;
                 self.tail.fill(0);
                 self.tail_dirty = false;
             }
@@ -1368,7 +1444,7 @@ impl ValueLog {
             debug_assert_eq!(self.write_off as usize % bs, 0);
             let nbytes = full * bs;
             let block_idx = self.write_off as u64 / bs as u64;
-            self.submit_block(dev, self.cur_seg_start + block_idx, &rest[..nbytes])?;
+            self.stage_blocks(dev, self.cur_seg_start + block_idx, &rest[..nbytes])?;
             self.write_off += nbytes as u32;
             rest = &rest[nbytes..];
         }
@@ -1380,6 +1456,32 @@ impl ValueLog {
             self.write_off += rest.len() as u32;
             self.tail_dirty = true;
         }
+        Ok(())
+    }
+
+    /// Writes the coalescing buffer and the dirty tail block that directly
+    /// follows it as one synchronous write. Both stay pending on failure.
+    fn flush_staged_and_tail<D: BlockDevice>(&mut self, dev: &D) -> Result<(), LogError> {
+        let bs = self.block_size;
+        let tail_lba = self.cur_seg_start + self.write_off as u64 / bs as u64;
+        let staged_len = self.staged.borrow().len();
+        if staged_len == 0 || self.staged_lba.get() + (staged_len / bs) as u64 != tail_lba {
+            self.drain_inflight(dev)?;
+            return self.flush_tail(dev);
+        }
+        crate::attribution::write_bytes(0, staged_len);
+        crate::attribution::write_bytes(1, bs);
+        let written = {
+            let mut staged = self.staged.borrow_mut();
+            staged.extend_from_slice(&self.tail);
+            let written = dev.write_at(self.staged_lba.get(), &staged);
+            staged.truncate(staged_len);
+            written
+        };
+        written?;
+        self.staged.borrow_mut().clear();
+        VLOG_TAIL_WRITE_BYTES.fetch_add(bs as u64, Ordering::Relaxed);
+        self.tail_dirty = false;
         Ok(())
     }
 
@@ -1722,6 +1824,156 @@ mod tests {
                 assert_eq!(*off as usize, SEG_HEADER_LEN);
             }
         }
+    }
+
+    struct SizeLogDevice {
+        inner: MemBlockDevice,
+        writes: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl BlockDevice for SizeLogDevice {
+        fn block_size(&self) -> usize {
+            self.inner.block_size()
+        }
+        fn num_blocks(&self) -> u64 {
+            self.inner.num_blocks()
+        }
+        fn read_at(&self, lba: u64, buf: &mut [u8]) -> vals_spdk::Result<()> {
+            self.inner.read_at(lba, buf)
+        }
+        fn write_at(&self, lba: u64, buf: &[u8]) -> vals_spdk::Result<()> {
+            self.writes.lock().unwrap().push(buf.len());
+            self.inner.write_at(lba, buf)
+        }
+        fn flush(&self) -> vals_spdk::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn full_blocks_are_coalesced_and_reads_and_syncs_see_staged_blocks() {
+        const SEG: u64 = 128; // 32 KiB segments of 256 B blocks: one 16 KiB coalesced write fits twice
+        let dev = SizeLogDevice {
+            inner: MemBlockDevice::new(BS, 1024),
+            writes: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut alloc = Allocator::new(1024, SEG, 0);
+        let mut log = ValueLog::new(BS, SEG, 0, 0);
+        let value = [7u8; 46]; // 50 B header + 4 B key + 46 B value = 100 B records
+        let mut ptrs = Vec::new();
+        for i in 0..200u32 {
+            let key = format!("k{i:03}");
+            ptrs.push(
+                log.append(&dev, &mut alloc, RecordKind::Put, 0, key.as_bytes(), &value)
+                    .unwrap()
+                    .1,
+            );
+        }
+        // 200 records fill 78 full blocks: one 64-block (16 KiB) write so far, the rest staged.
+        assert_eq!(*dev.writes.lock().unwrap(), [COALESCE_BYTES]);
+        assert_eq!(log.staged.borrow().len(), 14 * BS);
+        // A read drains first, so it sees a staged block's record.
+        let (start, _) = alloc.segment_range(ptrs[190].segment);
+        assert_eq!(log.read(&dev, start, &ptrs[190]).unwrap().value, value);
+        assert_eq!(*dev.writes.lock().unwrap(), [COALESCE_BYTES, 14 * BS]);
+        assert!(log.staged.borrow().is_empty());
+
+        for i in 200..260u32 {
+            log.append(
+                &dev,
+                &mut alloc,
+                RecordKind::Put,
+                0,
+                format!("k{i:03}").as_bytes(),
+                &value,
+            )
+            .unwrap();
+        }
+        log.sync(&dev).unwrap();
+        let mut buf = vec![0u8; SEG as usize * BS];
+        dev.read_at(start, &mut buf).unwrap();
+        let (_, recs) = replay_segment(&buf).unwrap();
+        assert_eq!(recs.len(), 260);
+        assert!(recs
+            .iter()
+            .enumerate()
+            .all(|(i, (_, r))| r.key == format!("k{i:03}").into_bytes()));
+        // Coalesced writes, then one partial-tail write: far fewer than one write per block.
+        assert!(
+            dev.writes.lock().unwrap().len() <= 4,
+            "{:?}",
+            dev.writes.lock().unwrap()
+        );
+    }
+
+    struct FailWritesDevice {
+        inner: MemBlockDevice,
+        fail: std::sync::atomic::AtomicBool,
+        writes: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl BlockDevice for FailWritesDevice {
+        fn block_size(&self) -> usize {
+            self.inner.block_size()
+        }
+        fn num_blocks(&self) -> u64 {
+            self.inner.num_blocks()
+        }
+        fn read_at(&self, lba: u64, buf: &mut [u8]) -> vals_spdk::Result<()> {
+            self.inner.read_at(lba, buf)
+        }
+        fn write_at(&self, lba: u64, buf: &[u8]) -> vals_spdk::Result<()> {
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(BlockError::Io(std::io::Error::other(
+                    "injected write failure",
+                )));
+            }
+            self.writes.lock().unwrap().push(buf.len());
+            self.inner.write_at(lba, buf)
+        }
+        fn flush(&self) -> vals_spdk::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn a_commit_writes_staged_blocks_and_tail_once_and_a_failed_commit_keeps_both() {
+        const SEG: u64 = 128;
+        let dev = FailWritesDevice {
+            inner: MemBlockDevice::new(BS, 1024),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            writes: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut alloc = Allocator::new(1024, SEG, 0);
+        let mut log = ValueLog::new(BS, SEG, 0, 0);
+        for i in 0..30u32 {
+            log.append(
+                &dev,
+                &mut alloc,
+                RecordKind::Put,
+                0,
+                format!("k{i:03}").as_bytes(),
+                &[7u8; 46],
+            )
+            .unwrap();
+        }
+        // 3,022 B: 11 full staged blocks plus a partial tail, no device write yet.
+        assert!(dev.writes.lock().unwrap().is_empty());
+        dev.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(log.drain_and_flush_tail(&dev).is_err());
+        assert_eq!(log.staged.borrow().len(), 11 * BS);
+        assert!(log.tail_dirty);
+        dev.fail.store(false, std::sync::atomic::Ordering::Relaxed);
+        log.drain_and_flush_tail(&dev).unwrap();
+        assert_eq!(
+            *dev.writes.lock().unwrap(),
+            [12 * BS],
+            "staged blocks and tail in one write"
+        );
+        let (start, _) = alloc.segment_range(SegmentId(0));
+        let mut buf = vec![0u8; SEG as usize * BS];
+        dev.read_at(start, &mut buf).unwrap();
+        assert_eq!(replay_segment(&buf).unwrap().1.len(), 30);
     }
 
     #[test]
