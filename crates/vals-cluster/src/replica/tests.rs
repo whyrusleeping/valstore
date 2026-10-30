@@ -835,6 +835,8 @@
 
     #[test]
     fn dirty_oldest_age_advances_at_scrape_and_clears_per_store() {
+        // Asserts the process-global ae_dirty_* gauges, which parallel tests also move.
+        if crate::testutil::isolated_env_test(&[]) { return; }
         let mut older = sorted_store(1);
         older
             .append_unknown_for_test(b"older-dirty", Some(b"value"), v(61, 1))
