@@ -90,3 +90,10 @@ Owner 2026-10-29: take another pass at bootes soak performance, see how far it g
 - **Rejected:** the padded tail (neutral) and the yielding commit wait (adds scheduler latency; −30–50% pre-step).
 - **Baselines:** HEAD (R5/R7) is +33–42% over R4 pre-step but slower post-step.
 - **Follow-ups:** 64 KiB coalescing (shim DMA slots); proposed 0545.
+
+2026-10-31 follow-up.
+- **64 KiB coalescing (COAL64, branch `wip-0544-coalesce64`): rejected.**
+  - Full replay R9 stopped at 4.66B; per 1B −10…−17% against 16 KiB at 2–5B.
+  - Fewer, larger writes (node1 ~3.5k ops/s) left more bytes for each commit's synchronous staged+tail write (3.1–4.6 ms against 2.1–2.5 ms), so device throughput fell. 16 KiB (86983dc) stays.
+- **The R9 build hit a rustc SIGSEGV on alphac-2** (RAM class); the retry built identical binaries.
+- **Owner is considering ECC SO-DIMMs for alphac-2.** The MS-02 Ultra (WM880) supports them. Kernel 7.0 has no EDAC driver for host bridge 8086:7d1c, so corrected errors would not be reported.
