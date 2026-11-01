@@ -40,7 +40,7 @@ Owner 2026-10-29: take another pass at bootes soak performance, see how far it g
   - R7, matched against R5 → neutral post-step (1.08 / 1.06M both), so rejected; branch `wip-0544-vlog-pad`.
   - Every vlog write is slow after the step, not just tail rewrites, so the limiter is device write service at ~1 outstanding commit per shard.
   - The 400M ABBA design was invalid: an idle drive recovers to its pre-step state.
-- **Integrity on alphac-2:** an R6 AE-reconcile CRC (×8) was cleared by a clean reopen: in-memory event, record-and-continue. R7 node1 had a 0248-class glibc heap abort; it recovered.
+- **Integrity on lab-2:** an R6 AE-reconcile CRC (×8) was cleared by a clean reopen: in-memory event, record-and-continue. R7 node1 had a 0248-class glibc heap abort; it recovered.
 - **Next:**
   - SPDK perf queue-depth probe on a post-step drive;
   - if bandwidth scales with depth, pipelined group commits;
@@ -54,14 +54,14 @@ Owner 2026-10-29: take another pass at bootes soak performance, see how far it g
   - post-step slower: 1.07 / 0.84 / 0.77 / 0.63 / 0.56M at 3–8B against 1.21 / 1.04 / 0.72 / 0.83 / 0.81M;
   - total active time about equal (12.3 ks to 10.2B against 13.2 ks to 10.41B).
 - **Post-step device throughput:** about 335 MB/s per node against R4's implied ~460. Shards are saturated on synchronous device waits (31 µs/write at 10.2B).
-- **R8 control (R4 binary on today's drives):** stopped at ~2B by 4 alphac-2 RAM fail-fasts (xor 0x04) that exhausted the unit's restart limit. Regression vs drive aging is still undecided.
+- **R8 control (R4 binary on today's drives):** stopped at ~2B by 4 lab-2 RAM fail-fasts (xor 0x04) that exhausted the unit's restart limit. Regression vs drive aging is still undecided.
 - **Next, in order:**
-  - repeat the R8 control (or run it on alphac-1/3 with the 2-node profile) to separate a post-step code regression from drive aging; if it is a regression, bisect the SPDK/vlog changes since R4 (0535 qpair owner lock and affinity checks first);
+  - repeat the R8 control (or run it on lab-1/3 with the 2-node profile) to separate a post-step code regression from drive aging; if it is a regression, bisect the SPDK/vlog changes since R4 (0535 qpair owner lock and affinity checks first);
   - SPDK perf queue-depth probe on a post-step drive;
   - pipelined group commit, so shards don't spin on device completions.
 
 2026-10-30 (owner approved steps 1-3).
-- **Step 1, R4-binary control (R8):** not obtainable on this fleet. On the R4 binary, alphac-2's bad bit (xor 0x04) trips the memtable fail-fast every few minutes: 8 crashes in 33 min, against 0–3 per whole run on HEAD. Recoveries confound the rate. The harness now gives an exit-75 restart-limit the same bounded reset as a start-limit hit.
+- **Step 1, R4-binary control (R8):** not obtainable on this fleet. On the R4 binary, lab-2's bad bit (xor 0x04) trips the memtable fail-fast every few minutes: 8 crashes in 33 min, against 0–3 per whole run on HEAD. Recoveries confound the rate. The harness now gives an exit-75 restart-limit the same bounded reset as a start-limit hit.
 - **Code comparison:** the vlog write path is byte-identical between R4's source and HEAD. DRIVE02 shows post-step drives held ~1.05 GB/s per node while vals reached 0.53–0.60 (HEAD ~0.34), so the drive is not the binding limit.
 - **Step 2, fresh drive probe:** 4 KiB sequential writes scale 0.43 → 3.2 GB/s from QD1 to QD32; 64 KiB writes reach 6.9 GB/s. The post-step probe runs after R9.
 - **Step 3 candidate PIPE0544 (padded async tail plus a yielding wait for the commit's writes): rejected.**
@@ -95,5 +95,5 @@ Owner 2026-10-29: take another pass at bootes soak performance, see how far it g
 - **64 KiB coalescing (COAL64, branch `wip-0544-coalesce64`): rejected.**
   - Full replay R9 stopped at 4.66B; per 1B −10…−17% against 16 KiB at 2–5B.
   - Fewer, larger writes (node1 ~3.5k ops/s) left more bytes for each commit's synchronous staged+tail write (3.1–4.6 ms against 2.1–2.5 ms), so device throughput fell. 16 KiB (86983dc) stays.
-- **The R9 build hit a rustc SIGSEGV on alphac-2** (RAM class); the retry built identical binaries.
-- **Owner is considering ECC SO-DIMMs for alphac-2.** The MS-02 Ultra (WM880) supports them. Kernel 7.0 has no EDAC driver for host bridge 8086:7d1c, so corrected errors would not be reported.
+- **The R9 build hit a rustc SIGSEGV on lab-2** (RAM class); the retry built identical binaries.
+- **Owner is considering ECC SO-DIMMs for lab-2.** The MS-02 Ultra (WM880) supports them. Kernel 7.0 has no EDAC driver for host bridge 8086:7d1c, so corrected errors would not be reported.
