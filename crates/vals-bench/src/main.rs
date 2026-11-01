@@ -6,6 +6,8 @@ use vals_store::{Config, Engine, Ordering, RunBuildOpts};
 
 mod common;
 use common::*;
+mod commit_write;
+use commit_write::*;
 mod engine;
 use engine::*;
 mod spdk_device;
@@ -118,6 +120,10 @@ fn main() {
         }
         "write" => {
             workload_write(&mut open_engine(backend, path, n, vsize), n, vsize)
+        }
+        "commitwrite" => {
+            let threads: usize = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(8);
+            workload_commitwrite(backend, path, n, vsize, batch, threads)
         }
         "read" => {
             workload_read(&mut open_engine(backend, path, n, vsize), n, vsize)
