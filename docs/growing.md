@@ -98,8 +98,9 @@ Know what this deployment does not give you:
 - **Security.** The secret gates only control operations; reads and writes
   are never authenticated or encrypted. Bind the data port to a private
   network ([operational notes](deploy.md#operational-notes)).
-- **Keep `gc_grace = 0s`** (the default) if you plan to migrate with a
-  backup: a restore into nodes with tombstone GC on is not qualified
+- **Prefer `gc_grace = 0s`** (the default) if you plan to migrate with a
+  backup: a restore into nodes with tombstone GC on is tested locally only,
+  and the hardware drill used `gc_grace = 0s`
   ([`backup-restore.md`](backup-restore.md#limits-and-evidence-1)).
 
 ## Sizing zones on the file backend
@@ -217,7 +218,8 @@ restore with `add-node`. **What may change:** addresses, the number of PDs,
   cluster must stay intact until you switch.
 - **Quiet placement.** Do not add or remove nodes, or create or drop zones,
   during the backup; `create` fails if the topology changes.
-- **`gc_grace = 0s`** on the new nodes, as noted above.
+- **`gc_grace = 0s`** on the new nodes is the qualified setting, as noted
+  above.
 
 **Steps.** These use three hosts, one PD and one data node on each, and a
 source with one data node; adjust the `data_node` lines to your node ids.
