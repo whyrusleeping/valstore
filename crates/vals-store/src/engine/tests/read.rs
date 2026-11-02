@@ -303,7 +303,7 @@ fn record_len_reports_live_records_only() {
     let mut e = engine(Ordering::Sorted);
     e.put(b"k", b"value", 0).unwrap();
     let len = e.record_len(b"k").unwrap();
-    assert_eq!(len as usize, HEADER_LEN + 1 + 5);
+    assert_eq!(len as usize, crate::vlog::MIN_RECORD_LEN + 1 + 5);
     assert_eq!(e.record_len(b"missing"), None);
     e.delete(b"k", 0).unwrap();
     assert_eq!(e.record_len(b"k"), None);
@@ -499,7 +499,7 @@ fn scan_over_runs_pages_and_is_bounded() {
 fn scan_refuses_a_record_pointer_with_the_wrong_key_or_version() {
     let cfg = Config { seg_blocks: 16, reserved_blocks: 0, ordering: Ordering::Sorted };
     let opts = RunBuildOpts { block_target_bytes: 256, bloom_bits_per_key: 10, num_buckets: 16 };
-    for (case, reason) in [("key", "record key mismatch"), ("version", "record version mismatch")] {
+    for (case, reason) in [("key", "record key mismatch"), ("version", "version mismatch")] {
         for flushed in [false, true] {
             let what = format!("{case} flushed={flushed}");
             let mut e = Engine::create_prewiped(MemBlockDevice::new(BS, 4096), cfg);
@@ -1037,12 +1037,12 @@ fn value_pointers_outside_their_segment_are_refused_instead_of_panicking() {
     ] {
         assert!(
             matches!(
-                e.plan_get_ptr(&ptr),
+                e.plan_get_ptr(&ptr, 0),
                 Err(EngineError::Log(LogError::Corrupt("value pointer outside its segment")))
             ),
             "{ptr:?}"
         );
     }
-    assert_eq!(e.plan_get_ptr(&good).unwrap().ptr(), good);
+    assert_eq!(e.plan_get_ptr(&good, 0).unwrap().ptr(), good);
     assert_eq!(e.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
 }

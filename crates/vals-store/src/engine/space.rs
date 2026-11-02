@@ -417,7 +417,7 @@ impl<D: BlockDevice> Engine<D> {
             None => computed,
         };
         let cap = self.alloc.num_segments() / 2;
-        computed.min(cap)
+        computed.min(cap).max(flush_segs.saturating_add(self.manifest_headroom_segs()))
     }
 
     pub fn free_fraction(&self) -> f64 {

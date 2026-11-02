@@ -73,11 +73,11 @@ fn winner_directory_multi_get_rejects_wrong_versions_sync_and_async() {
         );
     let keys: [&[u8]; 2] = [b"alpha", b"beta"];
     let sync = e.multi_get(&keys).unwrap_err().to_string();
-    assert!(sync.contains("record version mismatch"));
+    assert!(sync.contains("version mismatch"));
     let asynchronous = vals_rt::block_on(e.multi_get_async(&keys), || {})
         .unwrap_err()
         .to_string();
-    assert!(asynchronous.contains("record version mismatch"));
+    assert!(asynchronous.contains("version mismatch"));
 }
 
 #[test]
@@ -490,7 +490,7 @@ fn winner_directory_sync_and_async_reads_validate_key_and_version() {
             },
         );
     let wrong_version = e.get(b"alpha").unwrap_err().to_string();
-    assert!(wrong_version.contains("record version mismatch"));
+    assert!(wrong_version.contains("version mismatch"));
 
     e.winner_directory
         .as_mut()
@@ -516,7 +516,7 @@ fn winner_directory_sync_and_async_reads_validate_key_and_version() {
     )
     .unwrap_err()
     .to_string();
-    assert!(wrong_version.contains("record version mismatch"));
+    assert!(wrong_version.contains("version mismatch"));
 }
 
 #[test]

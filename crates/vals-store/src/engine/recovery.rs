@@ -412,12 +412,12 @@ impl<D: BlockDevice> Engine<D> {
             }
             let (start, _) = alloc.segment_range(*seg);
             dev.read_at(start, buf)?;
-            let (_hdr, recs) = replay_segment(buf)?;
-            for (off, rec) in recs {
+            let (_hdr, recs) = crate::vlog::replay_segment_extents(buf)?;
+            for (off, len, rec) in recs {
                 let ptr = ValuePtr {
                     segment: *seg,
                     offset: off,
-                    len: (HEADER_LEN + rec.key.len() + rec.value.len()) as u32,
+                    len,
                 };
                 max_seq = Some(max_seq.map_or(rec.seq, |m| m.max(rec.seq)));
                 if rec.kind == RecordKind::RangeDelete {

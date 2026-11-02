@@ -139,6 +139,25 @@ The `vals_run_write_version` metric reports the active value. See
 [deploy.md](deploy.md#on-disk-format-and-compatibility) for the compatibility
 rules and [format-history.md](format-history.md) for how the formats changed.
 
+### Value-log format version
+
+Value-log segments also have an on-disk format ([formats.md §2.1](formats.md#21-value-log-record)).
+Current builds write format 2, whose record headers are 13–47 bytes (18 for a
+typical ingest record) instead of format 1's 50. Builds read both formats, and
+a store can hold both: each segment keeps the format it was opened with. A
+build that knows only format 1 refuses to open a store holding a format-2
+segment. `VALS_VLOG_WRITE_VERSION` (read once at startup) selects the format
+new segments are written in:
+
+- `2` or unset: format 2 (the default).
+- `1`: format 1, for a rollback window to a release that cannot read format 2.
+  It must be set before the first format-2 segment is written; segments
+  written in format 2 stay until value-log GC or a flush frees them.
+- Any other value, including an empty string, logs an error and writes
+  format 1.
+
+The `vals_vlog_write_version` metric reports the active value.
+
 ## Node resource and maintenance settings
 
 `valsd node` accepts the following keys. They follow the

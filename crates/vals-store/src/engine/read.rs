@@ -308,7 +308,7 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
             return Ok(None);
         };
         let seg_start = self.value_start(&e.ptr)?;
-        Ok(Some(self.log.plan_read(&self.dev, seg_start, &e.ptr)?))
+        Ok(Some(self.log.plan_read(&self.dev, seg_start, &e.ptr, e.version)?))
     }
 
     pub fn probe_get(&self, key: &[u8]) -> StagedGet {
@@ -319,7 +319,7 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
             let Some(token) = directory.read_token(key).filter(|t| cover.is_none_or(|c| t.entry.version > c)) else {
                 return covered();
             };
-            return match self.value_start(&token.entry.ptr).and_then(|seg_start| self.log.plan_read(&self.dev, seg_start, &token.entry.ptr)) {
+            return match self.value_start(&token.entry.ptr).and_then(|seg_start| self.log.plan_read(&self.dev, seg_start, &token.entry.ptr, token.entry.version)) {
                 Ok(plan) => StagedGet::WinnerDirectory {
                     plan: Box::new(plan),
                     token,
@@ -357,7 +357,7 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
             let Some(e) = mutable.filter(|e| cover.is_none_or(|c| e.version > c)) else {
                 return covered();
             };
-            return match self.value_start(&e.ptr).and_then(|seg_start| self.log.plan_read(&self.dev, seg_start, &e.ptr)) {
+            return match self.value_start(&e.ptr).and_then(|seg_start| self.log.plan_read(&self.dev, seg_start, &e.ptr, e.version)) {
                 Ok(plan) => StagedGet::Memtable(Box::new(plan)),
                 Err(e) => StagedGet::Err(EngineError::Log(e)),
             };
@@ -371,9 +371,9 @@ impl<D: BlockDevice + AsyncRead> Engine<D> {
         }
     }
 
-    pub fn plan_get_ptr(&self, ptr: &ValuePtr) -> Result<crate::vlog::ReadPlan, EngineError> {
+    pub fn plan_get_ptr(&self, ptr: &ValuePtr, version: u128) -> Result<crate::vlog::ReadPlan, EngineError> {
         let seg_start = self.value_start(ptr)?;
-        Ok(self.log.plan_read(&self.dev, seg_start, ptr)?)
+        Ok(self.log.plan_read(&self.dev, seg_start, ptr, version)?)
     }
 }
 

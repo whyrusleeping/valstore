@@ -11,7 +11,7 @@ use crate::run::{self, DeviceRun, RunBuildOpts};
 use crate::snapshot::SnapshotEntry;
 use crate::snapshot_io::{self, LiveSnapshot, SnapshotError};
 use crate::vlog::{
-    replay_segment, LogError, Record, RecordKind, ValueLog, ValuePtr, HEADER_LEN, SEG_HEADER_LEN,
+    replay_segment, LogError, Record, RecordKind, ValueLog, ValuePtr, SEG_HEADER_LEN,
 };
 use crate::Ordering;
 

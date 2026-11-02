@@ -7,7 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use vals_cluster::reactor;
-use vals_cluster::{Coordinator, WriteConcern, NetTransport, Ring, ZoneId};
+use vals_cluster::{Coordinator, NetTransport, Persistence, Ring, WriteConcern, WriteOptions, ZoneId};
 
 fn run<F: std::future::Future>(f: F) -> F::Output {
     vals_rt::block_on(f, reactor::poll_io)
@@ -260,7 +260,12 @@ fn live_node_admin_dump_round_trips_while_serving() {
         let got = coord.read_in(zid, b"k000").await.unwrap();
         assert!(got.and_then(|s| s.value).is_some(), "k000 must still read");
         coord
-            .write_in(zid, b"post-dump", b"alive", WriteConcern::Majority)
+            .write_in(
+                zid,
+                b"post-dump",
+                b"alive",
+                WriteOptions { concern: WriteConcern::Majority, persistence: Persistence::Device },
+            )
             .await
             .unwrap();
         let got = coord.read_in(zid, b"post-dump").await.unwrap();

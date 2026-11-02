@@ -1091,7 +1091,7 @@ fn compact_commit_pins_inflight_flush_value_segments() {
 
     assert!(e.seg_allocated_for_test(captured.segment));
     let (seg_start, _) = e.alloc.segment_range(captured.segment);
-    let captured_record = e.log.read(&e.dev, seg_start, &captured).unwrap();
+    let captured_record = e.log.read_checked(&e.dev, seg_start, &captured, b"pending", 3).unwrap();
     assert_eq!(captured_record.value, vec![3u8; 100]);
 
     let flush_plan = loop {

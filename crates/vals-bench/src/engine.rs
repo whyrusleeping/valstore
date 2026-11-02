@@ -375,10 +375,11 @@ fn cocompact_scan<D: BlockDevice + AsyncRead + 'static>(
         spans_total += nspans;
         let mut recs: Vec<Option<vals_store::Record>> = Vec::new();
         recs.resize_with(keys.len(), || None);
+        let expected = |slot: usize| (keys[slot].0.as_slice(), keys[slot].1);
         let mut i = 0;
         while i < nspans {
             let hi_w = (i + qd).min(nspans);
-            let futs: Vec<_> = (i..hi_w).map(|j| plan.execute_span(j, dev)).collect();
+            let futs: Vec<_> = (i..hi_w).map(|j| plan.execute_span_checked(j, dev, &expected)).collect();
             let results = vals_rt::block_on(vals_rt::join_all(futs), || {
                 dev.poll_device();
             });

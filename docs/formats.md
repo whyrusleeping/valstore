@@ -38,7 +38,7 @@ digest, the CRC variant).
 
 | Constant | `u32` | LE bytes on disk | Where |
 |---|---|---|---|
-| `REC_MAGIC` | `0x324C4156` | `56 41 4C 32` = `VAL2` | vlog record (`vlog.rs`) |
+| `REC_MAGIC` | `0x324C4156` | `56 41 4C 32` = `VAL2` | format-1 vlog record (`vlog.rs`) |
 | `SEG_MAGIC` | `0x31475356` | `56 53 47 31` = `VSG1` | vlog segment header (`vlog.rs`) |
 | `SUPER_MAGIC` | `0x564C5A53` | `53 5A 4C 56` (mnemonic `VLZS`) | zone superblock (`zonestore.rs:296`) |
 | `LAYOUT_MAGIC` | `0x564C444D` | `4D 44 4C 56` (mnemonic `VLDM`) | drive layout map (`drive.rs:634`) |
@@ -403,7 +403,50 @@ Each engine is an append-only **value log** of fixed-size blocks over a
 
 ### 2.1 Value-log record
 
-`[50-byte header][key][value]` (`vlog.rs`):
+Records are packed back to back after the segment header (`vlog.rs`). Every
+record in a segment uses the format its header names (§2.2). New segments use
+format 2 (0565); format 1 is still read, and is written while
+`VALS_VLOG_WRITE_VERSION=1` ([configuration.md](configuration.md#value-log-format-version)).
+A value read, which does not fetch the segment header, tells the formats apart
+by the record's first byte: bit `0x80` is set for format 2 and clear for
+format 1 (`VAL2` starts with `0x56`).
+
+**Format 2** is `[header][key][value]` with a 13–47-byte header:
+
+| Field | Encoding |
+|---|---|
+| tag | u8: bit `0x80` set; `0x40` writer elided; `0x20` tombstone; bits `0..5` kind (`0` Put, `1` Delete, `2` RangeDelete) |
+| key_len | LEB128 varint, at most u32 |
+| val_len | LEB128 varint, at most u32 |
+| seq delta | LEB128 varint of zigzag(`seq − base_seq`), wrapping u64 arithmetic |
+| hlc delta | LEB128 varint of zigzag(`(version >> 64) − (base_version >> 64)`), wrapping u64 arithmetic |
+| writer | u64, the low 64 bits of `version`; absent when tag bit `0x40` is set, which means they equal `base_version`'s low 64 bits |
+| epoch tag | u32: the low 32 bits of SplitMix64's finalizer applied to `epoch + 0x9E3779B97F4A7C15` |
+| crc32c | u32 over the header bytes before it, then `version` (16 bytes), then key and value |
+
+zigzag maps a signed delta `d` to `(d << 1) ^ (d >> 63)` (arithmetic shift), so
+small steps either way encode in few bytes. A varint longer than 10 bytes, or a
+length above u32, is not a record.
+
+`base_seq` and `base_version` are in the segment header: they are the seq and
+version of the segment's first record, so that record encodes zero deltas.
+In the N2 bootes replay, the tail segments are written by one writer, keys are
+~115 bytes, values 130–140 bytes, and a 1 MiB segment holds a few thousand
+records. A record header there is 18 bytes (tag 1, lengths 1 + 2, seq 2,
+hlc 4, epoch tag 4, crc 4) instead of 50. Measured on that replay to 4.5B, value-log
+bytes per write fell 11% (295 → 262), device bytes per write 6–7%, and ingest took 4.7% less time (0565).
+
+The checksum covers the decoded `version`, not its delta bytes. Replay decodes
+the version from the segment header and checks the CRC against it. A value
+read through a memtable or run pointer checks the CRC against the version that
+the pointer's index entry holds. If the CRC matches, the bytes are intact and the
+record carries exactly that version. If it does not, the read cannot tell
+corruption from a pointer to another version of the record, and reports
+`record crc or version mismatch` (counted with the `crc` kind) unless the key
+differs too (`record key mismatch`). Value reads of format-2 records return no
+seq or epoch, since those are relative to the segment header.
+
+**Format 1** is `[50-byte header][key][value]`:
 
 | Offset | Field | Type |
 |---|---|---|
@@ -427,8 +470,10 @@ log record is dead. Releases before 0452 fail open on kind `2` (0450 hardening) 
 before 0450, stop replay at it silently, which is why an engine commits a v6 run
 before its first range delete (range-deletes.md §1 "Downgrade fence").
 
-The **CRC covers `header[0..46]` + key + value**: every byte except the CRC field
-itself. On recovery, the winner for a key is the greatest `version` across all
+In format 1 the **CRC covers `header[0..46]` + key + value**: every byte except
+the CRC field itself.
+
+The rest of this section applies to both formats. On recovery, the winner for a key is the greatest `version` across all
 replayed segments, with `seq` only breaking an equal-version tie; replay order is
 not authoritative. A winner with `seq <= covered_seq` does not enter the memtable
 even when its segment is replayed (`epoch >= covered_epoch`): it is in a run or
@@ -466,12 +511,22 @@ caller-selected node ID and left bits 32..63 zero; they decode unchanged, while 
 CSPRNG writer-incarnation identities reject that u32 range and occupy the full low
 64-bit field.
 
-The `epoch` field is what binds a record to its segment *incarnation* (v2 format
-change): freeing a segment wipes only its header block, so a reused segment still
-holds CRC-valid records of the prior generation past the new data's end. Replay
-accepts a record only when its epoch equals the segment header's, so that stale
-chain can never be walked into — even when the new data ends exactly at a block
-boundary and a prior-generation record starts right there.
+The epoch binds a record to its segment *incarnation*: freeing a segment wipes
+only its header block, so a reused segment still holds CRC-valid records of the
+prior generation past the new data's end. Replay must not walk into that stale
+chain, even when the new data ends exactly at a block boundary and a
+prior-generation record starts right there, and even though its forward search
+(§2.2) tries every byte offset up to the segment's end. A format-1 record
+carries its full epoch, and replay accepts it only when it equals the segment
+header's. A format-2 record carries a 32-bit epoch tag instead, and replay
+accepts it only when the tag matches the header's epoch *and* the CRC verifies
+against the version decoded from this incarnation's `base_version`. A stale
+record passes the first check only if the two incarnations' epoch tags
+collide (2^-32 for a pair of epochs), and then the second only if both
+incarnations have the same base version or its CRC collides (2^-32 per
+candidate). Folding the epoch into the CRC alone would leave the forward
+search, with tens of thousands of candidate offsets in a stale 1 MiB segment,
+about one false record per 10^5 replays of such a tail.
 
 That binding holds only while no segment is opened twice under the same epoch.
 A crash can lose the header block of a segment opened since the last device
@@ -512,30 +567,39 @@ sequence and counts its tail from the truncation point.
 
 ### 2.2 Segment header
 
-Each segment begins with a 22-byte header, then packed records, then zero padding
-(`vlog.rs`):
+Each segment begins with a header (50 bytes in format 2, 22 in format 1), then
+packed records, then zero padding (`vlog.rs`):
 
 | Offset | Field | Type |
 |---|---|---|
 | `0..4` | magic `SEG_MAGIC` (`VSG1`) | u32 |
-| `4..6` | format version (`FORMAT_VERSION = 1`) plus `0x8000` `not_tail` flag | u16 |
+| `4..6` | format (`2`, or `1`) plus `0x8000` `not_tail` flag | u16 |
 | `6..14` | epoch (segment write generation) | u64 |
 | `14..18` | block_size | u32 |
 | `18..22` | crc32c (over `[0..18]`) | u32 |
+| `22..30` | format 2 only: `base_seq`, the seq of the segment's first record | u64 |
+| `30..46` | format 2 only: `base_version`, the version of the segment's first record | u128 |
+| `46..50` | format 2 only: crc32c (over `[0..46]`) | u32 |
 
-The decoder removes the `not_tail` flag before checking `FORMAT_VERSION`. A
-CRC-valid header with an unrecognized version fails `Engine::open` and `valsd dump`
+Format 2 keeps format 1's first 22 bytes and their CRC. A release that knows
+only format 1 therefore sees a CRC-valid header with an unknown format. The
+decoder removes the `not_tail` flag before checking the format. A CRC-valid
+header with an unrecognized format fails `Engine::open` and `valsd dump`
 (`LogError::Unsupported`) instead of being treated as free space, so a downgraded
-binary refuses a log written by a newer release (0450). The format version governs the **record**
-codec for the whole segment, so §2.1 has no separate record-format field (its
-`version` field is the data's LWW version). Co-compaction output marks `not_tail`
+binary refuses a log written by a newer release (0450). The format governs the
+**record** codec for the whole segment, so a format-1 record has no format field
+(its `version` field is the data's LWW version). A segment keeps the format it
+was opened with until it is full, even if `VALS_VLOG_WRITE_VERSION` names
+another. Co-compaction output marks `not_tail`
 and recovery does not replay those segments into the mutable index; their values
 remain reachable through run pointers.
 
 Replay walks records from the segment header. At a position that does not hold a
-valid record of the segment's epoch (a non-`VAL2` magic, a short or CRC-failing
-record, or a prior-incarnation leftover), it searches forward byte by byte for
-the next CRC-valid record of the segment's epoch. If there is none, the position
+valid record of the segment's epoch (in format 1 a non-`VAL2` magic, in format 2
+a first byte without bit `0x80`; a short or CRC-failing record; or a
+prior-incarnation leftover), it searches forward byte by byte for the next
+CRC-valid record of the segment's epoch. In format 2 the search compares the
+epoch tag before it computes a CRC. If there is none, the position
 is the live tail (a torn tail or the end of the data) and replay stops there
 silently, as before 0528. If there is one, the bytes in between are damaged
 inside the log, because an append-only segment only tears at its end. Replay

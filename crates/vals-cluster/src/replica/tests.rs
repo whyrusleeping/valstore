@@ -1317,13 +1317,13 @@
                             let run = vals_store::resolve_run_probe(&key, &probes, &*dev)
                                 .await
                                 .unwrap();
-                            let ptr = match (mutable, run) {
-                                (Some(mem), Some(cold)) if cold.version > mem.version => cold.ptr,
-                                (Some(mem), _) => mem.ptr,
-                                (None, Some(cold)) => cold.ptr,
+                            let (ptr, version) = match (mutable, run) {
+                                (Some(mem), Some(cold)) if cold.version > mem.version => (cold.ptr, cold.version),
+                                (Some(mem), _) => (mem.ptr, mem.version),
+                                (None, Some(cold)) => (cold.ptr, cold.version),
                                 (None, None) => return None,
                             };
-                            Some(s.plan_get_ptr(&ptr).unwrap())
+                            Some(s.plan_get_ptr(&ptr, version).unwrap())
                         }
                     };
                     match plan {
@@ -2133,8 +2133,10 @@
         dev: &MemBlockDevice,
     ) -> Vec<(Vec<u8>, Stored)> {
         let mut blobs: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
+        let packed: Vec<u128> = keys.iter().map(|(_, v)| crate::replica::codec::pack_version(*v)).collect();
+        let expected = |slot: usize| (keys[slot].0.as_slice(), packed[slot]);
         for i in 0..plan.num_spans() {
-            let recs = vals_rt::block_on(plan.execute_span(i, dev), || {}).unwrap();
+            let recs = vals_rt::block_on(plan.execute_span_checked(i, dev, &expected), || {}).unwrap();
             for (slot, rec) in recs {
                 blobs[slot] = Some(rec.value);
             }
@@ -2850,7 +2852,7 @@
         for i in 0..6u64 {
             s.apply_at(
                 format!("k{i}").as_bytes(),
-                Some(&vec![1; 850]),
+                Some(&vec![1; 930]),
                 vp(100 + i, 1),
                 100 + i,
             )

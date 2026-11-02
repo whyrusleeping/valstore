@@ -670,7 +670,7 @@ use super::*;
     }
 
     fn fill_dirty_multi_segment(e: &mut Engine<MemBlockDevice>) {
-        for round in 0..20u32 {
+        for round in 0..60u32 {
             for k in ["hot0", "hot1", "hot2", "hot3"] {
                 e.put(k.as_bytes(), format!("val-{round}").as_bytes(), 0)
                     .unwrap();
@@ -828,7 +828,7 @@ use super::*;
                         if cover.is_some_and(|c| version <= c) {
                             return None;
                         }
-                        Some(e.plan_get_ptr(&ptr).unwrap())
+                        Some(e.plan_get_ptr(&ptr, version).unwrap())
                     }
                 };
                 match plan {

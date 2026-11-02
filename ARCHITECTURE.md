@@ -620,11 +620,15 @@ segment / superblock byte layouts are in [`docs/formats.md`](docs/formats.md)):
 
 - **Value log** — append-only segments of raw blocks; each record is
   `header | key | value` with a **CRC-32C** (hardware SSE4.2, scalar fallback).
-  Each record carries (CRC'd) the **epoch of its segment incarnation**, and replay
-  rejects a record whose epoch differs from the segment header's — so a reused
-  segment's leftover prior-generation records (freeing wipes only the header
-  block) can never be resurrected, even when new data ends exactly at a block
-  boundary. Group commit batches the durability barrier; the header is built on
+  Format-2 headers (0565) encode the seq and version as deltas from the segment's
+  first record (kept in the segment header) and are ~18 bytes for an ingest
+  record, against format 1's 50; the CRC covers the decoded version, so a value
+  read verifies it against the index entry's version without the segment
+  header. Each record carries (CRC'd) its **segment incarnation's epoch** (format
+  1 in full, format 2 as a 32-bit tag), and replay rejects a record whose epoch
+  differs from the segment header's — so a reused segment's leftover
+  prior-generation records (freeing wipes only the header block) can never be
+  resurrected, even when new data ends exactly at a block boundary. Group commit batches the durability barrier; the header is built on
   the stack and the value is checksummed + streamed to the device without a
   per-record copy. **Writes are pipelined** (queue depth > 1): full blocks submit
   asynchronously and are drained at `sync`, so the write path isn't QD1-bound.

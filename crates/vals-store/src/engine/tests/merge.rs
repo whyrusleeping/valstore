@@ -3097,7 +3097,7 @@ fn gc_rewrite_refuses_a_wrong_record_pointer_unpublished_and_excludes_the_segmen
     let ptr = |e: &Engine<MemBlockDevice>, k: &[u8]| {
         e.plan_get(k).unwrap().unwrap().ptr()
     };
-    for (case, reason) in [("key", "record key mismatch"), ("version", "record version mismatch")] {
+    for (case, reason) in [("key", "record key mismatch"), ("version", "record crc or version mismatch")] {
         let mut e = Engine::create_prewiped(MemBlockDevice::new(BS, 8192), cfg);
         for k in 0..40u32 {
             e.put(&key(k), format!("r0-{k:03}").as_bytes(), 1).unwrap();
@@ -3151,5 +3151,46 @@ fn gc_rewrite_refuses_a_wrong_record_pointer_unpublished_and_excludes_the_segmen
             let round = if k < 40 { 0 } else { 1 };
             assert_eq!(e.get(&key(k)).unwrap(), Some(format!("r{round}-{k:03}").into_bytes()), "{case} {k}");
         }
+    }
+}
+
+#[test]
+fn a_value_rewrite_that_outgrows_its_reservation_leaves_the_rest_in_place() {
+    if co_compact_env(true) { return; }
+    std::env::set_var("VALS_MERGE_TIER_MIN_K", "2");
+    let cfg = Config { seg_blocks: 4, reserved_blocks: 0, ordering: Ordering::Sorted };
+    let opts = RunBuildOpts { num_buckets: 16, ..Default::default() };
+    let dev = MemBlockDevice::new(BS, 8192);
+    let mut e = Engine::create_prewiped(dev.share(), cfg);
+    let key = |k: u32| format!("key-{k:03}").into_bytes();
+    let value = |r: u32, k: u32| format!("r{r}-{k:03}-{}", "v".repeat(24)).into_bytes();
+    for r in 0..2u32 {
+        for k in 0..40u32 {
+            e.put(&key(k), &value(r, k), 1 + r as u128).unwrap();
+        }
+        run_flush(&mut e, opts).unwrap();
+    }
+    let before: Vec<ValuePtr> = (0..40u32).map(|k| e.plan_get(&key(k)).unwrap().unwrap().ptr()).collect();
+    let mut plan = e.compact_plan(opts, None).unwrap().unwrap();
+    assert!(matches!(plan.vlog_rewrite, VlogRewrite::All));
+    assert!(plan.vlog_segs.len() > 1, "test premise: the rewrite reserves several segments");
+    for seg in plan.truncate_vlog_reservation_for_test(1) {
+        e.alloc.free(seg).unwrap();
+    }
+    let wdev = Arc::new(e.device().sibling().unwrap());
+    let written = vals_rt::block_on(compact_and_write(plan, wdev), || {})
+        .unwrap_or_else(|(_, err)| panic!("a full rewrite reservation must not fail the merge: {err}"));
+    e.compact_commit(written).unwrap();
+    let after: Vec<ValuePtr> = (0..40u32).map(|k| e.plan_get(&key(k)).unwrap().unwrap().ptr()).collect();
+    let moved = before.iter().zip(&after).filter(|(b, a)| b != a).count();
+    assert!(moved > 0 && moved < 40, "some values moved into the one reserved segment, the rest stayed ({moved})");
+    for k in 0..40u32 {
+        assert_eq!(e.get(&key(k)).unwrap(), Some(value(1, k)), "{k}");
+    }
+    e.sync().unwrap();
+    drop(e);
+    let e = Engine::open(dev, cfg).unwrap();
+    for k in 0..40u32 {
+        assert_eq!(e.get(&key(k)).unwrap(), Some(value(1, k)), "reopened {k}");
     }
 }

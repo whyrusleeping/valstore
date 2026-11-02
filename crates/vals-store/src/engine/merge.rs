@@ -256,6 +256,13 @@ pub struct CompactPlan<D: BlockDevice> {
 }
 
 impl<D: BlockDevice> CompactPlan<D> {
+    #[cfg(test)]
+    pub(super) fn truncate_vlog_reservation_for_test(&mut self, keep: usize) -> Vec<SegmentId> {
+        self.vlog_seg_lbas.truncate(keep);
+        self.vlog_epochs.truncate(keep);
+        self.vlog_segs.split_off(keep)
+    }
+
     fn new(
         dev: Arc<D>,
         alloc: &Allocator,
@@ -1054,7 +1061,7 @@ fn rewrite_chunk_values<D: BlockDevice>(
         })
         .map(|(i, _)| i)
         .collect();
-    if rewrite.is_empty() {
+    if rewrite.is_empty() || writer.is_full() {
         return Ok(());
     }
     let mut items: Vec<(u64, ValuePtr)> = Vec::with_capacity(rewrite.len());
@@ -1094,16 +1101,25 @@ fn rewrite_chunk_values<D: BlockDevice>(
     };
     for (&i, rec) in rewrite.iter().zip(records) {
         let e = &mut chunk[i];
-        let new_ptr = writer
-            .append(
-                RecordKind::Put,
-                e.tombstone,
-                e.seq,
-                e.version,
-                &e.key,
-                &rec.value,
-            )
-            .map_err(EngineError::from)?;
+        let new_ptr = match writer.append(
+            RecordKind::Put,
+            e.tombstone,
+            e.seq,
+            e.version,
+            &e.key,
+            &rec.value,
+        ) {
+            Ok(Some(ptr)) => ptr,
+            Ok(None) => {
+                log::warn!(
+                    "merge value rewrite filled its {} reserved segments; the remaining values stay where they are",
+                    writer.reserved_segments()
+                );
+                break;
+            }
+            Err(LogError::RecordTooLarge { .. }) => continue,
+            Err(err) => return Err(EngineError::from(err)),
+        };
         *bytes_rewritten += new_ptr.len as u64;
         e.ptr = new_ptr;
     }

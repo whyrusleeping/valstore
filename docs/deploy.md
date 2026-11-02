@@ -662,6 +662,12 @@ What matters operationally:
   rebuild the node from its peers. The same holds for the zone superblock and
   for PD Raft state: do not run an older PD against a directory a newer PD has
   written to.
+- **Value log.** New value-log segments are written in format 2 (compact
+  record headers, 0565). The engine also reads format 1, and a store can hold
+  segments of both. A binary that predates format 2 refuses to open a store
+  holding a format-2 segment (`unsupported segment format version`).
+  `VALS_VLOG_WRITE_VERSION=1`, set before the upgrade, keeps a node writing
+  format 1 as a rollback aid; `vals_vlog_write_version` shows the active value.
 - **`VALS_RUN_WRITE_VERSION`** (read once at startup; `vals_run_write_version`
   shows the active value) can keep a node writing the older v5 (`5`) or v4
   (`4`) run formats as a rollback aid. Leave it unset. While runs are written

@@ -155,7 +155,7 @@ pub(super) async fn build_get_plan<D: BlockDevice + AsyncRead>(
         return Ok(GetPlan::Covered(cover));
     }
     Ok(GetPlan::Found(
-        s.plan_get_ptr(&ptr)?,
+        s.plan_get_ptr(&ptr, version)?,
         generation,
         mutable,
         None,

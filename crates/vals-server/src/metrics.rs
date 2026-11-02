@@ -299,6 +299,10 @@ fn render() -> String {
         vals_store::run::run_write_version()
     ));
     out.push_str(&format!(
+        "# HELP vals_vlog_write_version Value-log format new segments are written in (1 = 50-byte record headers, 2 = compact headers; VALS_VLOG_WRITE_VERSION).\n# TYPE vals_vlog_write_version gauge\nvals_vlog_write_version {}\n",
+        vals_store::vlog::vlog_write_version()
+    ));
+    out.push_str(&format!(
         "# HELP vals_run_block_target_bytes Estimated encoded bytes at which new run data blocks close (VALS_RUN_BLOCK_TARGET_BYTES; existing runs keep their block size).\n# TYPE vals_run_block_target_bytes gauge\nvals_run_block_target_bytes {}\n# HELP vals_run_bloom_bits_per_key Bloom bits per entry for new runs (VALS_RUN_BLOOM_BITS_PER_KEY).\n# TYPE vals_run_bloom_bits_per_key gauge\nvals_run_bloom_bits_per_key {}\n",
         vals_store::run::run_block_target_bytes(),
         vals_store::run::run_bloom_bits_per_key()
@@ -495,6 +499,7 @@ mod tests {
         assert!(reply.contains("# TYPE vals_run_build_verify_bytes_total counter"), "{reply}");
         assert!(reply.contains("\nvals_run_build_verify_failures_total "), "{reply}");
         assert!(reply.contains("\nvals_run_write_version 6\n"), "{reply}");
+        assert!(reply.contains("\nvals_vlog_write_version 2\n"), "{reply}");
         assert!(reply.contains("\nvals_run_block_target_bytes 32768\n"), "{reply}");
         assert!(reply.contains("\nvals_run_bloom_bits_per_key 10\n"), "{reply}");
         for kind in vals_store::vlog::CORRUPT_READ_KINDS {

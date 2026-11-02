@@ -773,7 +773,7 @@ impl<D: BlockDevice> Engine<D> {
         token: WinnerReadToken,
     ) -> Result<crate::vlog::ReadPlan, EngineError> {
         let seg_start = self.value_start(&token.entry.ptr)?;
-        Ok(self.log.plan_read(&self.dev, seg_start, &token.entry.ptr)?)
+        Ok(self.log.plan_read(&self.dev, seg_start, &token.entry.ptr, token.entry.version)?)
     }
 
     pub fn winner_directory_len(&self) -> u64 {

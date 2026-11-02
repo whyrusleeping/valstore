@@ -168,7 +168,7 @@ fn compact_reclaims_dead_records_and_survives_reopen() {
     {
         let dev = FileBlockDevice::create(&path, BS, 1024).unwrap();
         let mut e = Engine::open(dev, cfg).unwrap();
-        for i in 0..40u32 {
+        for i in 0..120u32 {
             e.put(b"hot", format!("v{i}").as_bytes(), 0).unwrap();
         }
         for k in ["a", "b", "c"] {
@@ -181,7 +181,7 @@ fn compact_reclaims_dead_records_and_survives_reopen() {
         used_before = e.used_segments();
         stats = e.compact().unwrap();
 
-        assert_eq!(e.get(b"hot").unwrap().as_deref(), Some(&b"v39"[..]));
+        assert_eq!(e.get(b"hot").unwrap().as_deref(), Some(&b"v119"[..]));
         assert_eq!(e.get(b"a").unwrap().as_deref(), Some(&b"keep"[..]));
         assert_eq!(e.get(b"victim").unwrap(), None);
         assert_eq!(e.len(), 4);
@@ -204,7 +204,7 @@ fn compact_reclaims_dead_records_and_survives_reopen() {
 
     let dev = FileBlockDevice::open(&path, BS).unwrap();
     let e = Engine::open(dev, cfg).unwrap();
-    assert_eq!(e.get(b"hot").unwrap().as_deref(), Some(&b"v39"[..]));
+    assert_eq!(e.get(b"hot").unwrap().as_deref(), Some(&b"v119"[..]));
     assert_eq!(e.get(b"a").unwrap().as_deref(), Some(&b"keep"[..]));
     assert_eq!(e.get(b"victim").unwrap(), None);
     assert_eq!(e.get(b"after").unwrap().as_deref(), Some(&b"z"[..]));
@@ -2785,7 +2785,7 @@ fn cached_one_run_victim_needs_match_uncached_reference() {
     for key in 0..25u32 {
         e.put(format!("live{key:02}").as_bytes(), &[b'l'; 90], 1).unwrap();
     }
-    for version in 1..8 {
+    for version in 1..11 {
         e.put(b"hot", &[b'h'; 90], version).unwrap();
     }
     run_flush(&mut e, opts).unwrap();

@@ -30,6 +30,14 @@ fn write_seg(dev: &MemBlockDevice, seg: SegmentId, buf: &[u8]) {
 }
 
 fn tail_engine(flush: bool) -> MemBlockDevice {
+    tail_engine_in(crate::vlog::FORMAT_VERSION, flush)
+}
+
+fn tail_engine_in(format: u16, flush: bool) -> MemBlockDevice {
+    crate::vlog::with_vlog_write_version(format, || tail_engine_writes(flush))
+}
+
+fn tail_engine_writes(flush: bool) -> MemBlockDevice {
     let dev = MemBlockDevice::new(BS, FENCE_BLOCKS);
     let mut e = Engine::create(dev.share(), fence_cfg()).unwrap();
     for i in 0..4u32 {
@@ -49,22 +57,11 @@ fn first_tail_segment(dev: &MemBlockDevice) -> SegmentId {
     segs.iter().find(|(_, _, not_tail)| !*not_tail).expect("a tail segment").0
 }
 
-fn reseal_record(buf: &mut [u8], off: usize, edit: impl FnOnce(&mut [u8])) {
-    let key_len = u32::from_le_bytes(buf[off + 6..off + 10].try_into().unwrap()) as usize;
-    let val_len = u32::from_le_bytes(buf[off + 10..off + 14].try_into().unwrap()) as usize;
-    let rec = &mut buf[off..off + HEADER_LEN + key_len + val_len];
-    edit(rec);
-    let mut c = crate::crc::Crc32::new();
-    c.update(&rec[..HEADER_LEN - 4]);
-    c.update(&rec[HEADER_LEN..]);
-    let crc = c.finalize();
-    rec[HEADER_LEN - 4..HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
-}
-
-fn second_record_offset(buf: &[u8]) -> usize {
-    let (_, recs) = replay_segment(buf).unwrap();
+fn second_record(buf: &[u8]) -> (crate::vlog::SegHeader, std::ops::Range<usize>) {
+    let (hdr, recs) = crate::vlog::replay_segment_extents(buf).unwrap();
     assert!(recs.len() >= 2, "test premise: the tail segment holds at least two records");
-    recs[1].0 as usize
+    let (off, len, _) = recs[1];
+    (hdr, off as usize..(off + len) as usize)
 }
 
 fn open_err(dev: &MemBlockDevice) -> EngineError {
@@ -90,42 +87,51 @@ fn open_refuses_intact_segment_header_of_unknown_format_version() {
     assert!(scan.is_err(), "value-log dumps must report the newer segment, not skip it");
 }
 
+const FORMATS: [u16; 2] = [crate::vlog::SEG_FORMAT_V1, crate::vlog::SEG_FORMAT_V2];
+
 #[test]
 fn open_refuses_intact_tail_record_of_unknown_kind() {
-    let dev = tail_engine(false);
-    let seg = first_tail_segment(&dev);
-    let mut buf = read_seg(&dev, seg);
-    let off = second_record_offset(&buf);
-    reseal_record(&mut buf, off, |rec| rec[4] = 3);
-    write_seg(&dev, seg, &buf);
+    for format in FORMATS {
+        let dev = tail_engine_in(format, false);
+        let seg = first_tail_segment(&dev);
+        let mut buf = read_seg(&dev, seg);
+        let (hdr, rec) = second_record(&buf);
+        assert_eq!(hdr.format, format);
+        crate::vlog::forge::set_kind(&mut buf[rec.clone()], 3);
+        crate::vlog::forge::reseal(&mut buf[rec], &hdr);
+        write_seg(&dev, seg, &buf);
 
-    let err = open_err(&dev);
-    assert!(matches!(err, EngineError::Log(LogError::Unsupported("record kind"))), "{err}");
-    let scan = crate::scan_vlog_records(&dev, &fence_cfg(), |_| Ok::<(), ()>(()));
-    assert!(scan.is_err(), "value-log dumps must report the unknown record kind, not stop silently");
+        let err = open_err(&dev);
+        assert!(matches!(err, EngineError::Log(LogError::Unsupported("record kind"))), "format {format}: {err}");
+        let scan = crate::scan_vlog_records(&dev, &fence_cfg(), |_| Ok::<(), ()>(()));
+        assert!(scan.is_err(), "format {format}: value-log dumps must report the unknown record kind, not stop silently");
+    }
 }
 
 #[test]
 fn torn_or_stale_unknown_kind_record_still_ends_replay_silently() {
-    for stale in [false, true] {
-        let dev = tail_engine(false);
-        let seg = first_tail_segment(&dev);
-        let mut buf = read_seg(&dev, seg);
-        let off = second_record_offset(&buf);
-        if stale {
-            reseal_record(&mut buf, off, |rec| {
-                rec[4] = 3;
-                let epoch = u64::from_le_bytes(rec[22..30].try_into().unwrap());
-                rec[22..30].copy_from_slice(&(epoch + 1).to_le_bytes());
-            });
-        } else {
-            buf[off + 4] = 3;
-        }
-        write_seg(&dev, seg, &buf);
+    for format in FORMATS {
+        for stale in [false, true] {
+            let dev = tail_engine_in(format, false);
+            let seg = first_tail_segment(&dev);
+            let mut buf = read_seg(&dev, seg);
+            let (hdr, rec) = second_record(&buf);
+            crate::vlog::forge::set_kind(&mut buf[rec.clone()], 3);
+            if stale {
+                let epoch = crate::vlog::forge::epoch(&buf[rec.clone()], &hdr);
+                crate::vlog::forge::set_epoch(&mut buf[rec.clone()], epoch + 1);
+                crate::vlog::forge::reseal(&mut buf[rec], &hdr);
+            }
+            write_seg(&dev, seg, &buf);
 
-        let e = Engine::open(dev.share(), fence_cfg()).unwrap();
-        assert_eq!(e.get(b"k0").unwrap().as_deref(), Some(&b"v"[..]), "stale={stale}");
-        assert_eq!(e.get(b"k1").unwrap(), None, "stale={stale}: replay ends at the unreadable record");
+            let e = Engine::open(dev.share(), fence_cfg()).unwrap();
+            assert_eq!(e.get(b"k0").unwrap().as_deref(), Some(&b"v"[..]), "format {format} stale={stale}");
+            assert_eq!(
+                e.get(b"k1").unwrap(),
+                None,
+                "format {format} stale={stale}: replay ends at the unreadable record"
+            );
+        }
     }
 }
 
@@ -278,6 +284,9 @@ fn lost_manifest_with_rewrite_segments_fails_open_and_rebuild_replays_them() {
     for r in 0..10u32 {
         for k in 0..40u32 {
             e.put(format!("key-{k:03}").as_bytes(), value(r, k).as_bytes(), 1 + r as u128 * 1000 + k as u128).unwrap();
+            if k % 8 == 0 {
+                e.put(format!("cold-{r:02}-{k:03}").as_bytes(), value(r, k).as_bytes(), 1).unwrap();
+            }
         }
     }
     run_flush(&mut e, opts);
@@ -315,6 +324,12 @@ fn lost_manifest_with_rewrite_segments_fails_open_and_rebuild_replays_them() {
             Some(value(9, k).as_bytes()),
             "key-{k:03}"
         );
+    }
+    for r in 0..10u32 {
+        for k in (0..40u32).step_by(8) {
+            let cold = format!("cold-{r:02}-{k:03}");
+            assert_eq!(e.get(cold.as_bytes()).unwrap().as_deref(), Some(value(r, k).as_bytes()), "{cold}");
+        }
     }
 }
 
@@ -402,4 +417,57 @@ fn legacy_manifest_without_value_segments_opens_with_log_segments() {
     for key in ["k0", "k1", "k2", "k3", "late", "after"] {
         assert_eq!(e.get(key.as_bytes()).unwrap().as_deref(), Some(&b"v"[..]), "{key}");
     }
+}
+
+#[test]
+fn a_format_1_store_opens_under_format_2_and_keeps_reading_both() {
+    let dev = MemBlockDevice::new(BS, FENCE_BLOCKS);
+    let old = |i: u32| (format!("old-{i:02}"), format!("v1-{i}"));
+    crate::vlog::with_vlog_write_version(crate::vlog::SEG_FORMAT_V1, || {
+        let mut e = Engine::create(dev.share(), fence_cfg()).unwrap();
+        for i in 0..40u32 {
+            let (k, v) = old(i);
+            e.put(k.as_bytes(), v.as_bytes(), 10 + i as u128).unwrap();
+            if i == 29 {
+                e.flush(RunBuildOpts::default()).unwrap();
+            }
+        }
+        e.sync().unwrap();
+    });
+    let check = |e: &Engine<MemBlockDevice>, overwritten: bool| {
+        for i in 0..40u32 {
+            let (k, v) = old(i);
+            let want = if overwritten && i == 35 { "v2-35".to_string() } else { v };
+            assert_eq!(e.get(k.as_bytes()).unwrap().as_deref(), Some(want.as_bytes()), "{k}");
+        }
+    };
+    let mut e = Engine::open(dev.share(), fence_cfg()).unwrap();
+    check(&e, false);
+    for i in 0..20u32 {
+        e.put(format!("new-{i:02}").as_bytes(), b"v2", 100 + i as u128).unwrap();
+    }
+    e.put(b"old-35", b"v2-35", 1000).unwrap();
+    e.sync().unwrap();
+    drop(e);
+
+    let mut formats: Vec<u16> = crate::dump::scan_log_segments(&dev, &fence_alloc(), BS)
+        .unwrap()
+        .iter()
+        .map(|(seg, _, _)| crate::vlog::decode_seg_header(&read_seg(&dev, *seg)).unwrap().format)
+        .collect();
+    formats.dedup();
+    assert_eq!(formats.first(), Some(&crate::vlog::SEG_FORMAT_V1), "{formats:?}");
+    assert_eq!(formats.last(), Some(&crate::vlog::SEG_FORMAT_V2), "{formats:?}");
+
+    let mut e = Engine::open(dev.share(), fence_cfg()).unwrap();
+    check(&e, true);
+    for i in 0..20u32 {
+        assert_eq!(e.get(format!("new-{i:02}").as_bytes()).unwrap().as_deref(), Some(&b"v2"[..]));
+    }
+    e.flush(RunBuildOpts::default()).unwrap();
+    e.sync().unwrap();
+    drop(e);
+    let e = Engine::open(dev.share(), fence_cfg()).unwrap();
+    check(&e, true);
+    assert_eq!(e.get(b"new-19").unwrap().as_deref(), Some(&b"v2"[..]));
 }

@@ -32,7 +32,10 @@ impl<D: BlockDevice> Engine<D> {
                 let within = ptr.offset as usize % bs;
                 let mut buf = vec![0u8; (within + ptr.len as usize).div_ceil(bs) * bs];
                 self.dev.read_at(seg_start + first as u64, &mut buf)?;
-                crate::vlog::decode_record(&buf[within..within + ptr.len as usize])
+                let mut head = vec![0u8; bs];
+                self.dev.read_at(seg_start, &mut head)?;
+                let seg = crate::vlog::decode_seg_header(&head)?;
+                crate::vlog::decode_record(&buf[within..within + ptr.len as usize], &seg)
             })();
             KeyVersion { run, handle, entry, record }
         }).collect())

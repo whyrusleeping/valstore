@@ -536,7 +536,7 @@ fn concurrent_in_place_forced_windows_never_corrupt_merge_outputs() {
             engines,
             ops: 20_000,
             keys: if bulky { 4_000 } else { 1_500 },
-            region_blocks: if bulky { 12_288 } else { 6_144 },
+            region_blocks: if bulky { 12_288 } else { 5_120 },
             seg_blocks: 16,
             deferred,
             compact_lanes: 2,

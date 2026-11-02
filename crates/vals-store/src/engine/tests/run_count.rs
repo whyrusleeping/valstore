@@ -221,7 +221,7 @@ fn staged_read(e: &Engine<MemBlockDevice>, key: &[u8]) -> (Option<Vec<u8>>, u64)
             let entry = run.map(|r| IndexEntry { ptr: r.ptr, version: r.version, seq: r.seq, tombstone: r.tombstone });
             let best = entry.into_iter().chain(mutable).max_by_key(|e| e.version);
             let value = best.map(|entry| {
-                let plan = e.plan_get_ptr(&entry.ptr).unwrap();
+                let plan = e.plan_get_ptr(&entry.ptr, entry.version).unwrap();
                 vals_rt::block_on(plan.execute(e.device()), || {}).unwrap().value
             });
             (value, blocks)

@@ -4,8 +4,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use vals_spdk::{BlockDevice, MemBlockDevice};
 use vals_store::alloc::{Allocator, SegmentId};
 use vals_store::vlog::{
-    decode_record, decode_record_value, decode_seg_header, replay_segment, Record, RecordKind,
-    ValueLog, HEADER_LEN, SEG_HEADER_LEN,
+    decode_record, decode_record_value, decode_seg_header, replay_segment, replay_segment_extents, Record,
+    RecordKind, SegHeader, ValueLog, SEG_FORMAT_V1, SEG_FORMAT_V2, SEG_HEADER_LEN,
 };
 
 const BS: usize = 256;
@@ -148,13 +148,26 @@ fn mutate(r: &mut Rng, base: &[u8]) -> Vec<u8> {
     b
 }
 
+fn seg_header(format: u16) -> SegHeader {
+    SegHeader {
+        epoch: 7,
+        block_size: BS as u32,
+        not_tail: false,
+        format,
+        base_seq: 1 << 40,
+        base_version: u128::MAX - 5,
+    }
+}
+
 fn assert_no_panic(label: &str, bytes: &[u8]) {
     let outcomes = [
         catch_unwind(AssertUnwindSafe(|| {
-            let _ = decode_record(bytes);
+            let _ = decode_record(bytes, &seg_header(SEG_FORMAT_V1));
+            let _ = decode_record(bytes, &seg_header(SEG_FORMAT_V2));
         })),
         catch_unwind(AssertUnwindSafe(|| {
-            let _ = decode_record_value(bytes);
+            let _ = decode_record_value(bytes, None, 0);
+            let _ = decode_record_value(bytes, Some(b"key"), u128::MAX);
         })),
         catch_unwind(AssertUnwindSafe(|| {
             let _ = decode_seg_header(bytes);
@@ -181,16 +194,18 @@ fn replay_roundtrips_over_random_batches() {
         let mut recovered: Vec<Record> = Vec::new();
         for seg in &segs {
             let buf = read_segment(&dev, &alloc, *seg);
-            let (hdr, recs) = replay_segment(&buf).expect("valid segment replays");
-            for (off, rec) in recs {
+            let (hdr, recs) = replay_segment_extents(&buf).expect("valid segment replays");
+            for (off, len, rec) in recs {
                 assert_eq!(
                     rec.epoch, hdr.epoch,
                     "replay must only return records matching the segment epoch (seed {seed})"
                 );
-                let off = off as usize;
-                let len = HEADER_LEN + rec.key.len() + rec.value.len();
-                let re = decode_record(&buf[off..off + len])
+                let (off, len) = (off as usize, len as usize);
+                let re = decode_record(&buf[off..off + len], &hdr)
                     .expect("recovered record re-decodes from its offset");
+                let value = decode_record_value(&buf[off..off + len], Some(&rec.key), rec.version)
+                    .expect("a value read with the record's own key and version validates");
+                assert_eq!(value.value, rec.value);
                 assert_eq!(re, rec, "re-decode mismatch at seed {seed}");
                 recovered.push(rec);
             }

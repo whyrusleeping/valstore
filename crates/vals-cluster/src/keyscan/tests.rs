@@ -127,7 +127,7 @@ fn keyscan_ptr_crc_error_and_json_escaping() {
     let lba = entry.ptr.segment.0 * 16 + entry.ptr.offset as u64 / 256;
     let mut bytes = vec![0; 256];
     shared.read_at(lba, &mut bytes).unwrap();
-    bytes[entry.ptr.offset as usize % 256 + vals_store::vlog::HEADER_LEN] ^= 1;
+    bytes[(entry.ptr.offset + entry.ptr.len) as usize % 256 - 1] ^= 1;
     shared.write_at(lba, &bytes).unwrap();
     let text = details(&engine, 0, key, &entry).unwrap();
     assert!(text.contains("crc mismatch"));

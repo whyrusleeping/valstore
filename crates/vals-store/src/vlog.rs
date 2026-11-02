@@ -59,16 +59,75 @@ pub(crate) fn io_buf(len: usize) -> Vec<u8> {
 const REC_MAGIC: u32 = 0x324C_4156;
 const SEG_MAGIC: u32 = 0x3147_5356;
 
-pub const FORMAT_VERSION: u16 = 1;
+/// The original value-log format: a 22-byte segment header and 50-byte
+/// record headers that carry the full epoch, seq and version.
+pub const SEG_FORMAT_V1: u16 = 1;
+/// The compact value-log format (0565): the segment header carries the seq
+/// and version of the segment's first record, and records encode theirs
+/// relative to it (formats.md §2.1).
+pub const SEG_FORMAT_V2: u16 = 2;
+pub const FORMAT_VERSION: u16 = SEG_FORMAT_V2;
 
+/// The format-1 record header length.
 pub const HEADER_LEN: usize = 50;
 const VERSION_OFF: usize = 30;
 const CRC_OFF: usize = 46;
 const KEY_OFF: usize = 50;
 
-pub const SEG_HEADER_LEN: usize = 22;
+/// The shortest record either format can hold.
+pub const MIN_RECORD_LEN: usize = 13;
+
+const SEG_HEADER_LEN_V1: usize = 22;
+/// The header length of the segments this build writes by default.
+pub const SEG_HEADER_LEN: usize = 50;
+
+const REC_V2: u8 = 0x80;
+const REC_V2_WRITER_SAME: u8 = 0x40;
+const REC_V2_TOMBSTONE: u8 = 0x20;
+const REC_V2_KIND: u8 = 0x1F;
 
 pub const FLAG_TOMBSTONE: u8 = 0x01;
+
+pub fn parse_vlog_write_version(raw: Option<&str>) -> u16 {
+    match raw.map(str::trim) {
+        None | Some("2") => SEG_FORMAT_V2,
+        Some("1") => SEG_FORMAT_V1,
+        Some(other) => {
+            log::error!("VALS_VLOG_WRITE_VERSION={other:?} is not 1 or 2; writing value-log format 1");
+            SEG_FORMAT_V1
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+thread_local! {
+    static VLOG_WRITE_VERSION_OVERRIDE: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn with_vlog_write_version<R>(version: u16, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<u16>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            VLOG_WRITE_VERSION_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(VLOG_WRITE_VERSION_OVERRIDE.with(|c| c.replace(Some(version))));
+    f()
+}
+
+/// The value-log format new segments are written in (`VALS_VLOG_WRITE_VERSION`,
+/// read once).
+pub fn vlog_write_version() -> u16 {
+    #[cfg(any(test, feature = "test-fixtures"))]
+    if let Some(v) = VLOG_WRITE_VERSION_OVERRIDE.with(|c| c.get()) {
+        return v;
+    }
+    static VALUE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_vlog_write_version(std::env::var("VALS_VLOG_WRITE_VERSION").ok().as_deref())
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordKind {
@@ -88,6 +147,11 @@ impl RecordKind {
     }
 }
 
+/// A decoded value-log record. Records from replay (`replay_segment`,
+/// `decode_record`) carry every field. Value reads leave `key` empty, and
+/// for format-2 records they also leave `seq` and `epoch` 0: those are
+/// encoded relative to the segment header, which a value read does not
+/// fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     pub seq: u64,
@@ -107,7 +171,7 @@ pub struct ValuePtr {
 }
 
 pub fn check_value_ptr(ptr: &ValuePtr, seg_bytes: u64) -> Result<(), LogError> {
-    if (ptr.len as usize) < HEADER_LEN || ptr.offset as u64 + ptr.len as u64 > seg_bytes {
+    if (ptr.len as usize) < MIN_RECORD_LEN || ptr.offset as u64 + ptr.len as u64 > seg_bytes {
         return Err(LogError::Corrupt("value pointer outside its segment"));
     }
     Ok(())
@@ -176,6 +240,217 @@ impl From<BlockError> for LogError {
     }
 }
 
+fn zigzag(delta: u64) -> u64 {
+    (delta << 1) ^ (((delta as i64) >> 63) as u64)
+}
+
+fn unzigzag(z: u64) -> u64 {
+    (z >> 1) ^ (z & 1).wrapping_neg()
+}
+
+fn varint_len(mut v: u64) -> usize {
+    let mut n = 1;
+    while v >= 0x80 {
+        v >>= 7;
+        n += 1;
+    }
+    n
+}
+
+fn put_varint(out: &mut [u8], at: &mut usize, mut v: u64) {
+    while v >= 0x80 {
+        out[*at] = v as u8 | 0x80;
+        *at += 1;
+        v >>= 7;
+    }
+    out[*at] = v as u8;
+    *at += 1;
+}
+
+fn get_varint(b: &[u8], at: &mut usize) -> Option<u64> {
+    let mut v: u64 = 0;
+    for i in 0..10 {
+        let byte = *b.get(*at)?;
+        *at += 1;
+        if i == 9 && byte > 1 {
+            return None;
+        }
+        v |= u64::from(byte & 0x7F) << (7 * i);
+        if byte & 0x80 == 0 {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn epoch_tag(epoch: u64) -> u32 {
+    let mut z = epoch.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (z ^ (z >> 31)) as u32
+}
+
+fn version_hi(version: u128) -> u64 {
+    (version >> 64) as u64
+}
+
+fn v2_crc(head: &[u8], version: u128, key: &[u8], value: &[u8]) -> u32 {
+    let mut c = Crc32::new();
+    c.update(head);
+    c.update(&version.to_le_bytes());
+    c.update(key);
+    c.update(value);
+    c.finalize()
+}
+
+/// What a segment's records are encoded against: its format, epoch, and the
+/// seq and version of its first record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecordBase {
+    format: u16,
+    epoch: u64,
+    seq: u64,
+    version: u128,
+}
+
+struct RecHeader {
+    buf: [u8; HEADER_LEN],
+    len: usize,
+}
+
+impl RecHeader {
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl RecordBase {
+    fn header_len(&self, seq: u64, version: u128, key_len: usize, val_len: usize) -> usize {
+        if self.format == SEG_FORMAT_V1 {
+            return HEADER_LEN;
+        }
+        let writer = if version as u64 == self.version as u64 { 0 } else { 8 };
+        1 + varint_len(key_len as u64)
+            + varint_len(val_len as u64)
+            + varint_len(zigzag(seq.wrapping_sub(self.seq)))
+            + varint_len(zigzag(version_hi(version).wrapping_sub(version_hi(self.version))))
+            + writer
+            + 8
+    }
+
+    fn record_len(&self, seq: u64, version: u128, key: &[u8], value: &[u8]) -> usize {
+        self.header_len(seq, version, key.len(), value.len()) + key.len() + value.len()
+    }
+
+    fn encode(
+        &self,
+        kind: RecordKind,
+        tombstone: bool,
+        seq: u64,
+        version: u128,
+        key: &[u8],
+        value: &[u8],
+    ) -> RecHeader {
+        if self.format == SEG_FORMAT_V1 {
+            let mut buf = encode_header(kind, tombstone, seq, self.epoch, version, key.len(), value.len());
+            let mut c = Crc32::new();
+            c.update(&buf[0..CRC_OFF]);
+            c.update(key);
+            c.update(value);
+            buf[CRC_OFF..KEY_OFF].copy_from_slice(&c.finalize().to_le_bytes());
+            return RecHeader { buf, len: HEADER_LEN };
+        }
+        let writer_same = version as u64 == self.version as u64;
+        let mut buf = [0u8; HEADER_LEN];
+        buf[0] = REC_V2
+            | kind as u8
+            | if writer_same { REC_V2_WRITER_SAME } else { 0 }
+            | if tombstone { REC_V2_TOMBSTONE } else { 0 };
+        let mut at = 1;
+        put_varint(&mut buf, &mut at, key.len() as u64);
+        put_varint(&mut buf, &mut at, value.len() as u64);
+        put_varint(&mut buf, &mut at, zigzag(seq.wrapping_sub(self.seq)));
+        put_varint(
+            &mut buf,
+            &mut at,
+            zigzag(version_hi(version).wrapping_sub(version_hi(self.version))),
+        );
+        if !writer_same {
+            buf[at..at + 8].copy_from_slice(&(version as u64).to_le_bytes());
+            at += 8;
+        }
+        buf[at..at + 4].copy_from_slice(&epoch_tag(self.epoch).to_le_bytes());
+        at += 4;
+        let crc = v2_crc(&buf[..at], version, key, value);
+        buf[at..at + 4].copy_from_slice(&crc.to_le_bytes());
+        RecHeader { buf, len: at + 4 }
+    }
+}
+
+struct V2Head {
+    tag: u8,
+    key_len: usize,
+    val_len: usize,
+    seq_delta: u64,
+    hi_delta: u64,
+    writer: Option<u64>,
+    epoch_tag: u32,
+    crc: u32,
+    len: usize,
+}
+
+impl V2Head {
+    fn parse(b: &[u8]) -> Option<V2Head> {
+        let tag = *b.first()?;
+        if tag & REC_V2 == 0 {
+            return None;
+        }
+        let mut at = 1;
+        let key_len = u32::try_from(get_varint(b, &mut at)?).ok()? as usize;
+        let val_len = u32::try_from(get_varint(b, &mut at)?).ok()? as usize;
+        let seq_delta = unzigzag(get_varint(b, &mut at)?);
+        let hi_delta = unzigzag(get_varint(b, &mut at)?);
+        let writer = if tag & REC_V2_WRITER_SAME != 0 {
+            None
+        } else {
+            let w = u64::from_le_bytes(b.get(at..at + 8)?.try_into().unwrap());
+            at += 8;
+            Some(w)
+        };
+        let epoch_tag = u32::from_le_bytes(b.get(at..at + 4)?.try_into().unwrap());
+        let crc = u32::from_le_bytes(b.get(at + 4..at + 8)?.try_into().unwrap());
+        Some(V2Head {
+            tag,
+            key_len,
+            val_len,
+            seq_delta,
+            hi_delta,
+            writer,
+            epoch_tag,
+            crc,
+            len: at + 8,
+        })
+    }
+
+    fn total(&self) -> usize {
+        self.len + self.key_len + self.val_len
+    }
+
+    fn version(&self, base: u128) -> u128 {
+        let hi = version_hi(base).wrapping_add(self.hi_delta);
+        let writer = self.writer.unwrap_or(base as u64);
+        (hi as u128) << 64 | writer as u128
+    }
+
+    fn crc_matches(&self, b: &[u8], version: u128) -> bool {
+        v2_crc(&b[..self.len - 4], version, &b[self.len..self.total()], &[]) == self.crc
+    }
+
+    fn tombstone(&self) -> bool {
+        self.tag & REC_V2_TOMBSTONE != 0
+    }
+}
+
 fn encode_header(
     kind: RecordKind,
     tombstone: bool,
@@ -225,7 +500,35 @@ fn validate_record(b: &[u8]) -> Result<(RecordKind, bool, usize, u64, u64, u128)
     Ok((kind, tombstone, key_len, seq, epoch, version))
 }
 
-pub fn decode_record(b: &[u8]) -> Result<Record, LogError> {
+fn is_v2_record(b: &[u8]) -> bool {
+    b.first().is_some_and(|t| t & REC_V2 != 0)
+}
+
+/// Fully decodes the record `b`, read from a segment with header `seg`.
+pub fn decode_record(b: &[u8], seg: &SegHeader) -> Result<Record, LogError> {
+    if is_v2_record(b) {
+        let h = V2Head::parse(b).ok_or(LogError::Corrupt("short header"))?;
+        if b.len() != h.total() {
+            return Err(LogError::Corrupt("length mismatch"));
+        }
+        let version = h.version(seg.base_version);
+        if !h.crc_matches(b, version) {
+            return Err(LogError::Corrupt("crc mismatch"));
+        }
+        if h.epoch_tag != epoch_tag(seg.epoch) {
+            return Err(LogError::Corrupt(EPOCH_MISMATCH));
+        }
+        let kind = RecordKind::from_u8(h.tag & REC_V2_KIND).ok_or(LogError::Corrupt(BAD_KIND))?;
+        return Ok(Record {
+            seq: seg.base_seq.wrapping_add(h.seq_delta),
+            epoch: seg.epoch,
+            kind,
+            tombstone: h.tombstone(),
+            key: b[h.len..h.len + h.key_len].to_vec(),
+            value: b[h.len + h.key_len..].to_vec(),
+            version,
+        });
+    }
     let (kind, tombstone, key_len, seq, epoch, version) = validate_record(b)?;
     let key = b[KEY_OFF..KEY_OFF + key_len].to_vec();
     let value = b[KEY_OFF + key_len..].to_vec();
@@ -241,8 +544,10 @@ pub fn decode_record(b: &[u8]) -> Result<Record, LogError> {
 }
 
 const BAD_KIND: &str = "bad kind";
+const EPOCH_MISMATCH: &str = "record epoch mismatch";
 const KEY_MISMATCH: &str = "record key mismatch";
 const VERSION_MISMATCH: &str = "record version mismatch";
+const CRC_OR_VERSION_MISMATCH: &str = "record crc or version mismatch";
 
 pub const CORRUPT_READ_KINDS: [&str; 7] = ["magic", "kind", "length", "crc", "key", "version", "other"];
 
@@ -251,56 +556,82 @@ pub fn corrupt_read_kind(reason: &str) -> &'static str {
         "bad magic" => "magic",
         BAD_KIND => "kind",
         "short header" | "length mismatch" => "length",
-        "crc mismatch" => "crc",
+        "crc mismatch" | CRC_OR_VERSION_MISMATCH => "crc",
         KEY_MISMATCH => "key",
         VERSION_MISMATCH => "version",
         _ => "other",
     }
 }
 
-fn check_identity(
+struct ValueRecord {
+    kind: RecordKind,
+    tombstone: bool,
+    value_off: usize,
+    seq: u64,
+    epoch: u64,
+}
+
+/// Validates a record read through a value pointer. A format-2 record's
+/// checksum covers its full version, so it validates only against the
+/// version the pointer's index entry expects.
+fn validate_value(
     b: &[u8],
-    key_len: usize,
-    version: u128,
     expected_key: Option<&[u8]>,
-    expected_version: Option<u128>,
-) -> Result<(), LogError> {
+    expected_version: u128,
+) -> Result<ValueRecord, LogError> {
+    if is_v2_record(b) {
+        let h = V2Head::parse(b).ok_or(LogError::Corrupt("short header"))?;
+        if b.len() != h.total() {
+            return Err(LogError::Corrupt("length mismatch"));
+        }
+        let key_differs = expected_key.is_some_and(|k| &b[h.len..h.len + h.key_len] != k);
+        if !h.crc_matches(b, expected_version) {
+            return Err(LogError::Corrupt(if key_differs { KEY_MISMATCH } else { CRC_OR_VERSION_MISMATCH }));
+        }
+        let kind = RecordKind::from_u8(h.tag & REC_V2_KIND).ok_or(LogError::Corrupt(BAD_KIND))?;
+        if key_differs {
+            return Err(LogError::Corrupt(KEY_MISMATCH));
+        }
+        return Ok(ValueRecord {
+            kind,
+            tombstone: h.tombstone(),
+            value_off: h.len + h.key_len,
+            seq: 0,
+            epoch: 0,
+        });
+    }
+    let (kind, tombstone, key_len, seq, epoch, version) = validate_record(b)?;
     if expected_key.is_some_and(|k| &b[KEY_OFF..KEY_OFF + key_len] != k) {
         return Err(LogError::Corrupt(KEY_MISMATCH));
     }
-    if expected_version.is_some_and(|v| v != version) {
+    if version != expected_version {
         return Err(LogError::Corrupt(VERSION_MISMATCH));
     }
-    Ok(())
-}
-
-pub fn decode_record_value(b: &[u8]) -> Result<Record, LogError> {
-    decode_record_value_inner(b, None, None)
-}
-
-fn decode_record_value_checked(
-    b: &[u8],
-    expected_key: &[u8],
-    expected_version: u128,
-) -> Result<Record, LogError> {
-    decode_record_value_inner(b, Some(expected_key), Some(expected_version))
-}
-
-fn decode_record_value_inner(
-    b: &[u8],
-    expected_key: Option<&[u8]>,
-    expected_version: Option<u128>,
-) -> Result<Record, LogError> {
-    let (kind, tombstone, key_len, seq, epoch, version) = validate_record(b)?;
-    check_identity(b, key_len, version, expected_key, expected_version)?;
-    Ok(Record {
-        seq,
-        epoch,
+    Ok(ValueRecord {
         kind,
         tombstone,
+        value_off: KEY_OFF + key_len,
+        seq,
+        epoch,
+    })
+}
+
+/// Decodes a record read through a value pointer whose index entry has
+/// version `expected_version` (and key `expected_key`, if given).
+pub fn decode_record_value(
+    b: &[u8],
+    expected_key: Option<&[u8]>,
+    expected_version: u128,
+) -> Result<Record, LogError> {
+    let rec = validate_value(b, expected_key, expected_version)?;
+    Ok(Record {
+        seq: rec.seq,
+        epoch: rec.epoch,
+        kind: rec.kind,
+        tombstone: rec.tombstone,
         key: Vec::new(),
-        value: b[KEY_OFF + key_len..].to_vec(),
-        version,
+        value: b[rec.value_off..].to_vec(),
+        version: expected_version,
     })
 }
 
@@ -310,6 +641,7 @@ pub struct ReadPlan {
     block_size: usize,
     within: usize,
     ptr: ValuePtr,
+    version: u128,
     tail_overlay: Option<(usize, Vec<u8>)>,
 }
 
@@ -332,7 +664,7 @@ impl ReadPlan {
         expected_key: Option<&[u8]>,
     ) -> Result<Record, LogError> {
         let buf = self.read_buf(dev).await?;
-        let rec = decode_record_value_inner(self.record(&buf), expected_key, None);
+        let rec = decode_record_value(self.record(&buf), expected_key, self.version);
         dev.release_scratch(buf);
         rec
     }
@@ -376,7 +708,7 @@ impl ReadPlan {
     where
         D: AsyncRead + BlockDevice,
     {
-        self.read_value_inner(dev, None, None, f).await
+        self.read_value_inner(dev, None, self.version, f).await
     }
 
     pub async fn read_value_checked<D, R>(
@@ -389,7 +721,7 @@ impl ReadPlan {
     where
         D: AsyncRead + BlockDevice,
     {
-        self.read_value_inner(dev, Some(expected_key), Some(expected_version), f)
+        self.read_value_inner(dev, Some(expected_key), expected_version, f)
             .await
     }
 
@@ -397,7 +729,7 @@ impl ReadPlan {
         &self,
         dev: &D,
         expected_key: Option<&[u8]>,
-        expected_version: Option<u128>,
+        expected_version: u128,
         f: impl FnOnce(u128, &[u8]) -> R,
     ) -> Result<R, LogError>
     where
@@ -406,9 +738,8 @@ impl ReadPlan {
         let buf = self.read_buf(dev).await?;
         let out = (|| {
             let rec = self.record(&buf);
-            let (_, _, key_len, _, _, version) = validate_record(rec)?;
-            check_identity(rec, key_len, version, expected_key, expected_version)?;
-            Ok(f(version, &rec[KEY_OFF + key_len..]))
+            let value = validate_value(rec, expected_key, expected_version)?;
+            Ok(f(expected_version, &rec[value.value_off..]))
         })();
         dev.release_scratch(buf);
         out
@@ -451,8 +782,6 @@ impl From<SpanReadError> for LogError {
     }
 }
 
-type UncheckedSpan = fn(usize) -> (&'static [u8], u128);
-
 impl SpanReadPlan {
     pub fn num_spans(&self) -> usize {
         self.spans.len()
@@ -462,34 +791,11 @@ impl SpanReadPlan {
         self.num_records
     }
 
-    pub async fn execute_span<D: AsyncRead + BlockDevice>(
-        &self,
-        i: usize,
-        dev: &D,
-    ) -> Result<Vec<(usize, Record)>, LogError> {
-        Ok(self
-            .execute_span_inner(i, dev, None::<&UncheckedSpan>)
-            .await?)
-    }
-
     pub async fn execute_span_checked<'k, D, F>(
         &self,
         i: usize,
         dev: &D,
         expected: &F,
-    ) -> Result<Vec<(usize, Record)>, SpanReadError>
-    where
-        D: AsyncRead + BlockDevice,
-        F: Fn(usize) -> (&'k [u8], u128),
-    {
-        self.execute_span_inner(i, dev, Some(expected)).await
-    }
-
-    async fn execute_span_inner<'k, D, F>(
-        &self,
-        i: usize,
-        dev: &D,
-        expected: Option<&F>,
     ) -> Result<Vec<(usize, Record)>, SpanReadError>
     where
         D: AsyncRead + BlockDevice,
@@ -529,7 +835,6 @@ impl SpanReadPlan {
         D: BlockDevice,
         F: Fn(usize) -> (&'k [u8], u128),
     {
-        let expected = Some(expected);
         let mut bufs: Vec<Vec<u8>> = self
             .spans
             .iter()
@@ -565,20 +870,14 @@ impl SpanReadPlan {
     fn decode_span<'k, F: Fn(usize) -> (&'k [u8], u128)>(
         span: &Span,
         buf: &[u8],
-        expected: Option<&F>,
+        expected: &F,
     ) -> Result<Vec<(usize, Record)>, SpanReadError> {
         let mut out = Vec::with_capacity(span.slots.len());
         for &(slot, off, ptr) in &span.slots {
             let slot = slot as usize;
-            let (key, version) = match expected {
-                Some(f) => {
-                    let (key, version) = f(slot);
-                    (Some(key), Some(version))
-                }
-                None => (None, None),
-            };
+            let (key, version) = expected(slot);
             let bytes = &buf[off as usize..off as usize + ptr.len as usize];
-            match decode_record_value_inner(bytes, key, version) {
+            match decode_record_value(bytes, Some(key), version) {
                 Ok(rec) => out.push((slot, rec)),
                 Err(error) => {
                     return Err(SpanReadError {
@@ -654,6 +953,9 @@ pub struct VlogWriter<'a, D: BlockDevice> {
     seg_idx: usize,
     open: bool,
     fence_first_header: bool,
+    format: u16,
+    base: RecordBase,
+    full: bool,
     buf: Vec<u8>,
     err: Option<LogError>,
 }
@@ -679,6 +981,14 @@ impl<'a, D: BlockDevice> VlogWriter<'a, D> {
             seg_idx: usize::MAX,
             open: false,
             fence_first_header: false,
+            format: vlog_write_version(),
+            base: RecordBase {
+                format: SEG_FORMAT_V1,
+                epoch: 0,
+                seq: 0,
+                version: 0,
+            },
+            full: false,
             buf: Vec::with_capacity(seg_capacity),
             err: None,
         }
@@ -690,9 +1000,22 @@ impl<'a, D: BlockDevice> VlogWriter<'a, D> {
     }
 
     pub fn usable_per_segment(&self) -> usize {
-        self.seg_capacity - SEG_HEADER_LEN
+        self.seg_capacity - seg_header_len(self.format)
     }
 
+    /// Whether the reserved segments ran out. A rewritten record can be
+    /// longer than its source (a format-2 header depends on the segment it
+    /// lands in), so a rewrite can need more than it reserved.
+    pub fn is_full(&self) -> bool {
+        self.full
+    }
+
+    pub fn reserved_segments(&self) -> usize {
+        self.segs.len()
+    }
+
+    /// Appends a record, or returns `None` once the reserved segments are
+    /// full (the caller keeps the record where it is).
     #[allow(clippy::too_many_arguments)]
     pub fn append(
         &mut self,
@@ -702,66 +1025,63 @@ impl<'a, D: BlockDevice> VlogWriter<'a, D> {
         version: u128,
         key: &[u8],
         value: &[u8],
-    ) -> Result<ValuePtr, LogError> {
+    ) -> Result<Option<ValuePtr>, LogError> {
         if self.err.is_some() {
             return Err(LogError::Corrupt(
                 "vlog co-compaction writer already errored",
             ));
         }
-        let total = HEADER_LEN + key.len() + value.len();
-        if total > self.usable_per_segment() {
+        if self.full {
+            return Ok(None);
+        }
+        let first = RecordBase { format: self.format, epoch: 0, seq, version }.record_len(seq, version, key, value);
+        if first > self.usable_per_segment() {
             return Err(LogError::RecordTooLarge {
-                size: total,
+                size: first,
                 max: self.usable_per_segment(),
             });
         }
-        let need_roll = !self.open || self.buf.len() + total > self.seg_capacity;
-        if need_roll {
-            self.roll()?;
+        let need_roll =
+            !self.open || self.buf.len() + self.base.record_len(seq, version, key, value) > self.seg_capacity;
+        if need_roll && !self.roll(seq, version)? {
+            self.full = true;
+            return Ok(None);
         }
         let seg = self.segs[self.seg_idx];
-        let epoch = self.epochs[self.seg_idx];
         let offset = self.buf.len() as u32;
-        let mut header =
-            encode_header(kind, tombstone, seq, epoch, version, key.len(), value.len());
-        let mut c = Crc32::new();
-        c.update(&header[0..CRC_OFF]);
-        c.update(key);
-        c.update(value);
-        header[CRC_OFF..KEY_OFF].copy_from_slice(&c.finalize().to_le_bytes());
-        self.buf.extend_from_slice(&header);
+        let header = self.base.encode(kind, tombstone, seq, version, key, value);
+        let total = header.len + key.len() + value.len();
+        self.buf.extend_from_slice(header.bytes());
         self.buf.extend_from_slice(key);
         self.buf.extend_from_slice(value);
-        Ok(ValuePtr {
+        Ok(Some(ValuePtr {
             segment: seg,
             offset,
             len: total as u32,
-        })
+        }))
     }
 
-    fn roll(&mut self) -> Result<(), LogError> {
-        if self.open {
-            self.flush_current()?;
-        }
+    fn roll(&mut self, seq: u64, version: u128) -> Result<bool, LogError> {
         let next = if self.seg_idx == usize::MAX {
             0
         } else {
             self.seg_idx + 1
         };
         if next >= self.segs.len() {
-            let e = LogError::Corrupt("vlog co-compaction exceeded its reserved segments");
-            self.err = Some(LogError::Corrupt(
-                "vlog co-compaction exceeded its reserved segments",
-            ));
-            return Err(e);
+            return Ok(false);
+        }
+        if self.open {
+            self.flush_current()?;
         }
         self.seg_idx = next;
         self.buf.clear();
-        let hdr = encode_seg_header_flagged(
-            self.epochs[next],
-            self.block_size as u32,
-            /* not_tail */ true,
-        );
+        self.base = RecordBase {
+            format: self.format,
+            epoch: self.epochs[next],
+            seq,
+            version,
+        };
+        let hdr = encode_seg_header(&self.base, self.block_size as u32, /* not_tail */ true);
         self.buf.extend_from_slice(&hdr);
         self.open = true;
         if next == 0 && self.fence_first_header {
@@ -773,7 +1093,7 @@ impl<'a, D: BlockDevice> VlogWriter<'a, D> {
                 return Err(e.into());
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn flush_current(&mut self) -> Result<(), LogError> {
@@ -806,37 +1126,57 @@ impl<'a, D: BlockDevice> VlogWriter<'a, D> {
     }
 }
 
-fn encode_seg_header(epoch: u64, block_size: u32) -> Vec<u8> {
-    encode_seg_header_flagged(epoch, block_size, false)
-}
-
 pub const SEG_FLAG_NOT_TAIL: u16 = 0x8000;
 
-fn encode_seg_header_flagged(epoch: u64, block_size: u32, not_tail: bool) -> Vec<u8> {
-    let mut b = vec![0u8; SEG_HEADER_LEN];
+fn seg_header_len(format: u16) -> usize {
+    if format == SEG_FORMAT_V1 {
+        SEG_HEADER_LEN_V1
+    } else {
+        SEG_HEADER_LEN
+    }
+}
+
+fn encode_seg_header(base: &RecordBase, block_size: u32, not_tail: bool) -> Vec<u8> {
+    let mut b = vec![0u8; seg_header_len(base.format)];
     b[0..4].copy_from_slice(&SEG_MAGIC.to_le_bytes());
-    let version = FORMAT_VERSION | if not_tail { SEG_FLAG_NOT_TAIL } else { 0 };
+    let version = base.format | if not_tail { SEG_FLAG_NOT_TAIL } else { 0 };
     b[4..6].copy_from_slice(&version.to_le_bytes());
-    b[6..14].copy_from_slice(&epoch.to_le_bytes());
+    b[6..14].copy_from_slice(&base.epoch.to_le_bytes());
     b[14..18].copy_from_slice(&block_size.to_le_bytes());
-    let crc = {
+    let mut c = Crc32::new();
+    c.update(&b[0..18]);
+    b[18..22].copy_from_slice(&c.finalize().to_le_bytes());
+    if base.format != SEG_FORMAT_V1 {
+        b[22..30].copy_from_slice(&base.seq.to_le_bytes());
+        b[30..46].copy_from_slice(&base.version.to_le_bytes());
         let mut c = Crc32::new();
-        c.update(&b[0..18]);
-        c.finalize()
-    };
-    b[18..22].copy_from_slice(&crc.to_le_bytes());
+        c.update(&b[0..46]);
+        b[46..50].copy_from_slice(&c.finalize().to_le_bytes());
+    }
     b
 }
 
+/// A decoded segment header. `base_seq` and `base_version` are the seq and
+/// version of the segment's first record, which format-2 records are
+/// encoded against (0 for format 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegHeader {
     pub epoch: u64,
     pub block_size: u32,
     pub not_tail: bool,
+    pub format: u16,
+    pub base_seq: u64,
+    pub base_version: u128,
+}
+
+impl SegHeader {
+    pub fn header_len(&self) -> usize {
+        seg_header_len(self.format)
+    }
 }
 
 pub fn decode_seg_header(b: &[u8]) -> Result<SegHeader, LogError> {
-    if b.len() < SEG_HEADER_LEN {
+    if b.len() < SEG_HEADER_LEN_V1 {
         return Err(LogError::Corrupt("short seg header"));
     }
     let magic = u32::from_le_bytes(b[0..4].try_into().unwrap());
@@ -851,14 +1191,33 @@ pub fn decode_seg_header(b: &[u8]) -> Result<SegHeader, LogError> {
     }
     let raw_version = u16::from_le_bytes(b[4..6].try_into().unwrap());
     let not_tail = raw_version & SEG_FLAG_NOT_TAIL != 0;
-    let version = raw_version & !SEG_FLAG_NOT_TAIL;
-    if version != FORMAT_VERSION {
-        return Err(LogError::Unsupported("segment format version"));
-    }
+    let format = raw_version & !SEG_FLAG_NOT_TAIL;
+    let (base_seq, base_version) = match format {
+        SEG_FORMAT_V1 => (0, 0),
+        SEG_FORMAT_V2 => {
+            if b.len() < SEG_HEADER_LEN {
+                return Err(LogError::Corrupt("short seg header"));
+            }
+            let stored_crc = u32::from_le_bytes(b[46..50].try_into().unwrap());
+            let mut c = Crc32::new();
+            c.update(&b[0..46]);
+            if c.finalize() != stored_crc {
+                return Err(LogError::Corrupt("seg crc mismatch"));
+            }
+            (
+                u64::from_le_bytes(b[22..30].try_into().unwrap()),
+                u128::from_le_bytes(b[30..46].try_into().unwrap()),
+            )
+        }
+        _ => return Err(LogError::Unsupported("segment format version")),
+    };
     Ok(SegHeader {
         epoch: u64::from_le_bytes(b[6..14].try_into().unwrap()),
         block_size: u32::from_le_bytes(b[14..18].try_into().unwrap()),
         not_tail,
+        format,
+        base_seq,
+        base_version,
     })
 }
 
@@ -873,6 +1232,7 @@ pub struct ValueLog {
     next_seq: u64,
     next_epoch: u64,
     cur_epoch: u64,
+    cur_base: RecordBase,
     inflight: RefCell<Vec<WriteHandle>>,
     /// Full blocks appended but not yet submitted, contiguous from `staged_lba`.
     /// Submitted before any wait for in-flight writes, so readers and syncs
@@ -903,6 +1263,12 @@ impl ValueLog {
             next_seq: start_seq,
             next_epoch: start_epoch,
             cur_epoch: 0,
+            cur_base: RecordBase {
+                format: SEG_FORMAT_V1,
+                epoch: 0,
+                seq: 0,
+                version: 0,
+            },
             inflight: RefCell::new(Vec::new()),
             staged: RefCell::new(Vec::new()),
             staged_lba: std::cell::Cell::new(0),
@@ -1133,38 +1499,29 @@ impl ValueLog {
         key: &[u8],
         value: &[u8],
     ) -> Result<(u64, ValuePtr), LogError> {
-        let total = HEADER_LEN + key.len() + value.len();
-        let max = self.seg_capacity() - SEG_HEADER_LEN;
-        if total > max {
-            return Err(LogError::RecordTooLarge { size: total, max });
+        let seq = self.next_seq;
+        let format = vlog_write_version();
+        let first = RecordBase { format, epoch: 0, seq, version }.record_len(seq, version, key, value);
+        let max = self.seg_capacity() - seg_header_len(format);
+        if first > max {
+            return Err(LogError::RecordTooLarge { size: first, max });
         }
         let need_roll = match self.cur_seg {
             None => true,
-            Some(_) => self.write_off as usize + total > self.seg_capacity(),
+            Some(_) => {
+                self.write_off as usize + self.cur_base.record_len(seq, version, key, value) > self.seg_capacity()
+            }
         };
         if need_roll {
-            self.roll(dev, alloc)?;
+            self.roll(dev, alloc, seq, version)?;
         }
 
-        let seq = self.next_seq;
         self.next_seq += 1;
-        let mut header = encode_header(
-            kind,
-            tombstone,
-            seq,
-            self.cur_epoch,
-            version,
-            key.len(),
-            value.len(),
-        );
-        let mut c = Crc32::new();
-        c.update(&header[0..CRC_OFF]);
-        c.update(key);
-        c.update(value);
-        header[CRC_OFF..KEY_OFF].copy_from_slice(&c.finalize().to_le_bytes());
+        let header = self.cur_base.encode(kind, tombstone, seq, version, key, value);
+        let total = header.len + key.len() + value.len();
         let start_off = self.write_off;
         let seg = self.cur_seg.expect("segment open after roll");
-        self.append_bytes(dev, &header)?;
+        self.append_bytes(dev, header.bytes())?;
         self.append_bytes(dev, key)?;
         self.append_bytes(dev, value)?;
         Ok((
@@ -1220,26 +1577,13 @@ impl ValueLog {
         }
         let mut out = Vec::with_capacity(items.len());
         for (((buf, &span), (_, ptr)), &(key, version)) in bufs.iter_mut().zip(spans).zip(items).zip(expected) {
-            out.push(decode_record_value_checked(
+            out.push(decode_record_value(
                 self.record_bytes(buf, ptr, span),
-                key,
+                Some(key),
                 version,
             )?);
         }
         Ok(out)
-    }
-
-    pub fn read<D: BlockDevice>(
-        &self,
-        dev: &D,
-        seg_start_lba: u64,
-        ptr: &ValuePtr,
-    ) -> Result<Record, LogError> {
-        self.drain_inflight(dev)?;
-        let span = self.span_blocks(ptr)?;
-        let mut buf = io_buf(span.1 * self.block_size);
-        dev.read_at(seg_start_lba + span.0, &mut buf)?;
-        decode_record_value(self.record_bytes(&mut buf, ptr, span))
     }
 
     pub fn read_checked<D: BlockDevice>(
@@ -1254,9 +1598,9 @@ impl ValueLog {
         let span = self.span_blocks(ptr)?;
         let mut buf = io_buf(span.1 * self.block_size);
         dev.read_at(seg_start_lba + span.0, &mut buf)?;
-        decode_record_value_checked(
+        decode_record_value(
             self.record_bytes(&mut buf, ptr, span),
-            expected_key,
+            Some(expected_key),
             expected_version,
         )
     }
@@ -1316,6 +1660,7 @@ impl ValueLog {
         dev: &D,
         seg_start_lba: u64,
         ptr: &ValuePtr,
+        version: u128,
     ) -> Result<ReadPlan, LogError> {
         self.drain_inflight(dev)?;
         let (first_block, nblocks) = self.span_blocks(ptr)?;
@@ -1328,6 +1673,7 @@ impl ValueLog {
             block_size: self.block_size,
             within: ptr.offset as usize % self.block_size,
             ptr: *ptr,
+            version,
             tail_overlay,
         })
     }
@@ -1379,7 +1725,13 @@ impl ValueLog {
         flushed
     }
 
-    fn roll<D: BlockDevice>(&mut self, dev: &D, alloc: &mut Allocator) -> Result<(), LogError> {
+    fn roll<D: BlockDevice>(
+        &mut self,
+        dev: &D,
+        alloc: &mut Allocator,
+        seq: u64,
+        version: u128,
+    ) -> Result<(), LogError> {
         if self.tail_dirty {
             self.flush_tail(dev)?;
         }
@@ -1402,8 +1754,14 @@ impl ValueLog {
         let epoch = self.next_epoch;
         self.next_epoch += 1;
         self.cur_epoch = epoch;
+        self.cur_base = RecordBase {
+            format: vlog_write_version(),
+            epoch,
+            seq,
+            version,
+        };
         self.tail_segs.push((epoch, seg));
-        let hdr = encode_seg_header(epoch, self.block_size as u32);
+        let hdr = encode_seg_header(&self.cur_base, self.block_size as u32, false);
         self.append_bytes(dev, &hdr)?;
         if self.epoch_fence_pending {
             self.flush_tail(dev)?;
@@ -1489,25 +1847,33 @@ impl ValueLog {
     }
 }
 
+/// Replays a whole segment: every intact record of the segment's
+/// incarnation, as `(offset, record)`.
 pub fn replay_segment(buf: &[u8]) -> Result<(SegHeader, Vec<(u32, Record)>), LogError> {
+    let (hdr, recs) = replay_segment_extents(buf)?;
+    Ok((hdr, recs.into_iter().map(|(off, _, rec)| (off, rec)).collect()))
+}
+
+/// Like [`replay_segment`], as `(offset, length, record)`.
+pub fn replay_segment_extents(buf: &[u8]) -> Result<(SegHeader, Vec<(u32, u32, Record)>), LogError> {
     let hdr = decode_seg_header(buf)?;
     let mut out = Vec::new();
-    let mut off = SEG_HEADER_LEN;
+    let mut off = hdr.header_len();
     while off < buf.len() {
-        if let Some(total) = record_extent(buf, off) {
-            match decode_record(&buf[off..off + total]) {
+        if let Some(total) = record_extent(buf, off, &hdr) {
+            match decode_record(&buf[off..off + total], &hdr) {
                 Ok(rec) if rec.epoch == hdr.epoch => {
-                    out.push((off as u32, rec));
+                    out.push((off as u32, total as u32, rec));
                     off += total;
                     continue;
                 }
-                Err(LogError::Corrupt(BAD_KIND)) if intact_record_of_epoch(&buf[off..off + total], hdr.epoch) => {
+                Err(LogError::Corrupt(BAD_KIND)) if intact_record(&buf[off..off + total], &hdr) => {
                     return Err(LogError::Unsupported("record kind"));
                 }
                 _ => {}
             }
         }
-        let Some(next) = next_intact_record(buf, off + 1, hdr.epoch) else {
+        let Some(next) = next_intact_record(buf, off + 1, &hdr) else {
             break;
         };
         note_replay_skip(hdr.epoch, off, next);
@@ -1516,21 +1882,30 @@ pub fn replay_segment(buf: &[u8]) -> Result<(SegHeader, Vec<(u32, Record)>), Log
     Ok((hdr, out))
 }
 
-fn record_extent(buf: &[u8], off: usize) -> Option<usize> {
-    if off + HEADER_LEN > buf.len() || buf[off..off + 4] != REC_MAGIC.to_le_bytes() {
-        return None;
-    }
-    let key_len = u32::from_le_bytes(buf[off + 6..off + 10].try_into().unwrap()) as usize;
-    let val_len = u32::from_le_bytes(buf[off + 10..off + 14].try_into().unwrap()) as usize;
-    let total = HEADER_LEN + key_len + val_len;
+fn record_extent(buf: &[u8], off: usize, hdr: &SegHeader) -> Option<usize> {
+    let total = if hdr.format == SEG_FORMAT_V1 {
+        if off + HEADER_LEN > buf.len() || buf[off..off + 4] != REC_MAGIC.to_le_bytes() {
+            return None;
+        }
+        let key_len = u32::from_le_bytes(buf[off + 6..off + 10].try_into().unwrap()) as usize;
+        let val_len = u32::from_le_bytes(buf[off + 10..off + 14].try_into().unwrap()) as usize;
+        HEADER_LEN + key_len + val_len
+    } else {
+        V2Head::parse(&buf[off..])?.total()
+    };
     (off + total <= buf.len()).then_some(total)
 }
 
-fn next_intact_record(buf: &[u8], from: usize, epoch: u64) -> Option<usize> {
-    let first = REC_MAGIC.to_le_bytes()[0];
-    (from..buf.len().saturating_sub(HEADER_LEN - 1)).find(|&p| {
-        buf[p] == first
-            && record_extent(buf, p).is_some_and(|total| intact_record_of_epoch(&buf[p..p + total], epoch))
+fn next_intact_record(buf: &[u8], from: usize, hdr: &SegHeader) -> Option<usize> {
+    let (min_len, starts) = if hdr.format == SEG_FORMAT_V1 {
+        let first = REC_MAGIC.to_le_bytes()[0];
+        (HEADER_LEN, Box::new(move |b: u8| b == first) as Box<dyn Fn(u8) -> bool>)
+    } else {
+        (MIN_RECORD_LEN, Box::new(|b: u8| b & REC_V2 != 0) as Box<dyn Fn(u8) -> bool>)
+    };
+    (from..buf.len().saturating_sub(min_len - 1)).find(|&p| {
+        starts(buf[p])
+            && record_extent(buf, p, hdr).is_some_and(|total| intact_record(&buf[p..p + total], hdr))
     })
 }
 
@@ -1544,12 +1919,21 @@ fn note_replay_skip(epoch: u64, from: usize, to: usize) {
     );
 }
 
-fn intact_record_of_epoch(b: &[u8], epoch: u64) -> bool {
-    let stored_crc = u32::from_le_bytes(b[CRC_OFF..KEY_OFF].try_into().unwrap());
-    let mut c = Crc32::new();
-    c.update(&b[0..CRC_OFF]);
-    c.update(&b[KEY_OFF..]);
-    c.finalize() == stored_crc && u64::from_le_bytes(b[22..30].try_into().unwrap()) == epoch
+/// Whether `b` (one record extent) is an intact record of the segment
+/// `hdr`'s incarnation, whatever its kind.
+fn intact_record(b: &[u8], hdr: &SegHeader) -> bool {
+    if hdr.format == SEG_FORMAT_V1 {
+        let stored_crc = u32::from_le_bytes(b[CRC_OFF..KEY_OFF].try_into().unwrap());
+        let mut c = Crc32::new();
+        c.update(&b[0..CRC_OFF]);
+        c.update(&b[KEY_OFF..]);
+        return c.finalize() == stored_crc && u64::from_le_bytes(b[22..30].try_into().unwrap()) == hdr.epoch;
+    }
+    V2Head::parse(b).is_some_and(|h| {
+        h.total() == b.len()
+            && h.epoch_tag == epoch_tag(hdr.epoch)
+            && h.crc_matches(b, h.version(hdr.base_version))
+    })
 }
 
 pub fn read_record<D: BlockDevice>(
@@ -1558,12 +1942,59 @@ pub fn read_record<D: BlockDevice>(
     seg_bytes: u64,
     seg_start_lba: u64,
     ptr: &ValuePtr,
+    version: u128,
 ) -> Result<Record, LogError> {
     let (first_block, nblocks) = record_span(ptr, block_size, seg_bytes)?;
     let mut buf = vec![0u8; nblocks * block_size];
     dev.read_at(seg_start_lba + first_block, &mut buf)?;
     let within = ptr.offset as usize % block_size;
-    decode_record_value(&buf[within..within + ptr.len as usize])
+    decode_record_value(&buf[within..within + ptr.len as usize], None, version)
+}
+
+/// Raw record edits for tests that forge on-disk records.
+#[cfg(test)]
+pub(crate) mod forge {
+    use super::*;
+
+    pub(crate) fn set_kind(rec: &mut [u8], kind: u8) {
+        if is_v2_record(rec) {
+            rec[0] = (rec[0] & !REC_V2_KIND) | kind;
+        } else {
+            rec[4] = kind;
+        }
+    }
+
+    pub(crate) fn set_epoch(rec: &mut [u8], epoch: u64) {
+        if is_v2_record(rec) {
+            let h = V2Head::parse(rec).unwrap();
+            rec[h.len - 8..h.len - 4].copy_from_slice(&epoch_tag(epoch).to_le_bytes());
+        } else {
+            rec[22..30].copy_from_slice(&epoch.to_le_bytes());
+        }
+    }
+
+    pub(crate) fn epoch(rec: &[u8], seg: &SegHeader) -> u64 {
+        if is_v2_record(rec) {
+            seg.epoch
+        } else {
+            u64::from_le_bytes(rec[22..30].try_into().unwrap())
+        }
+    }
+
+    pub(crate) fn reseal(rec: &mut [u8], seg: &SegHeader) {
+        let crc = if is_v2_record(rec) {
+            let h = V2Head::parse(rec).unwrap();
+            let version = h.version(seg.base_version);
+            v2_crc(&rec[..h.len - 4], version, &rec[h.len..], &[])
+        } else {
+            let mut c = Crc32::new();
+            c.update(&rec[..CRC_OFF]);
+            c.update(&rec[KEY_OFF..]);
+            c.finalize()
+        };
+        let at = if is_v2_record(rec) { V2Head::parse(rec).unwrap().len - 4 } else { CRC_OFF };
+        rec[at..at + 4].copy_from_slice(&crc.to_le_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -1583,7 +2014,7 @@ mod tests {
 
     fn read_back(dev: &MemBlockDevice, alloc: &Allocator, ptr: &ValuePtr) -> Record {
         let (start, _) = alloc.segment_range(ptr.segment);
-        read_record(dev, BS, SEG_BLOCKS * BS as u64, start, ptr).unwrap()
+        read_record(dev, BS, SEG_BLOCKS * BS as u64, start, ptr, 0).unwrap()
     }
 
     #[test]
@@ -1733,22 +2164,21 @@ mod tests {
         for ptr in [
             at(0, 0),
             at(good.offset, 0),
-            at(good.offset, HEADER_LEN as u32 - 1),
+            at(good.offset, MIN_RECORD_LEN as u32 - 1),
             at(0, u32::MAX),
             at(u32::MAX, good.len),
             at(seg_bytes as u32 - good.len + 1, good.len),
         ] {
             assert!(refused(check_value_ptr(&ptr, seg_bytes)), "{ptr:?}");
-            assert!(refused(log.read(&dev, start, &ptr).map(drop)), "{ptr:?}");
             assert!(refused(log.read_checked(&dev, start, &ptr, b"k", 7).map(drop)), "{ptr:?}");
             assert!(refused(log.read_many_checked(&dev, &[(start, good), (start, ptr)], &[(b"k", 7), (b"k", 7)]).map(drop)), "{ptr:?}");
             let (items, expected) = ([(start, good), (start, ptr)], [(&b"k"[..], 7), (&b"k"[..], 7)]);
             let many = vals_rt::block_on(log.read_many_async_checked(&dev, &items, &expected), || {});
             assert!(refused(many.map(drop)), "{ptr:?}");
-            assert!(refused(log.plan_read(&dev, start, &ptr).map(drop)), "{ptr:?}");
+            assert!(refused(log.plan_read(&dev, start, &ptr, 7).map(drop)), "{ptr:?}");
             assert!(refused(log.plan_read_spans(&dev, &[(start, good), (start, ptr)]).map(drop)), "{ptr:?}");
             assert!(refused(plan_read_spans_detached(BS, seg_bytes, &[(start, ptr)]).map(drop)), "{ptr:?}");
-            assert!(refused(read_record(&dev, BS, seg_bytes, start, &ptr).map(drop)), "{ptr:?}");
+            assert!(refused(read_record(&dev, BS, seg_bytes, start, &ptr, 7).map(drop)), "{ptr:?}");
             assert!(refused(value_ptr_start(&alloc, BS, &ptr).map(drop)), "{ptr:?}");
         }
         for segment in [SegmentId(alloc.num_segments()), SegmentId(u64::MAX)] {
@@ -1756,7 +2186,7 @@ mod tests {
         }
         assert!(check_value_ptr(&at(seg_bytes as u32 - good.len, good.len), seg_bytes).is_ok());
         assert_eq!(value_ptr_start(&alloc, BS, &good).unwrap(), start);
-        assert_eq!(log.read(&dev, start, &good).unwrap().value, b"v");
+        assert_eq!(log.read_checked(&dev, start, &good, b"k", 7).unwrap().value, b"v");
         assert_eq!(log.read_many_checked(&dev, &[(start, good)], &[(b"k", 7)]).unwrap()[0].value, b"v");
     }
 
@@ -1770,11 +2200,11 @@ mod tests {
         let (start, _) = alloc.segment_range(ptr.segment);
         let mut blk = vec![0u8; BS];
         dev.read_at(start, &mut blk).unwrap();
-        let corrupt_at = ptr.offset as usize + KEY_OFF + 1;
+        let corrupt_at = (ptr.offset + ptr.len) as usize - 1;
         blk[corrupt_at] ^= 0xFF;
         dev.write_at(start, &blk).unwrap();
         assert!(matches!(
-            read_record(&dev, BS, SEG_BLOCKS * BS as u64, start, &ptr),
+            read_record(&dev, BS, SEG_BLOCKS * BS as u64, start, &ptr, 0),
             Err(LogError::Corrupt(_))
         ));
     }
@@ -1846,6 +2276,10 @@ mod tests {
 
     #[test]
     fn full_blocks_are_coalesced_and_reads_and_syncs_see_staged_blocks() {
+        with_vlog_write_version(SEG_FORMAT_V1, coalesced_v1_records);
+    }
+
+    fn coalesced_v1_records() {
         const SEG: u64 = 128; // 32 KiB segments of 256 B blocks: one 16 KiB coalesced write fits twice
         let dev = SizeLogDevice {
             inner: MemBlockDevice::new(BS, 1024),
@@ -1868,7 +2302,7 @@ mod tests {
         assert_eq!(log.staged.borrow().len(), 14 * BS);
         // A read drains first, so it sees a staged block's record.
         let (start, _) = alloc.segment_range(ptrs[190].segment);
-        assert_eq!(log.read(&dev, start, &ptrs[190]).unwrap().value, value);
+        assert_eq!(log.read_checked(&dev, start, &ptrs[190], b"k190", 0).unwrap().value, value);
         assert_eq!(*dev.writes.lock().unwrap(), [COALESCE_BYTES, 14 * BS]);
         assert!(log.staged.borrow().is_empty());
 
@@ -1932,6 +2366,10 @@ mod tests {
 
     #[test]
     fn a_commit_writes_staged_blocks_and_tail_once_and_a_failed_commit_keeps_both() {
+        with_vlog_write_version(SEG_FORMAT_V1, commit_v1_records);
+    }
+
+    fn commit_v1_records() {
         const SEG: u64 = 128;
         let dev = FailWritesDevice {
             inner: MemBlockDevice::new(BS, 1024),
@@ -1970,8 +2408,16 @@ mod tests {
         assert_eq!(replay_segment(&buf).unwrap().1.len(), 30);
     }
 
+    const FORMATS: [u16; 2] = [SEG_FORMAT_V1, SEG_FORMAT_V2];
+
     #[test]
     fn replay_stops_at_torn_tail() {
+        for format in FORMATS {
+            with_vlog_write_version(format, replay_stops_at_torn_tail_in);
+        }
+    }
+
+    fn replay_stops_at_torn_tail_in() {
         let (dev, mut alloc, mut log) = setup();
         for i in 0..3u32 {
             log.append(
@@ -1987,18 +2433,24 @@ mod tests {
         log.sync(&dev).unwrap();
 
         let mut buf = read_segment(&dev, &alloc, SegmentId(0));
-        let (_, recs) = replay_segment(&buf).unwrap();
-        let last_off = recs[2].0 as usize;
-        buf[last_off + KEY_OFF] ^= 0xFF;
+        let (_, recs) = replay_segment_extents(&buf).unwrap();
+        let (last_off, last_len, _) = recs[2];
+        buf[(last_off + last_len) as usize - 2] ^= 0xFF;
         let (_, torn) = replay_segment(&buf).unwrap();
         assert_eq!(torn.iter().map(|(_, r)| r.key.clone()).collect::<Vec<_>>(), [b"k0".to_vec(), b"k1".to_vec()]);
-        buf[last_off..].fill(0);
+        buf[last_off as usize..].fill(0);
         let (_, unwritten) = replay_segment(&buf).unwrap();
         assert_eq!(unwritten.len(), 2);
     }
 
     #[test]
     fn replay_skips_mid_segment_corruption_and_recovers_later_records() {
+        for format in FORMATS {
+            with_vlog_write_version(format, || replay_skips_mid_segment_corruption_in(format));
+        }
+    }
+
+    fn replay_skips_mid_segment_corruption_in(format: u16) {
         let (dev, mut alloc, mut log) = setup();
         for i in 0..4u32 {
             log.append(&dev, &mut alloc, RecordKind::Put, 0, format!("k{i}").as_bytes(), b"v")
@@ -2008,21 +2460,34 @@ mod tests {
 
         let mut buf = read_segment(&dev, &alloc, SegmentId(0));
         let (_, recs) = replay_segment(&buf).unwrap();
+        let (_, extents) = replay_segment_extents(&buf).unwrap();
         let keys = |rs: &[(u32, Record)]| rs.iter().map(|(o, r)| (*o, r.key.clone())).collect::<Vec<_>>();
-        buf[recs[0].0 as usize + KEY_OFF] ^= 0x01;
+        let (off0, len0, _) = extents[0];
+        buf[(off0 + len0) as usize - 2] ^= 0x01;
         let (_, after_bit_flip) = replay_segment(&buf).unwrap();
         assert_eq!(keys(&after_bit_flip), keys(&recs[1..]));
 
-        buf[recs[1].0 as usize + 6] ^= 0x40;
+        let key_len_at = if format == SEG_FORMAT_V1 { 6 } else { 1 };
+        buf[recs[1].0 as usize + key_len_at] ^= 0x40;
         let (_, after_bad_length) = replay_segment(&buf).unwrap();
         assert_eq!(keys(&after_bad_length), keys(&recs[2..]));
     }
 
     #[test]
     fn replay_rejects_prior_incarnation_records_on_reused_segment() {
+        for format in FORMATS {
+            with_vlog_write_version(format, || prior_incarnation_in(format));
+        }
+    }
+
+    fn prior_incarnation_in(format: u16) {
         let dev = MemBlockDevice::new(BS, 64);
-        let boundary_fill = vec![1u8; BS - SEG_HEADER_LEN - HEADER_LEN - 4];
-        {
+        let (seg_header, first_header) = match format {
+            SEG_FORMAT_V1 => (SEG_HEADER_LEN_V1, HEADER_LEN),
+            _ => (SEG_HEADER_LEN, MIN_RECORD_LEN + 1),
+        };
+        let boundary_fill = vec![1u8; BS - seg_header - first_header - 4];
+        let gen1 = {
             let mut alloc = Allocator::new(64, SEG_BLOCKS, 0);
             let mut log1 = ValueLog::new(BS, SEG_BLOCKS, 0, 0);
             log1.append(
@@ -2037,7 +2502,13 @@ mod tests {
             log1.append(&dev, &mut alloc, RecordKind::Put, 0, b"stale", b"old-data")
                 .unwrap();
             log1.sync(&dev).unwrap();
-        }
+            read_segment(&dev, &alloc, SegmentId(0))
+        };
+        let (_, old) = replay_segment(&gen1).unwrap();
+        assert_eq!(old[1].0 as usize, BS, "test premise: the stale record starts at a block boundary");
+        assert_eq!(old[1].1.key, b"stale");
+        assert_eq!(old[1].1.epoch, 0);
+
         let mut alloc = Allocator::new(64, SEG_BLOCKS, 0);
         let mut log2 = ValueLog::new(BS, SEG_BLOCKS, 100, 1);
         let (_, ptr) = log2
@@ -2059,9 +2530,7 @@ mod tests {
         log2.sync(&dev).unwrap();
 
         let buf = read_segment(&dev, &alloc, SegmentId(0));
-        let stale = decode_record(&buf[256..256 + HEADER_LEN + 5 + 8]).unwrap();
-        assert_eq!(stale.key, b"stale");
-        assert_eq!(stale.epoch, 0);
+        assert_eq!(buf[BS..], gen1[BS..], "test premise: the stale record is still on the device");
         let (hdr, recs) = replay_segment(&buf).unwrap();
         assert_eq!(hdr.epoch, 1);
         assert_eq!(
@@ -2071,6 +2540,137 @@ mod tests {
         );
         assert_eq!(recs[0].1.key, b"gen2");
         assert_eq!(recs[0].1.epoch, 1);
+        assert_eq!(recs[0].1.seq, 100);
+    }
+
+    #[test]
+    fn compact_records_round_trip_seq_and_version_deltas() {
+        let (dev, mut alloc, mut log) = setup();
+        let base = (1_700_000_000_000u128 << 16) << 64 | 0xABCD_EF01_2345_6789;
+        let versions = [
+            base,
+            base + (5u128 << 64),
+            base - (3u128 << 64),
+            (base & !(u64::MAX as u128)) | 42,
+            u128::MAX,
+            0,
+            base,
+        ];
+        let mut ptrs = Vec::new();
+        for (i, &version) in versions.iter().enumerate() {
+            let key = format!("key-{i}");
+            let tombstone = i % 3 == 1;
+            let (seq, ptr) = log
+                .append_tombstone(&dev, &mut alloc, RecordKind::Put, tombstone, version, key.as_bytes(), b"value")
+                .unwrap();
+            ptrs.push((seq, ptr, key, version, tombstone));
+        }
+        log.append(&dev, &mut alloc, RecordKind::Delete, base, b"gone", &[]).unwrap();
+        log.sync(&dev).unwrap();
+        assert_eq!(ptrs[0].1.len as usize, MIN_RECORD_LEN + 5 + 5, "the first record encodes zero deltas");
+        assert_eq!(ptrs[1].1.len as usize, MIN_RECORD_LEN + 5 + 5, "a small hlc step and the same writer");
+        assert_eq!(ptrs[3].1.len as usize, MIN_RECORD_LEN + 8 + 5 + 5, "another writer is stored in full");
+
+        let buf = read_segment(&dev, &alloc, SegmentId(0));
+        let (hdr, recs) = replay_segment_extents(&buf).unwrap();
+        assert_eq!(hdr.format, SEG_FORMAT_V2);
+        assert_eq!((hdr.base_seq, hdr.base_version), (0, base));
+        assert_eq!(recs.len(), versions.len() + 1);
+        for ((off, len, rec), (seq, ptr, key, version, tombstone)) in recs.iter().zip(&ptrs) {
+            assert_eq!((*off, *len), (ptr.offset, ptr.len));
+            assert_eq!((rec.seq, rec.version, rec.tombstone), (*seq, *version, *tombstone));
+            assert_eq!((rec.key.as_slice(), rec.value.as_slice()), (key.as_bytes(), &b"value"[..]));
+            let start = alloc.segment_range(ptr.segment).0;
+            let read = log.read_checked(&dev, start, ptr, key.as_bytes(), *version).unwrap();
+            assert_eq!((read.value.as_slice(), read.version, read.tombstone), (&b"value"[..], *version, *tombstone));
+            let wrong = log.read_checked(&dev, start, ptr, key.as_bytes(), version ^ 1).unwrap_err();
+            assert!(matches!(wrong, LogError::Corrupt(CRC_OR_VERSION_MISMATCH)), "{wrong}");
+            assert_eq!(corrupt_read_kind(CRC_OR_VERSION_MISMATCH), "crc");
+            let wrong_key = log.read_checked(&dev, start, ptr, b"other", *version).unwrap_err();
+            assert!(matches!(wrong_key, LogError::Corrupt(KEY_MISMATCH)), "{wrong_key}");
+        }
+        let (_, _, gone) = recs.last().unwrap();
+        assert_eq!((gone.kind, gone.key.as_slice(), gone.version), (RecordKind::Delete, &b"gone"[..], base));
+    }
+
+    #[test]
+    fn segments_keep_the_format_they_were_opened_with() {
+        let (dev, mut alloc, mut log) = setup();
+        let value = vec![7u8; 600];
+        let (_, first) = with_vlog_write_version(SEG_FORMAT_V1, || {
+            log.append(&dev, &mut alloc, RecordKind::Put, 1, b"old", &value).unwrap()
+        });
+        let (_, same_seg) = log.append(&dev, &mut alloc, RecordKind::Put, 2, b"old2", b"v").unwrap();
+        assert_eq!(same_seg.segment, first.segment);
+        assert_eq!(same_seg.len as usize, HEADER_LEN + 5, "the open format-1 segment keeps format 1");
+        let (_, rolled) = log.append(&dev, &mut alloc, RecordKind::Put, 3, b"new", &value).unwrap();
+        assert_ne!(rolled.segment, first.segment);
+        log.sync(&dev).unwrap();
+        let formats: Vec<u16> = [first.segment, rolled.segment]
+            .iter()
+            .map(|s| replay_segment(&read_segment(&dev, &alloc, *s)).unwrap().0.format)
+            .collect();
+        assert_eq!(formats, [SEG_FORMAT_V1, SEG_FORMAT_V2]);
+        for (ptr, key, version) in [(first, &b"old"[..], 1), (same_seg, b"old2", 2), (rolled, b"new", 3)] {
+            let start = alloc.segment_range(ptr.segment).0;
+            assert!(log.read_checked(&dev, start, &ptr, key, version).is_ok(), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn rewrite_writer_reports_full_instead_of_failing() {
+        let dev = MemBlockDevice::new(BS, 64);
+        let mut alloc = Allocator::new(64, SEG_BLOCKS, 0);
+        let segs = [alloc.allocate().unwrap()];
+        let lbas = [alloc.segment_range(segs[0]).0];
+        let epochs = [9];
+        let mut w = VlogWriter::new(&dev, &segs, &lbas, &epochs, SEG_BLOCKS as usize * BS, BS);
+        let mut written = Vec::new();
+        for i in 0..100u64 {
+            match w.append(RecordKind::Put, false, i, i as u128, format!("k{i}").as_bytes(), &[1u8; 40]).unwrap() {
+                Some(ptr) => written.push((i, ptr)),
+                None => break,
+            }
+        }
+        assert!(w.is_full(), "test premise: one segment does not hold 100 records");
+        assert_eq!(w.append(RecordKind::Put, false, 0, 0, b"k", b"v").unwrap(), None);
+        let used = vals_rt::block_on(w.finish(), || {}).unwrap();
+        assert_eq!(used, segs);
+        let buf = read_segment(&dev, &alloc, segs[0]);
+        let (hdr, recs) = replay_segment(&buf).unwrap();
+        assert!(hdr.not_tail);
+        assert_eq!(recs.iter().map(|(_, r)| r.seq).collect::<Vec<_>>(), written.iter().map(|(i, _)| *i).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn varints_and_zigzag_round_trip_at_their_limits() {
+        for v in [0u64, 1, 127, 128, 16_383, 16_384, u32::MAX as u64, u64::MAX - 1, u64::MAX] {
+            let mut buf = [0u8; 10];
+            let mut at = 0;
+            put_varint(&mut buf, &mut at, v);
+            assert_eq!(at, varint_len(v));
+            let mut read = 0;
+            assert_eq!(get_varint(&buf, &mut read), Some(v));
+            assert_eq!(read, at);
+            assert_eq!(unzigzag(zigzag(v)), v);
+        }
+        assert_eq!(zigzag(u64::MAX), 1, "-1 encodes in one byte");
+        let mut at = 0;
+        assert_eq!(get_varint(&[0xFF; 10], &mut at), None, "an over-long varint is refused");
+        let mut at = 0;
+        assert_eq!(get_varint(&[0x80, 0x80], &mut at), None, "a truncated varint is refused");
+    }
+
+    #[test]
+    fn vlog_write_version_parses_like_the_run_knob() {
+        assert_eq!(parse_vlog_write_version(None), SEG_FORMAT_V2);
+        assert_eq!(parse_vlog_write_version(Some("2")), SEG_FORMAT_V2);
+        assert_eq!(parse_vlog_write_version(Some(" 1 ")), SEG_FORMAT_V1);
+        assert_eq!(parse_vlog_write_version(Some("")), SEG_FORMAT_V1);
+        assert_eq!(parse_vlog_write_version(Some("3")), SEG_FORMAT_V1);
+        assert_eq!(vlog_write_version(), SEG_FORMAT_V2);
+        assert_eq!(with_vlog_write_version(SEG_FORMAT_V1, vlog_write_version), SEG_FORMAT_V1);
+        assert_eq!(vlog_write_version(), SEG_FORMAT_V2);
     }
 
     #[test]
@@ -2095,7 +2695,8 @@ mod tests {
 
     #[test]
     fn seg_header_unknown_version_is_rejected_loud() {
-        let mut b = encode_seg_header(7, BS as u32);
+        let base = RecordBase { format: SEG_FORMAT_V2, epoch: 7, seq: 0, version: 0 };
+        let mut b = encode_seg_header(&base, BS as u32, false);
         b[4..6].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
         let crc = {
             let mut c = Crc32::new();

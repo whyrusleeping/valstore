@@ -107,8 +107,8 @@
 
         store.borrow_mut().apply(b"key-a", Some(b"value-0340"), v(2)).unwrap();
         set_ptr(&store, b"key-a", a);
-        let before = corrupt_reads("version");
-        expect_failure(get(&store, b"key-a"), "record version mismatch", "version", before, "get key 6b65792d61");
+        let before = corrupt_reads("crc");
+        expect_failure(get(&store, b"key-a"), "record crc or version mismatch", "crc", before, "get key 6b65792d61");
 
         assert_eq!(
             get(&store, b"key-b"),

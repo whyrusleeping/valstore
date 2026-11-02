@@ -182,11 +182,12 @@ impl<D: BlockDevice> VersionedStore<D> {
     pub fn plan_get_ptr(
         &self,
         ptr: &vals_store::vlog::ValuePtr,
+        version: u128,
     ) -> Result<vals_store::ReadPlan, EngineError>
     where
         D: AsyncRead,
     {
-        self.engine.plan_get_ptr(ptr)
+        self.engine.plan_get_ptr(ptr, version)
     }
 
     pub fn probe_version(&self, key: &[u8]) -> vals_store::StagedVersion
