@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::crc::Crc32;
@@ -650,7 +651,7 @@ pub struct ReadPlan {
     within: usize,
     ptr: ValuePtr,
     version: u128,
-    tail_overlay: Option<(usize, Vec<u8>)>,
+    unwritten: Overlays,
 }
 
 impl ReadPlan {
@@ -698,9 +699,7 @@ impl ReadPlan {
             dev.release_scratch(buf);
             return Err(e.into());
         }
-        if let Some((off, tail)) = &self.tail_overlay {
-            buf.as_mut_slice()[*off..*off + self.block_size].copy_from_slice(tail);
-        }
+        overlay(buf.as_mut_slice(), &self.unwritten);
         Ok(buf)
     }
 
@@ -754,13 +753,28 @@ impl ReadPlan {
     }
 }
 
+/// Value-log blocks a read covers that are still only in memory (staged
+/// blocks, the dirty tail), as `(byte offset into the read, bytes)`, laid over
+/// the device bytes once the read completes.
+type Overlays = Vec<(usize, Vec<u8>)>;
+
+fn overlay(buf: &mut [u8], unwritten: &Overlays) {
+    for (off, bytes) in unwritten {
+        buf[*off..*off + bytes.len()].copy_from_slice(bytes);
+    }
+}
+
+fn overlaps(a: &Range<u64>, b: &Range<u64>) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
 const SPAN_GAP_BLOCKS: u64 = 4;
 const SPAN_MAX_BYTES: usize = 128 * 1024;
 
 struct Span {
     lba: u64,
     nblocks: usize,
-    tail_overlay: Option<(usize, Vec<u8>)>,
+    unwritten: Overlays,
     slots: Vec<(u32, u32, ValuePtr)>,
 }
 
@@ -826,9 +840,7 @@ impl SpanReadPlan {
                 error: e.into(),
             });
         }
-        if let Some((off, tail)) = &span.tail_overlay {
-            buf.as_mut_slice()[*off..*off + self.block_size].copy_from_slice(tail);
-        }
+        overlay(buf.as_mut_slice(), &span.unwritten);
         let out = Self::decode_span(span, &buf[..span.nblocks * self.block_size], expected);
         dev.release_scratch(buf);
         out
@@ -862,9 +874,7 @@ impl SpanReadPlan {
         let mut out: Vec<Option<Record>> = Vec::with_capacity(self.num_records);
         out.resize_with(self.num_records, || None);
         for (span, buf) in self.spans.iter().zip(&mut bufs) {
-            if let Some((off, tail)) = &span.tail_overlay {
-                buf[*off..*off + self.block_size].copy_from_slice(tail);
-            }
+            overlay(buf, &span.unwritten);
             for (slot, rec) in Self::decode_span(span, buf, expected)? {
                 out[slot] = Some(rec);
             }
@@ -938,7 +948,7 @@ pub fn plan_read_spans_detached(
             spans.push(Span {
                 lba,
                 nblocks,
-                tail_overlay: None,
+                unwritten: Vec::new(),
                 slots: vec![(slot, (ptr.offset as usize % bs) as u32, *ptr)],
             });
         }
@@ -1229,6 +1239,12 @@ pub fn decode_seg_header(b: &[u8]) -> Result<SegHeader, LogError> {
     })
 }
 
+/// A submitted asynchronous block write and the device blocks it covers.
+struct InflightWrite {
+    lbas: Range<u64>,
+    handle: WriteHandle,
+}
+
 pub struct ValueLog {
     block_size: usize,
     seg_blocks: u64,
@@ -1241,10 +1257,9 @@ pub struct ValueLog {
     next_epoch: u64,
     cur_epoch: u64,
     cur_base: RecordBase,
-    inflight: RefCell<Vec<WriteHandle>>,
+    inflight: RefCell<Vec<InflightWrite>>,
     /// Full blocks appended but not yet submitted, contiguous from `staged_lba`.
-    /// Submitted before any wait for in-flight writes, so readers and syncs
-    /// (which drain first) never miss them.
+    /// Syncs write them; reads lay them over the device bytes instead.
     staged: RefCell<Vec<u8>>,
     staged_lba: std::cell::Cell<u64>,
     tail_segs: Vec<(u64, SegmentId)>,
@@ -1307,9 +1322,9 @@ impl ValueLog {
         let mut i = 0;
         let mut result = Ok(());
         while i < inflight.len() {
-            if inflight[i].is_done() {
-                let h = inflight.swap_remove(i);
-                if let Err(e) = h.into_result() {
+            if inflight[i].handle.is_done() {
+                let w = inflight.swap_remove(i);
+                if let Err(e) = w.handle.into_result() {
                     self.write_lost.set(true);
                     result = Err(e.into());
                 }
@@ -1321,7 +1336,7 @@ impl ValueLog {
     }
 
     fn head_done(&self) -> bool {
-        self.inflight.borrow().first().is_some_and(|h| h.is_done())
+        self.inflight.borrow().first().is_some_and(|w| w.handle.is_done())
     }
 
     fn submit_block<D: BlockDevice>(&self, dev: &D, lba: u64, buf: &[u8]) -> Result<(), LogError> {
@@ -1336,9 +1351,10 @@ impl ValueLog {
             VLOG_STALLS.fetch_add(1, Ordering::Relaxed);
             VLOG_STALL_US_TOTAL.fetch_add(us, Ordering::Relaxed);
         }
-        let h = dev.submit_write(lba, buf);
+        let handle = dev.submit_write(lba, buf);
         crate::attribution::write_bytes(0, buf.len());
-        self.inflight.borrow_mut().push(h);
+        let lbas = lba..lba + (buf.len() / self.block_size) as u64;
+        self.inflight.borrow_mut().push(InflightWrite { lbas, handle });
         Ok(())
     }
 
@@ -1403,12 +1419,52 @@ impl ValueLog {
         self.write_staged(dev)
     }
 
-    /// `drain_inflight` for a read: a lost write fails the syncs that cover
-    /// it, not reads of other records (a read of a lost record fails its
-    /// key and checksum checks).
-    fn drain_for_read<D: BlockDevice>(&self, dev: &D) -> Result<(), LogError> {
-        self.quiesce_inflight(dev);
-        self.write_staged(dev)
+    /// Readies the device for a read of `reads` (block ranges) without
+    /// forcing out unrelated writes (0557): waits only for the in-flight
+    /// writes that overlap them, and writes nothing. Blocks still only in
+    /// memory are laid over the read with [`Self::unwritten`]. Completed
+    /// writes are reaped on the way, so a lost write still sets `write_lost`
+    /// and fails later syncs; a read of a lost record fails its key and
+    /// checksum checks.
+    fn ready_for_read<D: BlockDevice>(&self, dev: &D, reads: &[Range<u64>]) {
+        let _ = self.reap();
+        let pending = |log: &Self| {
+            log.inflight
+                .borrow()
+                .iter()
+                .any(|w| reads.iter().any(|r| overlaps(&w.lbas, r)))
+        };
+        while pending(self) {
+            dev.poll_writes();
+            let _ = self.reap();
+        }
+    }
+
+    /// The blocks of `read` still only in memory (staged blocks and the
+    /// dirty tail), as overlays for its buffer. Copied, so they stay right
+    /// even if those blocks are submitted while an async read is in flight.
+    fn unwritten(&self, read: &Range<u64>) -> Overlays {
+        let bs = self.block_size as u64;
+        let mut out = Vec::new();
+        let staged = self.staged.borrow();
+        let staged_lbas = self.staged_lba.get()..self.staged_lba.get() + staged.len() as u64 / bs;
+        let (from, to) = (read.start.max(staged_lbas.start), read.end.min(staged_lbas.end));
+        if from < to {
+            let bytes = &staged[((from - staged_lbas.start) * bs) as usize..((to - staged_lbas.start) * bs) as usize];
+            out.push((((from - read.start) * bs) as usize, bytes.to_vec()));
+        }
+        if self.tail_dirty && self.cur_seg.is_some() {
+            let tail_lba = self.cur_seg_start + self.write_off as u64 / bs;
+            if read.contains(&tail_lba) {
+                out.push((((tail_lba - read.start) * bs) as usize, self.tail.to_vec()));
+            }
+        }
+        out
+    }
+
+    fn read_range(&self, seg_start_lba: u64, ptr: &ValuePtr) -> Result<Range<u64>, LogError> {
+        let (first, nblocks) = self.span_blocks(ptr)?;
+        Ok(seg_start_lba + first..seg_start_lba + first + nblocks as u64)
     }
 
     fn write_staged<D: BlockDevice>(&self, dev: &D) -> Result<(), LogError> {
@@ -1444,7 +1500,7 @@ impl ValueLog {
     }
 
     pub fn inflight_writes(&self) -> usize {
-        self.inflight.borrow().iter().filter(|h| !h.is_done()).count()
+        self.inflight.borrow().iter().filter(|w| !w.handle.is_done()).count()
     }
 
     pub fn next_seq(&self) -> u64 {
@@ -1576,29 +1632,25 @@ impl ValueLog {
         record_span(ptr, self.block_size, self.seg_blocks * self.block_size as u64)
     }
 
-    fn tail_overlay_off(&self, ptr: &ValuePtr, first: u64, nblocks: usize) -> Option<usize> {
-        if Some(ptr.segment) != self.cur_seg || !self.tail_dirty {
-            return None;
+    /// Each item's block range, readied for reading with its unwritten
+    /// blocks captured, and a buffer for it.
+    fn ready_reads<D: BlockDevice>(
+        &self,
+        dev: &D,
+        items: &[(u64, ValuePtr)],
+    ) -> Result<(Vec<Range<u64>>, Vec<Overlays>, Vec<Vec<u8>>), LogError> {
+        let mut reads = Vec::with_capacity(items.len());
+        for (seg_start, ptr) in items {
+            reads.push(self.read_range(*seg_start, ptr)?);
         }
-        let bs = self.block_size as u64;
-        let tail_block = self.write_off as u64 / bs;
-        let last = first + nblocks as u64 - 1;
-        (tail_block >= first && tail_block <= last).then(|| ((tail_block - first) * bs) as usize)
+        self.ready_for_read(dev, &reads);
+        let unwritten = reads.iter().map(|r| self.unwritten(r)).collect();
+        let bufs = reads.iter().map(|r| io_buf((r.end - r.start) as usize * self.block_size)).collect();
+        Ok((reads, unwritten, bufs))
     }
 
-    fn read_bufs(&self, items: &[(u64, ValuePtr)]) -> Result<(Vec<(u64, usize)>, Vec<Vec<u8>>), LogError> {
-        let mut spans = Vec::with_capacity(items.len());
-        for (_, ptr) in items {
-            spans.push(self.span_blocks(ptr)?);
-        }
-        let bufs = spans.iter().map(|&(_, n)| io_buf(n * self.block_size)).collect();
-        Ok((spans, bufs))
-    }
-
-    fn record_bytes<'a>(&self, buf: &'a mut [u8], ptr: &ValuePtr, (first, nblocks): (u64, usize)) -> &'a [u8] {
-        if let Some(off) = self.tail_overlay_off(ptr, first, nblocks) {
-            buf[off..off + self.block_size].copy_from_slice(&self.tail);
-        }
+    fn record_bytes<'a>(&self, buf: &'a mut [u8], unwritten: &Overlays, ptr: &ValuePtr) -> &'a [u8] {
+        overlay(buf, unwritten);
         let within = ptr.offset as usize % self.block_size;
         &buf[within..within + ptr.len as usize]
     }
@@ -1606,7 +1658,7 @@ impl ValueLog {
     fn decode_records_checked(
         &self,
         bufs: &mut [Vec<u8>],
-        spans: &[(u64, usize)],
+        unwritten: &[Overlays],
         items: &[(u64, ValuePtr)],
         expected: &[(&[u8], u128)],
     ) -> Result<Vec<Record>, LogError> {
@@ -1614,9 +1666,9 @@ impl ValueLog {
             return Err(LogError::Corrupt("checked batch length mismatch"));
         }
         let mut out = Vec::with_capacity(items.len());
-        for (((buf, &span), (_, ptr)), &(key, version)) in bufs.iter_mut().zip(spans).zip(items).zip(expected) {
+        for (((buf, unwritten), (_, ptr)), &(key, version)) in bufs.iter_mut().zip(unwritten).zip(items).zip(expected) {
             out.push(decode_record_value(
-                self.record_bytes(buf, ptr, span),
+                self.record_bytes(buf, unwritten, ptr),
                 Some(key),
                 version,
             )?);
@@ -1632,12 +1684,12 @@ impl ValueLog {
         expected_key: &[u8],
         expected_version: u128,
     ) -> Result<Record, LogError> {
-        self.drain_for_read(dev)?;
-        let span = self.span_blocks(ptr)?;
-        let mut buf = io_buf(span.1 * self.block_size);
-        dev.read_at(seg_start_lba + span.0, &mut buf)?;
+        let read = self.read_range(seg_start_lba, ptr)?;
+        self.ready_for_read(dev, std::slice::from_ref(&read));
+        let mut buf = io_buf((read.end - read.start) as usize * self.block_size);
+        dev.read_at(read.start, &mut buf)?;
         decode_record_value(
-            self.record_bytes(&mut buf, ptr, span),
+            self.record_bytes(&mut buf, &self.unwritten(&read), ptr),
             Some(expected_key),
             expected_version,
         )
@@ -1649,21 +1701,16 @@ impl ValueLog {
         items: &[(u64, ValuePtr)],
         expected: &[(&[u8], u128)],
     ) -> Result<Vec<Record>, LogError> {
-        self.drain_for_read(dev)?;
-        let (spans, mut bufs) = self.read_bufs(items)?;
+        let (reads, unwritten, mut bufs) = self.ready_reads(dev, items)?;
         {
             let mut ops: Vec<ReadOp<'_>> = bufs
                 .iter_mut()
-                .zip(&spans)
-                .zip(items)
-                .map(|((buf, &(first, _)), (seg_start, _))| ReadOp {
-                    lba: seg_start + first,
-                    buf,
-                })
+                .zip(&reads)
+                .map(|(buf, read)| ReadOp { lba: read.start, buf })
                 .collect();
             dev.read_batch(&mut ops)?;
         }
-        self.decode_records_checked(&mut bufs, &spans, items, expected)
+        self.decode_records_checked(&mut bufs, &unwritten, items, expected)
     }
 
     pub async fn read_many_async_checked<D: AsyncRead + BlockDevice>(
@@ -1672,17 +1719,15 @@ impl ValueLog {
         items: &[(u64, ValuePtr)],
         expected: &[(&[u8], u128)],
     ) -> Result<Vec<Record>, LogError> {
-        self.drain_for_read(dev)?;
-        let (spans, mut bufs) = self.read_bufs(items)?;
+        let (reads, unwritten, mut bufs) = self.ready_reads(dev, items)?;
 
         let acks = {
             let futs: Vec<_> = bufs
                 .iter_mut()
-                .zip(&spans)
-                .zip(items)
-                .map(|((buf, &(first, _)), (seg_start, _))| {
+                .zip(&reads)
+                .map(|(buf, read)| {
                     // SAFETY: `bufs` is owned by this future, so leaking the reads leaks it too.
-                    unsafe { dev.read_async_in_place(seg_start + first, buf.as_mut_slice()) }
+                    unsafe { dev.read_async_in_place(read.start, buf.as_mut_slice()) }
                 })
                 .collect();
             vals_rt::join_all(futs).await
@@ -1690,7 +1735,7 @@ impl ValueLog {
         for ack in acks {
             ack?;
         }
-        self.decode_records_checked(&mut bufs, &spans, items, expected)
+        self.decode_records_checked(&mut bufs, &unwritten, items, expected)
     }
 
     pub fn plan_read<D: BlockDevice>(
@@ -1700,19 +1745,16 @@ impl ValueLog {
         ptr: &ValuePtr,
         version: u128,
     ) -> Result<ReadPlan, LogError> {
-        self.drain_for_read(dev)?;
-        let (first_block, nblocks) = self.span_blocks(ptr)?;
-        let tail_overlay = self
-            .tail_overlay_off(ptr, first_block, nblocks)
-            .map(|off| (off, self.tail.to_vec()));
+        let read = self.read_range(seg_start_lba, ptr)?;
+        self.ready_for_read(dev, std::slice::from_ref(&read));
         Ok(ReadPlan {
-            lba: seg_start_lba + first_block,
-            nblocks,
+            lba: read.start,
+            nblocks: (read.end - read.start) as usize,
             block_size: self.block_size,
             within: ptr.offset as usize % self.block_size,
             ptr: *ptr,
             version,
-            tail_overlay,
+            unwritten: self.unwritten(&read),
         })
     }
 
@@ -1721,20 +1763,13 @@ impl ValueLog {
         dev: &D,
         items: &[(u64, ValuePtr)],
     ) -> Result<SpanReadPlan, LogError> {
-        self.drain_for_read(dev)?;
         let bs = self.block_size;
         let mut plan = plan_read_spans_detached(bs, self.seg_blocks * bs as u64, items)?;
-
-        if self.tail_dirty && self.cur_seg.is_some() {
-            let tail_lba = self.cur_seg_start + self.write_off as u64 / bs as u64;
-            for span in &mut plan.spans {
-                if tail_lba >= span.lba && tail_lba < span.lba + span.nblocks as u64 {
-                    let off = (tail_lba - span.lba) as usize * bs;
-                    span.tail_overlay = Some((off, self.tail.to_vec()));
-                }
-            }
+        let reads: Vec<Range<u64>> = plan.spans.iter().map(|s| s.lba..s.lba + s.nblocks as u64).collect();
+        self.ready_for_read(dev, &reads);
+        for (span, read) in plan.spans.iter_mut().zip(&reads) {
+            span.unwritten = self.unwritten(read);
         }
-
         Ok(plan)
     }
 
@@ -2060,9 +2095,10 @@ mod tests {
         let (_, _, log) = setup();
         let first = vals_spdk::WriteState::pending();
         let second = vals_spdk::WriteState::pending();
-        log.inflight.borrow_mut().extend([
-            WriteHandle::pending(first.clone()), WriteHandle::pending(second.clone()),
-        ]);
+        log.inflight.borrow_mut().extend([first.clone(), second.clone()].map(|state| InflightWrite {
+            lbas: 0..1,
+            handle: WriteHandle::pending(state),
+        }));
         assert_eq!(log.inflight_writes(), 2);
         first.complete(true);
         assert_eq!(log.inflight_writes(), 1);
@@ -2338,11 +2374,11 @@ mod tests {
         // 200 records fill 78 full blocks: one 64-block (16 KiB) write so far, the rest staged.
         assert_eq!(*dev.writes.lock().unwrap(), [COALESCE_BYTES]);
         assert_eq!(log.staged.borrow().len(), 14 * BS);
-        // A read drains first, so it sees a staged block's record.
+        // A read sees a staged block's record from memory, writing nothing.
         let (start, _) = alloc.segment_range(ptrs[190].segment);
         assert_eq!(log.read_checked(&dev, start, &ptrs[190], b"k190", 0).unwrap().value, value);
-        assert_eq!(*dev.writes.lock().unwrap(), [COALESCE_BYTES, 14 * BS]);
-        assert!(log.staged.borrow().is_empty());
+        assert_eq!(*dev.writes.lock().unwrap(), [COALESCE_BYTES]);
+        assert_eq!(log.staged.borrow().len(), 14 * BS);
 
         for i in 200..260u32 {
             log.append(
@@ -2444,6 +2480,145 @@ mod tests {
         let mut buf = vec![0u8; SEG as usize * BS];
         dev.read_at(start, &mut buf).unwrap();
         assert_eq!(replay_segment(&buf).unwrap().1.len(), 30);
+    }
+
+    /// Lands asynchronous writes only when polled, one per poll, so a read
+    /// that does not wait for an overlapping write sees the old bytes.
+    struct DeferredWritesDevice {
+        inner: MemBlockDevice,
+        pending: std::sync::Mutex<std::collections::VecDeque<(u64, Vec<u8>, std::sync::Arc<vals_spdk::WriteState>)>>,
+        writes: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl DeferredWritesDevice {
+        fn pending(&self) -> usize {
+            self.pending.lock().unwrap().len()
+        }
+    }
+
+    impl BlockDevice for DeferredWritesDevice {
+        fn block_size(&self) -> usize {
+            self.inner.block_size()
+        }
+        fn num_blocks(&self) -> u64 {
+            self.inner.num_blocks()
+        }
+        fn read_at(&self, lba: u64, buf: &mut [u8]) -> vals_spdk::Result<()> {
+            self.inner.read_at(lba, buf)
+        }
+        fn write_at(&self, lba: u64, buf: &[u8]) -> vals_spdk::Result<()> {
+            self.writes.lock().unwrap().push(buf.len());
+            self.inner.write_at(lba, buf)
+        }
+        fn flush(&self) -> vals_spdk::Result<()> {
+            self.inner.flush()
+        }
+        fn submit_write(&self, lba: u64, buf: &[u8]) -> WriteHandle {
+            self.writes.lock().unwrap().push(buf.len());
+            let state = vals_spdk::WriteState::pending();
+            self.pending.lock().unwrap().push_back((lba, buf.to_vec(), state.clone()));
+            WriteHandle::pending(state)
+        }
+        fn poll_writes(&self) -> i32 {
+            let next = self.pending.lock().unwrap().pop_front();
+            let Some((lba, data, state)) = next else { return 0 };
+            self.inner.write_at(lba, &data).unwrap();
+            state.complete(true);
+            1
+        }
+    }
+
+    impl AsyncRead for DeferredWritesDevice {
+        async fn read_async(&self, lba: u64, buf: &mut [u8]) -> vals_spdk::Result<()> {
+            self.read_at(lba, buf)
+        }
+    }
+
+    #[test]
+    fn reads_wait_only_for_overlapping_writes_and_never_write() {
+        with_vlog_write_version(SEG_FORMAT_V1, reads_wait_only_for_overlapping_writes);
+    }
+
+    fn reads_wait_only_for_overlapping_writes() {
+        const SEG: u64 = 128;
+        let dev = DeferredWritesDevice {
+            inner: MemBlockDevice::new(BS, 1024),
+            pending: Default::default(),
+            writes: Default::default(),
+        };
+        let mut alloc = Allocator::new(1024, SEG, 0);
+        let mut log = ValueLog::new(BS, SEG, 0, 0);
+        let value = [7u8; 46]; // 100 B records
+        let key = |i: usize| format!("k{i:03}").into_bytes();
+        let mut ptrs = Vec::new();
+        let mut append = |log: &mut ValueLog, i: usize| {
+            ptrs.push(log.append(&dev, &mut alloc, RecordKind::Put, i as u128, &key(i), &value).unwrap().1);
+        };
+        for i in 0..10 {
+            append(&mut log, i);
+        }
+        log.sync(&dev).unwrap();
+        // Then one coalesced 16 KiB write in flight (not landed), 14 staged
+        // blocks and a dirty tail.
+        for i in 10..210 {
+            append(&mut log, i);
+        }
+        let start = alloc.segment_range(ptrs[0].segment).0;
+        let rec_range = |i: usize| log.read_range(start, &ptrs[i]).unwrap();
+        assert_eq!(dev.pending(), 1);
+        let inflight = log.inflight.borrow()[0].lbas.clone();
+        let staged = log.staged_lba.get()..log.staged_lba.get() + (log.staged.borrow().len() / BS) as u64;
+        let staged_len = log.staged.borrow().len();
+        assert!(!staged.is_empty());
+        assert!(log.tail_dirty);
+        let (old, in_flight, in_staged, in_tail) = (0, 20, 190, 209);
+        assert!(rec_range(old).end <= inflight.start);
+        assert!(overlaps(&rec_range(in_flight), &inflight) && !overlaps(&rec_range(in_flight), &staged));
+        assert!(rec_range(in_staged).start >= staged.start && rec_range(in_staged).end <= staged.end);
+        // The last record runs from a staged block into the tail block.
+        let tail_lba = start + log.write_off as u64 / BS as u64;
+        assert!(rec_range(in_tail).contains(&tail_lba) && overlaps(&rec_range(in_tail), &staged));
+        assert!(!overlaps(&rec_range(in_tail), &inflight));
+        let writes = dev.writes.lock().unwrap().len();
+        let check = |log: &ValueLog, i: usize| {
+            let r = &ptrs[i];
+            assert_eq!(log.read_checked(&dev, start, r, &key(i), i as u128).unwrap().value, value, "{i}");
+            let many = log.read_many_checked(&dev, &[(start, *r)], &[(&key(i), i as u128)]).unwrap();
+            assert_eq!(many[0].value, value, "{i}");
+            let many = vals_rt::block_on(log.read_many_async_checked(&dev, &[(start, *r)], &[(&key(i), i as u128)]), || {});
+            assert_eq!(many.unwrap()[0].value, value, "{i}");
+            let plan = log.plan_read(&dev, start, r, i as u128).unwrap();
+            assert_eq!(vals_rt::block_on(plan.execute_checked(&dev, &key(i)), || {}).unwrap().value, value, "{i}");
+            let spans = log.plan_read_spans(&dev, &[(start, *r)]).unwrap();
+            let expected = |_: usize| (key(i).leak() as &[u8], i as u128);
+            assert_eq!(spans.execute_sync_checked(&dev, &expected).unwrap()[0].value, value, "{i}");
+        };
+
+        // Old, staged and tail records: read without waiting for the
+        // unrelated in-flight write or writing anything.
+        for i in [old, in_staged, in_tail] {
+            check(&log, i);
+            assert_eq!(dev.pending(), 1, "{i} waited for an unrelated write");
+        }
+        assert_eq!(dev.writes.lock().unwrap().len(), writes, "a read wrote");
+        assert_eq!(log.staged.borrow().len(), staged_len);
+
+        // A staged record's plan stays right when its blocks are submitted
+        // (and not yet landed) before the plan runs.
+        let plan = log.plan_read(&dev, start, &ptrs[in_staged], in_staged as u128).unwrap();
+        log.submit_staged(&dev).unwrap();
+        assert_eq!(dev.pending(), 2);
+        let rec = vals_rt::block_on(plan.execute_checked(&dev, &key(in_staged)), || {}).unwrap();
+        assert_eq!(rec.value, value);
+
+        // A record in an in-flight write waits for exactly that write.
+        check(&log, in_flight);
+        assert_eq!(dev.pending(), 1, "only the overlapping write landed");
+
+        log.sync(&dev).unwrap();
+        for (i, ptr) in ptrs.iter().enumerate() {
+            assert_eq!(log.read_checked(&dev, start, ptr, &key(i), i as u128).unwrap().value, value);
+        }
     }
 
     /// Fails the device write with index `fail_at` (0-based).

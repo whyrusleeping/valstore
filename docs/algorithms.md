@@ -1197,12 +1197,14 @@ they are load-bearing and worth recording. Full rationale is in `ARCHITECTURE.md
   in memory; `Persistence::Device` (`WriteOptions::device_durable`) delays it until
   device sync. Full vlog blocks are coalesced into contiguous writes of up to
   16 KiB and submitted asynchronously (queue depth > 1); a sync writes the remaining
-  staged blocks and the partial tail together in one write, and every read drains
-  staged blocks first. A failed asynchronous block write cannot be retried (its
-  bytes are not kept), so whichever caller reaps it, the value log fails every
-  later sync and append with `LogError::WriteLost` until the engine is reopened;
-  reads of other records keep working (0545). Reads serve the partial tail from memory, and
-  concurrent device-persistent single/batch requests on one shard and zone join one
+  staged blocks and the partial tail together in one write. A read writes
+  nothing: it waits only for the in-flight writes that overlap the blocks it
+  reads and lays staged blocks and the partial tail over the device bytes from
+  memory, copied when it plans the read (0557). A failed asynchronous block write
+  cannot be retried (its bytes are not kept), so whichever caller reaps it, the
+  value log fails every later sync and append with `LogError::WriteLost` until
+  the engine is reopened; reads of other records keep working (0545). Concurrent
+  device-persistent single/batch requests on one shard and zone join one
   barrier after installing their writes. The leader issues one engine sync, then
   releases all joined requests with the same success/failure result, so N in-flight
   requests require O(1) device syncs. `Unacknowledged` waits for no acknowledgements,
