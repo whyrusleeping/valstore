@@ -1531,14 +1531,7 @@ impl<D: BlockDevice> Engine<D> {
             covered_epoch,
             runs: vec![meta.clone()],
         };
-        let live = snapshot_io::write_manifest(
-            &*self.dev,
-            &mut self.alloc,
-            &manifest,
-            generation,
-            self.live_manifest.as_ref(),
-        )
-        .map_err(EngineError::from)?;
+        let live = self.publish_manifest(&manifest)?;
 
         let removed: Vec<(crate::run::RunHandle, u64)> = self
             .runs
@@ -2546,6 +2539,10 @@ impl<D: BlockDevice> Engine<D> {
                 || written.covered_dropped > 0
                 || !written.rt_collected.is_empty());
         let reserved = written.output_segments();
+        if self.poisoned {
+            self.free_compact_segs(&reserved);
+            return Err(EngineError::Poisoned);
+        }
         let protected = self.protected_segments();
         let mut input_handles = std::collections::HashSet::new();
         let inputs_current = !written.merged_inputs.is_empty()
@@ -2671,18 +2668,12 @@ impl<D: BlockDevice> Engine<D> {
             covered_epoch: self.last_flush_epoch,
             runs: run_metas,
         };
-        let live = match snapshot_io::write_manifest(
-            &*self.dev,
-            &mut self.alloc,
-            &manifest,
-            generation,
-            self.live_manifest.as_ref(),
-        ) {
+        let live = match self.publish_manifest(&manifest) {
             Ok(l) => l,
             Err(e) => {
                 drop(run);
                 self.free_compact_segs(&reserved);
-                return Err(EngineError::from(e));
+                return Err(e);
             }
         };
 

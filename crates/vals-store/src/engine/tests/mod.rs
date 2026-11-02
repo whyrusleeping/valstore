@@ -295,6 +295,81 @@ use super::*;
         }
     }
 
+    #[derive(Default)]
+    struct AmbiguousManifestState {
+        armed: AtomicBool,
+        head_written: AtomicBool,
+        tripped: AtomicBool,
+        cleanup_durable: AtomicBool,
+    }
+
+    struct AmbiguousManifestDevice {
+        inner: MemBlockDevice,
+        state: Arc<AmbiguousManifestState>,
+    }
+    impl AmbiguousManifestDevice {
+        fn new(inner: MemBlockDevice, cleanup_durable: bool) -> Self {
+            let state = AmbiguousManifestState::default();
+            state.cleanup_durable.store(cleanup_durable, AtomicOrdering::Relaxed);
+            AmbiguousManifestDevice { inner, state: Arc::new(state) }
+        }
+        fn arm(&self) {
+            self.state.armed.store(true, AtomicOrdering::Relaxed);
+        }
+        fn recover(&self) {
+            self.state.armed.store(false, AtomicOrdering::Relaxed);
+            self.state.tripped.store(false, AtomicOrdering::Relaxed);
+        }
+    }
+    impl BlockDevice for AmbiguousManifestDevice {
+        fn block_size(&self) -> usize {
+            self.inner.block_size()
+        }
+        fn num_blocks(&self) -> u64 {
+            self.inner.num_blocks()
+        }
+        fn read_at(&self, lba: u64, buf: &mut [u8]) -> vals_spdk::Result<()> {
+            self.inner.read_at(lba, buf)
+        }
+        fn write_at(&self, lba: u64, buf: &[u8]) -> vals_spdk::Result<()> {
+            const MAN_MAGIC_LE: [u8; 4] = [0x56, 0x4d, 0x4e, 0x43];
+            let st = &self.state;
+            if st.tripped.load(AtomicOrdering::Relaxed) {
+                if st.cleanup_durable.load(AtomicOrdering::Relaxed) {
+                    return self.inner.write_at(lba, buf);
+                }
+                return Err(BlockError::Io(std::io::Error::other("injected persistent write failure")));
+            }
+            if st.armed.load(AtomicOrdering::Relaxed)
+                && buf.len() == self.inner.block_size()
+                && buf[..4] == MAN_MAGIC_LE
+            {
+                st.head_written.store(true, AtomicOrdering::Relaxed);
+            }
+            self.inner.write_at(lba, buf)
+        }
+        fn flush(&self) -> vals_spdk::Result<()> {
+            let st = &self.state;
+            if st.tripped.load(AtomicOrdering::Relaxed) {
+                if st.cleanup_durable.load(AtomicOrdering::Relaxed) {
+                    return self.inner.flush();
+                }
+                return Err(BlockError::Io(std::io::Error::other("injected persistent flush failure")));
+            }
+            if st.armed.load(AtomicOrdering::Relaxed) && st.head_written.swap(false, AtomicOrdering::Relaxed) {
+                self.inner.flush()?;
+                st.tripped.store(true, AtomicOrdering::Relaxed);
+                return Err(BlockError::Io(std::io::Error::other(
+                    "injected manifest flush failure after the head reached media",
+                )));
+            }
+            self.inner.flush()
+        }
+        fn sibling(&self) -> vals_spdk::Result<Self> {
+            Ok(AmbiguousManifestDevice { inner: self.inner.share(), state: self.state.clone() })
+        }
+    }
+
     struct TailWriteFailDevice {
         inner: MemBlockDevice,
         armed: Arc<AtomicBool>,

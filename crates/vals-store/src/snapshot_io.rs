@@ -37,6 +37,10 @@ pub enum SnapshotError {
         generation: Option<u64>,
         why: &'static str,
     },
+    /// A chain write failed after its head header was issued and the head
+    /// could not be durably invalidated: the new generation may or may not be
+    /// on media, so every segment either generation references stays allocated.
+    PublicationAmbiguous(BlockError),
 }
 
 impl std::fmt::Display for SnapshotError {
@@ -62,6 +66,11 @@ impl std::fmt::Display for SnapshotError {
                      (set {REBUILD_LOST_MANIFEST_ENV}=1 to rebuild anyway)"
                 )
             }
+            SnapshotError::PublicationAmbiguous(e) => write!(
+                f,
+                "manifest publication failed after its head header was issued and the head \
+                 could not be durably invalidated, so the new generation may be on media: {e}"
+            ),
         }
     }
 }
@@ -203,13 +212,13 @@ pub(crate) fn write_chain(
         buf[CHAIN_HDR_LEN..CHAIN_HDR_LEN + chunk.len()].copy_from_slice(chunk);
         buf
     };
-    let write = |lba: u64, buf: &[u8]| -> Result<(), SnapshotError> {
+    let write = |lba: u64, buf: &[u8]| -> Result<(), BlockError> {
         crate::attribution::write_bytes(5, buf.len());
-        dev.write_at(lba, buf)?;
-        Ok(())
+        dev.write_at(lba, buf)
     };
 
-    let write_phase = || -> Result<(), SnapshotError> {
+    let mut head_issued = false;
+    let mut write_phase = || -> Result<(), BlockError> {
         for i in (1..n).rev() {
             write(seg_lbas[i], &seg_image(i))?;
         }
@@ -219,19 +228,32 @@ pub(crate) fn write_chain(
         write(seg_lbas[0], &head)?;
         dev.flush()?;
         head[..CHAIN_HDR_LEN].copy_from_slice(&head_header);
+        head_issued = true;
         write(seg_lbas[0], &head[..dev.block_size()])?;
         dev.flush()?;
         Ok(())
     };
     if let Err(e) = write_phase() {
         let zero = vec![0u8; dev.block_size()];
-        for s in &segs {
-            let (lba, _) = alloc.segment_range(*s);
+        let scrub = |lba: u64| {
             crate::attribution::write_bytes(5, zero.len());
-            let _ = dev.write_at(lba, &zero);
+            dev.write_at(lba, &zero).is_ok()
+        };
+        let rest = if head_issued {
+            if !(scrub(seg_lbas[0]) && dev.flush().is_ok()) {
+                return Err(SnapshotError::PublicationAmbiguous(e));
+            }
+            &seg_lbas[1..]
+        } else {
+            &seg_lbas[..]
+        };
+        for &lba in rest {
+            scrub(lba);
+        }
+        for s in &segs {
             let _ = alloc.free(*s);
         }
-        return Err(e);
+        return Err(SnapshotError::Io(e));
     }
 
     if let Some(prev) = prev {
@@ -851,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn io_error_on_final_flush_reclaims_and_scrubs_segments() {
+    fn io_error_on_payload_flush_reclaims_and_scrubs_segments() {
         let dev = FailingDevice::new(MemBlockDevice::new(BS, 512));
         let mut alloc = Allocator::new(512, 16, 0);
 
@@ -886,5 +908,140 @@ mod tests {
             .expect("prev chain still present");
         assert_eq!(loaded, m1);
         assert_eq!(loaded_live, prev);
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum HeadFault {
+        HeaderWrite,
+        FinalFlush,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Cleanup {
+        Durable,
+        WritesFail,
+        LostInCrash,
+        HeadWriteFails,
+        OnlyHeadLost,
+    }
+
+    struct AmbiguousDevice {
+        inner: MemBlockDevice,
+        fault: HeadFault,
+        cleanup: Cleanup,
+        armed: std::sync::atomic::AtomicBool,
+        head_written: std::sync::atomic::AtomicBool,
+        head_lba: std::sync::atomic::AtomicU64,
+        tripped: std::sync::atomic::AtomicBool,
+    }
+    impl BlockDevice for AmbiguousDevice {
+        fn block_size(&self) -> usize {
+            self.inner.block_size()
+        }
+        fn num_blocks(&self) -> u64 {
+            self.inner.num_blocks()
+        }
+        fn read_at(&self, lba: u64, buf: &mut [u8]) -> vals_spdk::Result<()> {
+            self.inner.read_at(lba, buf)
+        }
+        fn write_at(&self, lba: u64, buf: &[u8]) -> vals_spdk::Result<()> {
+            use std::sync::atomic::Ordering::Relaxed;
+            if self.tripped.load(Relaxed) {
+                let head = lba == self.head_lba.load(Relaxed);
+                return match self.cleanup {
+                    Cleanup::Durable => self.inner.write_at(lba, buf),
+                    Cleanup::WritesFail => Err(BlockError::Io(std::io::Error::other("persistent write failure"))),
+                    Cleanup::HeadWriteFails if head => Err(BlockError::Io(std::io::Error::other("head write failure"))),
+                    Cleanup::LostInCrash => Ok(()),
+                    Cleanup::OnlyHeadLost if head => Ok(()),
+                    Cleanup::HeadWriteFails | Cleanup::OnlyHeadLost => self.inner.write_at(lba, buf),
+                };
+            }
+            let head = self.armed.load(Relaxed)
+                && buf.len() == BS
+                && buf[..4] == MAN_CHAIN_MAGIC.to_le_bytes();
+            self.inner.write_at(lba, buf)?;
+            if head {
+                self.head_written.store(true, Relaxed);
+                self.head_lba.store(lba, Relaxed);
+                if self.fault == HeadFault::HeaderWrite {
+                    self.tripped.store(true, Relaxed);
+                    return Err(BlockError::Io(std::io::Error::other("header write reached media but failed")));
+                }
+            }
+            Ok(())
+        }
+        fn flush(&self) -> vals_spdk::Result<()> {
+            use std::sync::atomic::Ordering::Relaxed;
+            if self.tripped.load(Relaxed) {
+                return match self.cleanup {
+                    Cleanup::Durable => self.inner.flush(),
+                    _ => Err(BlockError::Io(std::io::Error::other("persistent flush failure"))),
+                };
+            }
+            self.inner.flush()?;
+            if self.fault == HeadFault::FinalFlush && self.head_written.load(Relaxed) {
+                self.tripped.store(true, Relaxed);
+                return Err(BlockError::Io(std::io::Error::other("final flush failed after the head reached media")));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_head_write_failure_frees_only_after_a_durable_rollback() {
+        for seg_blocks in [16u64, 2] {
+            for fault in [HeadFault::HeaderWrite, HeadFault::FinalFlush] {
+                for cleanup in [
+                    Cleanup::Durable,
+                    Cleanup::WritesFail,
+                    Cleanup::LostInCrash,
+                    Cleanup::HeadWriteFails,
+                    Cleanup::OnlyHeadLost,
+                ] {
+                    let case = format!("seg_blocks {seg_blocks}, {fault:?}, cleanup {cleanup:?}");
+                    let dev = AmbiguousDevice {
+                        inner: MemBlockDevice::new(BS, 1024),
+                        fault,
+                        cleanup,
+                        armed: Default::default(),
+                        head_written: Default::default(),
+                        head_lba: Default::default(),
+                        tripped: Default::default(),
+                    };
+                    let mut alloc = Allocator::new(1024, seg_blocks, 0);
+                    let m1 = manifest_with(3);
+                    let live1 = write_manifest(&dev, &mut alloc, &m1, 1, None).unwrap();
+                    let free_before = alloc.free_segments();
+                    let m2 = manifest_with(200);
+                    dev.armed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let err = write_manifest(&dev, &mut alloc, &m2, 2, Some(&live1)).unwrap_err();
+                    assert!(dev.head_written.load(std::sync::atomic::Ordering::Relaxed), "{case}");
+
+                    let rolled_back = cleanup == Cleanup::Durable;
+                    if rolled_back {
+                        assert!(matches!(err, SnapshotError::Io(_)), "{case}: {err:?}");
+                        assert_eq!(alloc.free_segments(), free_before, "{case}");
+                    } else {
+                        assert!(matches!(err, SnapshotError::PublicationAmbiguous(_)), "{case}: {err:?}");
+                        assert!(alloc.free_segments() < free_before, "{case}: the new chain stays allocated");
+                    }
+                    assert!(live1.segs.iter().all(|s| !alloc.is_free(*s)), "{case}");
+
+                    let garbage = vec![0xa5u8; alloc.blocks_per_segment() as usize * BS];
+                    while let Some(seg) = alloc.allocate() {
+                        dev.inner.write_at(alloc.segment_range(seg).0, &garbage).unwrap();
+                    }
+                    let (loaded, live) = load_manifest(&dev.inner, &alloc)
+                        .unwrap_or_else(|e| panic!("{case}: {e}"))
+                        .expect("a manifest");
+                    if rolled_back {
+                        assert_eq!((loaded, live), (m1.clone(), live1.clone()), "{case}");
+                    } else {
+                        assert_eq!((loaded, live.generation), (m2, 2), "{case}");
+                    }
+                }
+            }
+        }
     }
 }

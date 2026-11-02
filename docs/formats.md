@@ -678,7 +678,17 @@ segments and the head segment's payload on the device with the head's header
 still zero, flushes, then writes the head's first block again with its header
 and flushes (0529). A CRC-valid head header therefore proves the whole chain was
 durable before it, so a crash during the write leaves the previous generation as
-the newest valid head, never a valid head over a missing payload. After the
+the newest valid head, never a valid head over a missing payload. A write that
+fails before the head's header is issued cannot have published anything: its
+segments are zeroed best-effort and freed. A failure at or after the header
+write (the header write or the final flush returns an error) is ambiguous,
+because the header may have reached media anyway, so the writer zeroes only the
+head's first block and flushes again. Only if both succeed does it zero the
+other segments' headers best-effort and free the new segments; otherwise it returns `SnapshotError::PublicationAmbiguous`, keeps the
+new chain and the previous generation's segments allocated, and the engine
+poisons itself without freeing the segments the new manifest references (a
+flush's or merge's output run, a merge's inputs), so whichever generation a
+reopen finds still has all its storage (0549). After the
 commit, the first block of every previous-generation segment is zeroed without a flush. An
 `Engine::open` that still finds an older head in a free segment, left by a crash
 between the commit and the next flush, keeps that segment allocated as part of

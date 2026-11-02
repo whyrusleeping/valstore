@@ -1369,6 +1369,84 @@ fn compact_runs_torn_manifest_commit_keeps_prior_runs_on_reopen() {
 }
 
 #[test]
+fn ambiguous_merge_manifest_publication_poisons_and_refuses_the_in_flight_flush_commit() {
+    let cfg = Config {
+        seg_blocks: 8,
+        reserved_blocks: 0,
+        ordering: Ordering::Sorted,
+    };
+    let mem = MemBlockDevice::new(BS, 4096);
+    let disk = mem.share();
+    let mut e = Engine::create_prewiped(AmbiguousManifestDevice::new(mem, false), cfg);
+    e.put(b"a", b"a1", 1).unwrap();
+    e.put(b"b", b"b1", 1).unwrap();
+    run_flush(&mut e, RunBuildOpts::default()).unwrap();
+    e.put(b"a", b"a2", 2).unwrap();
+    e.put(b"c", b"c2", 2).unwrap();
+    run_flush(&mut e, RunBuildOpts::default()).unwrap();
+    let input_segs: Vec<SegmentId> = e.run_handles().into_iter().flat_map(|h| h.segs).collect();
+    e.put(b"d", b"d3", 3).unwrap();
+    e.sync().unwrap();
+    let plan = e.flush_plan(RunBuildOpts::default()).unwrap().unwrap();
+    let wdev = e.device().sibling().unwrap();
+    let written = vals_rt::block_on(build_and_write_flush(plan, &wdev), || {}).unwrap();
+    let flush_segs = written.run_segs_for_test().to_vec();
+
+    e.device().arm();
+    let err = e.compact_runs(RunBuildOpts::default(), None).unwrap_err();
+    e.device().recover();
+    assert!(matches!(err, EngineError::Snapshot(SnapshotError::PublicationAmbiguous(_))), "{err:?}");
+    assert!(e.is_poisoned());
+    assert!(input_segs.iter().all(|s| !e.alloc.is_free(*s)), "the merge inputs stay allocated");
+    assert!(matches!(e.flush_commit(written), Err(EngineError::Poisoned)));
+    assert!(flush_segs.iter().all(|s| !e.alloc.is_free(*s)));
+    assert!(matches!(e.put(b"e", b"e4", 4), Err(EngineError::Poisoned)));
+    drop(e);
+
+    let e = Engine::open(disk, cfg).unwrap();
+    assert_eq!(e.run_count(), 1, "the head reached media, so the merged generation is recovered");
+    for (k, v) in [(b"a", &b"a2"[..]), (b"b", b"b1"), (b"c", b"c2"), (b"d", b"d3")] {
+        assert_eq!(e.get(k).unwrap().as_deref(), Some(v));
+    }
+    assert_eq!(e.get(b"e").unwrap(), None);
+}
+
+#[test]
+fn ambiguous_flush_manifest_publication_refuses_the_in_flight_compact_commit() {
+    let cfg = Config {
+        seg_blocks: 8,
+        reserved_blocks: 0,
+        ordering: Ordering::Sorted,
+    };
+    let opts = RunBuildOpts::default();
+    let mem = MemBlockDevice::new(BS, 4096);
+    let disk = mem.share();
+    let mut e = Engine::create_prewiped(AmbiguousManifestDevice::new(mem, false), cfg);
+    e.put_kind(b"k", b"tomb", 10, true).unwrap();
+    run_flush(&mut e, opts).unwrap();
+    let plan = e.compact_plan_lone_gc(opts, Some(u128::MAX)).unwrap().expect("aged lone tombstone plans GC");
+    let wdev = Arc::new(e.device().sibling().unwrap());
+    let compacted = vals_rt::block_on(compact_and_write(plan, wdev), || {}).unwrap();
+    e.put(b"d", b"d2", 2).unwrap();
+    e.sync().unwrap();
+    let plan = e.flush_plan(opts).unwrap().unwrap();
+    let wdev = e.device().sibling().unwrap();
+    let flushed = vals_rt::block_on(build_and_write_flush(plan, &wdev), || {}).unwrap();
+
+    e.device().arm();
+    let err = e.flush_commit(flushed).unwrap_err();
+    e.device().recover();
+    assert!(matches!(err, EngineError::Snapshot(SnapshotError::PublicationAmbiguous(_))), "{err:?}");
+    assert!(matches!(e.compact_commit(compacted), Err(EngineError::Poisoned)));
+    drop(e);
+
+    let e = Engine::open(disk, cfg).unwrap();
+    assert_eq!(e.run_count(), 2, "the flush generation is recovered and the GC never published");
+    assert_eq!(e.version(b"k").unwrap(), Some(10));
+    assert_eq!(e.get(b"d").unwrap().as_deref(), Some(&b"d2"[..]));
+}
+
+#[test]
 fn compact_empty_is_noop() {
     let mut e = engine(Ordering::Unsorted);
     assert_eq!(e.compact().unwrap(), CompactStats::default());

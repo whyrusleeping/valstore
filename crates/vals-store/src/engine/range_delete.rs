@@ -655,20 +655,16 @@ impl<D: BlockDevice> Engine<D> {
             covered_epoch: self.last_flush_epoch,
             runs: run_metas,
         };
-        let live = match snapshot_io::write_manifest(
-            &*self.dev,
-            &mut self.alloc,
-            &manifest,
-            generation,
-            self.live_manifest.as_ref(),
-        ) {
+        let live = match self.publish_manifest(&manifest) {
             Ok(live) => live,
             Err(e) => {
                 drop(run);
-                for s in &handle.segs {
-                    let _ = self.alloc.free(*s);
+                if !self.poisoned {
+                    for s in &handle.segs {
+                        let _ = self.alloc.free(*s);
+                    }
                 }
-                return Err(e.into());
+                return Err(e);
             }
         };
         self.manifest_gen = generation;

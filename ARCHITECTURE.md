@@ -719,7 +719,10 @@ segment / superblock byte layouts are in [`docs/formats.md`](docs/formats.md)):
   numbering advances past it so nothing it handed out is ever re-issued); a
   headroom precondition refuses a pass that can't hold old + new live data
   simultaneously, and only if the rollback's invalidation writes themselves fail
-  is the engine **poisoned** (mutations refused, reads fine, reopen recovers).
+  is the engine **poisoned** (mutations refused, reads fine, reopen recovers). A
+  manifest write that fails after its head header was issued, and whose head
+  cannot be durably zeroed, poisons the engine the same way and frees nothing
+  either manifest generation references.
 - **Backends** — `MemBlockDevice` / `FileBlockDevice` for development; the
   `SpdkBlockDevice` (userspace poll-mode NVMe) for production (see
   [`docs/SPDK.md`](docs/SPDK.md)). Batched + async read/write paths drive the

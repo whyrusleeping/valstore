@@ -74,6 +74,29 @@ fn put_range(e: &mut Engine<MemBlockDevice>, prefix: &str, n: u64, ver: u64) {
 }
 
 #[test]
+fn ambiguous_fence_manifest_publication_poisons_and_keeps_the_fence_run_allocated() {
+    let mem = MemBlockDevice::new(BS, RD_BLOCKS);
+    let disk = mem.share();
+    let mut e = Engine::create_prewiped(AmbiguousManifestDevice::new(mem, false), rd_cfg());
+    for i in 0..10u64 {
+        e.put(format!("k{i:04}").as_bytes(), b"value", v(1)).unwrap();
+    }
+    e.sync().unwrap();
+    let used_before = e.used_segments();
+    e.device().arm();
+    let err = e.apply_range_delete(Some(b"k0002"), Some(b"k0005"), v(5)).unwrap_err();
+    e.device().recover();
+    assert!(matches!(err, EngineError::Snapshot(SnapshotError::PublicationAmbiguous(_))), "{err:?}");
+    assert!(e.is_poisoned());
+    assert_eq!(e.used_segments(), used_before + 2, "the fence run and the new chain stay allocated");
+    drop(e);
+
+    let e = Engine::open(disk, rd_cfg()).unwrap();
+    assert_eq!(e.run_count(), 1, "the head reached media, so the fence generation is recovered");
+    assert_eq!(e.get(b"k0003").unwrap().as_deref(), Some(&b"value"[..]));
+}
+
+#[test]
 fn apply_overlays_appends_and_reports_no_ops_and_refusals() {
     let mut e = rd_engine();
     put_range(&mut e, "k", 10, 1);

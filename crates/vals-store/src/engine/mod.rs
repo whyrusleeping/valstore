@@ -327,9 +327,10 @@ impl std::fmt::Display for EngineError {
             ),
             EngineError::Poisoned => write!(
                 f,
-                "engine is poisoned: a failed compaction could not be rolled back \
-                 (device refused the invalidation writes); mutations are refused \
-                 until the engine is reopened and recovery replays the log"
+                "engine is poisoned: a failed compaction could not be rolled back, or a \
+                 manifest publication failed ambiguously (the device refused the \
+                 invalidation writes); mutations are refused until the engine is \
+                 reopened and recovery replays the log"
             ),
             EngineError::PartialForget { dropped, source } => write!(
                 f,

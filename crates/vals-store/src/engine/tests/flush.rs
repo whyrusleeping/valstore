@@ -1371,6 +1371,60 @@ fn flush_commit_manifest_write_failure_clears_gate_and_reclaims_segments() {
 }
 
 #[test]
+fn ambiguous_flush_manifest_publication_poisons_and_keeps_both_generations_recoverable() {
+    let cfg = Config {
+        seg_blocks: 8,
+        reserved_blocks: 0,
+        ordering: Ordering::Sorted,
+    };
+    for cleanup_durable in [false, true] {
+        let mem = MemBlockDevice::new(BS, 4096);
+        let disk = mem.share();
+        let mut e = Engine::create_prewiped(AmbiguousManifestDevice::new(mem, cleanup_durable), cfg);
+        e.put(b"durable", b"original", 1).unwrap();
+        e.sync().unwrap();
+        let plan = e.flush_plan(RunBuildOpts::default()).unwrap().unwrap();
+        let wdev = e.device().sibling().unwrap();
+        let written = vals_rt::block_on(build_and_write_flush(plan, &wdev), || {}).unwrap();
+        let run_segs = written.run_segs_for_test().to_vec();
+
+        e.device().arm();
+        let err = e.flush_commit(written).unwrap_err();
+        e.device().recover();
+        let later = |e: &mut Engine<AmbiguousManifestDevice>| -> Result<(), EngineError> {
+            for i in 0..16u8 {
+                e.put(format!("later/{i}").as_bytes(), &[i; 1500], 2)?;
+            }
+            e.sync()
+        };
+        if cleanup_durable {
+            assert!(matches!(err, EngineError::Snapshot(SnapshotError::Io(_))), "{err:?}");
+            assert!(!e.is_poisoned());
+            assert!(run_segs.iter().all(|s| e.alloc.is_free(*s)));
+            later(&mut e).unwrap();
+            run_flush(&mut e, RunBuildOpts::default()).unwrap();
+        } else {
+            assert!(matches!(err, EngineError::Snapshot(SnapshotError::PublicationAmbiguous(_))), "{err:?}");
+            assert!(e.is_poisoned());
+            assert!(run_segs.iter().all(|s| !e.alloc.is_free(*s)), "the possibly published run stays allocated");
+            assert!(matches!(later(&mut e), Err(EngineError::Poisoned)));
+            assert!(matches!(e.flush(RunBuildOpts::default()), Err(EngineError::Poisoned)));
+        }
+        assert_eq!(e.get(b"durable").unwrap().as_deref(), Some(&b"original"[..]));
+        drop(e);
+
+        let e = Engine::open(disk, cfg).unwrap();
+        assert_eq!(e.get(b"durable").unwrap().as_deref(), Some(&b"original"[..]));
+        assert_eq!(e.run_count(), 1);
+        if cleanup_durable {
+            assert_eq!(e.get(b"later/15").unwrap().as_deref(), Some(&[15u8; 1500][..]));
+        } else {
+            assert_eq!(e.get(b"later/0").unwrap(), None);
+        }
+    }
+}
+
+#[test]
 fn torn_flush_manifest_commit_keeps_prior_state_on_reopen() {
     let cfg = Config {
         seg_blocks: 8,

@@ -179,6 +179,11 @@ impl<D: BlockDevice> WrittenFlush<D> {
     pub(crate) fn key_sink_for_test(&self) -> Option<&crate::keyfilter::KeyFilterSink> {
         self.key_sink.as_ref()
     }
+
+    #[cfg(test)]
+    pub(crate) fn run_segs_for_test(&self) -> &[SegmentId] {
+        &self.handle.segs
+    }
 }
 
 impl<D: BlockDevice> FlushPlan<D> {
@@ -330,14 +335,7 @@ impl<D: BlockDevice> Engine<D> {
             covered_epoch,
             runs: run_metas,
         };
-        let live = snapshot_io::write_manifest(
-            &*self.dev,
-            &mut self.alloc,
-            &manifest,
-            generation,
-            self.live_manifest.as_ref(),
-        )
-        .map_err(EngineError::from)?;
+        let live = self.publish_manifest(&manifest)?;
         self.manifest_gen = generation;
         self.live_manifest = Some(live);
         self.last_flush_epoch = covered_epoch;
@@ -522,6 +520,10 @@ impl<D: BlockDevice> Engine<D> {
         &mut self,
         mut written: WrittenFlush<D>,
     ) -> Result<FlushCommit, EngineError> {
+        if self.poisoned {
+            self.free_flush_segs(&written.handle.segs);
+            return Err(EngineError::Poisoned);
+        }
         for s in &written.unused_segs {
             let _ = self.alloc.free(*s);
         }
@@ -570,19 +572,13 @@ impl<D: BlockDevice> Engine<D> {
             covered_epoch: written.covered_epoch,
             runs: run_metas,
         };
-        let live = match snapshot_io::write_manifest(
-            &*self.dev,
-            &mut self.alloc,
-            &manifest,
-            generation,
-            self.live_manifest.as_ref(),
-        ) {
+        let live = match self.publish_manifest(&manifest) {
             Ok(l) => l,
             Err(e) => {
                 drop(run);
                 self.defer_flush_cleanup(std::mem::take(&mut written.entries));
                 self.free_flush_segs(&written.handle.segs);
-                return Err(EngineError::from(e));
+                return Err(e);
             }
         };
 
@@ -642,6 +638,22 @@ impl<D: BlockDevice> Engine<D> {
         }
     }
 
+    pub(super) fn publish_manifest(&mut self, manifest: &Manifest) -> Result<LiveSnapshot, EngineError> {
+        snapshot_io::write_manifest(
+            &*self.dev,
+            &mut self.alloc,
+            manifest,
+            manifest.generation,
+            self.live_manifest.as_ref(),
+        )
+        .map_err(|e| {
+            if matches!(e, SnapshotError::PublicationAmbiguous(_)) {
+                self.poisoned = true;
+            }
+            EngineError::from(e)
+        })
+    }
+
     pub fn free_flush_segs(&mut self, segs: &[SegmentId]) {
         self.free_unreferenced_staged_segs(segs);
         if let Some(snapshot) = self.flush_snapshot.take() {
@@ -680,6 +692,9 @@ impl<D: BlockDevice> Engine<D> {
     }
 
     fn free_unreferenced_staged_segs(&mut self, segs: &[SegmentId]) {
+        if self.poisoned {
+            return;
+        }
         let protected = self.protected_segments();
         for s in segs {
             if !protected.contains(s) {
