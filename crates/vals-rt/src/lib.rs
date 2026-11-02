@@ -69,11 +69,17 @@ struct TaskNotify {
     ready: Arc<ReadyQueue>,
     id: usize,
     active: AtomicBool,
+    /// Set while the task has an entry in the ready queue, so repeated wakes
+    /// before its next poll add one entry instead of one per wake. The
+    /// executor clears it with a swap just before polling, so a wake that
+    /// lands during the poll queues the task again and writes made before a
+    /// coalesced wake are visible to the poll.
+    queued: AtomicBool,
 }
 
 impl TaskNotify {
     fn enqueue(self: &Arc<Self>) {
-        if self.active.load(Ordering::Acquire) {
+        if self.active.load(Ordering::Acquire) && !self.queued.swap(true, Ordering::AcqRel) {
             self.ready.push(self.id, self);
         }
     }
@@ -110,6 +116,7 @@ impl Shared {
             ready: self.ready.clone(),
             id,
             active: AtomicBool::new(true),
+            queued: AtomicBool::new(true),
         });
         let entry = TaskEntry {
             fut: Box::pin(fut),
@@ -231,6 +238,7 @@ impl LocalExecutor {
                 slot.take().unwrap()
             };
             let TaskEntry { mut fut, notify } = entry;
+            notify.queued.swap(false, Ordering::AcqRel);
             let waker = Waker::from(notify.clone());
             let mut cx = Context::from_waker(&waker);
             match fut.as_mut().poll(&mut cx) {
@@ -965,6 +973,110 @@ mod tests {
             current.borrow_mut().take().unwrap().wake();
         });
         assert_eq!(premature_polls.get(), 0);
+    }
+
+    #[test]
+    fn repeated_wakes_before_a_poll_queue_the_task_once() {
+        let ex = LocalExecutor::new();
+        let waker = Rc::new(RefCell::new(None::<Waker>));
+        let polls = Rc::new(Cell::new(0usize));
+        let (task_waker, task_polls) = (waker.clone(), polls.clone());
+        ex.spawn(std::future::poll_fn(move |cx| {
+            task_polls.set(task_polls.get() + 1);
+            if task_polls.get() == 1 {
+                *task_waker.borrow_mut() = Some(cx.waker().clone());
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        }));
+        let mut io_rounds = 0;
+        ex.run(|| {
+            io_rounds += 1;
+            assert_eq!(io_rounds, 1, "task did not finish after its wake");
+            let waker = waker.borrow_mut().take().unwrap();
+            for _ in 0..10_000 {
+                waker.wake_by_ref();
+            }
+            assert_eq!(ex.shared.ready.len(), 1);
+        });
+        assert_eq!(polls.get(), 2);
+    }
+
+    #[test]
+    fn spawned_task_woken_from_another_thread_during_poll_is_not_lost() {
+        let (sender, receiver) = mpsc::channel();
+        let (woke_sender, woke) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let waker: Waker = receiver.recv().unwrap();
+            waker.wake_by_ref();
+            waker.wake_by_ref();
+            woke_sender.send(()).unwrap();
+        });
+        let ex = LocalExecutor::new();
+        ex.spawn(WakeDuringPoll {
+            sender: Some(sender),
+            woke,
+            first_poll: true,
+        });
+        let mut io_rounds = 0;
+        ex.run(|| {
+            io_rounds += 1;
+            assert_eq!(io_rounds, 1, "the wake during the first poll was lost");
+        });
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_wakes_coalesce_without_losing_the_last_one() {
+        const THREADS: usize = 4;
+        const WAKES: usize = 5_000;
+        let ex = LocalExecutor::new();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls = Rc::new(Cell::new(0usize));
+        let (sender, receiver) = mpsc::channel::<Waker>();
+        let (task_count, task_polls) = (count.clone(), polls.clone());
+        let mut sender = Some(sender);
+        ex.spawn(std::future::poll_fn(move |cx| {
+            task_polls.set(task_polls.get() + 1);
+            if let Some(sender) = sender.take() {
+                sender.send(cx.waker().clone()).unwrap();
+            }
+            if task_count.load(Ordering::Acquire) == THREADS * WAKES {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }));
+        let waker = Arc::new(Mutex::new(None::<Waker>));
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let (count, waker) = (count.clone(), waker.clone());
+                thread::spawn(move || {
+                    let waker = loop {
+                        if let Some(w) = waker.lock().unwrap().clone() {
+                            break w;
+                        }
+                        thread::yield_now();
+                    };
+                    for _ in 0..WAKES {
+                        count.fetch_add(1, Ordering::Release);
+                        waker.wake_by_ref();
+                    }
+                })
+            })
+            .collect();
+        ex.run(|| {
+            if let Ok(w) = receiver.try_recv() {
+                *waker.lock().unwrap() = Some(w);
+            }
+            assert!(ex.shared.ready.len() <= 1);
+            thread::yield_now();
+        });
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(polls.get() <= THREADS * WAKES + 1);
     }
 
     #[test]
