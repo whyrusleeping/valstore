@@ -89,7 +89,8 @@ fn check_block(block: &[u8], probes: &[Vec<u8>]) {
     let decoded = decode_block(block);
     assert_eq!(drain(BlockCursor::new(block.to_vec(), None, false)), decoded, "cursor drain diverged from decode_block");
     if block.len() >= 8 && block_crc_ok(block) {
-        assert_eq!(decode_block_body(&block[..block.len() - 4]), decoded, "body decode diverged from decode_block");
+        let body = decode_block_payload(&block[..block.len() - 4]).map_err(FrameError::why);
+        assert_eq!(body.and_then(|b| decode_block_body(&b)), decoded, "body decode diverged from decode_block");
     }
     let walked = walk(block);
     let first = block_first_key(block);
@@ -127,9 +128,17 @@ fn check_block(block: &[u8], probes: &[Vec<u8>]) {
 #[test]
 fn block_decoders_agree_and_never_panic_on_resealed_mutations() {
     let mut rng = Rng(0x0536_B10C_F022_0001);
+    let mut coded_rounds = 0;
     for round in 0..4000u32 {
         let entries = gen_entries(&mut rng);
         let block = encode_block(&entries);
+        let block = match compress_block_body(&block[..block.len() - 4]) {
+            Some(coded) if round % 2 == 1 => {
+                coded_rounds += 1;
+                reseal(coded)
+            }
+            _ => block,
+        };
         let mut probes: Vec<Vec<u8>> = entries.iter().map(|e| e.key.clone()).collect();
         for _ in 0..4 {
             let len = rng.range(0, 12) as usize;
@@ -145,6 +154,7 @@ fn block_decoders_agree_and_never_panic_on_resealed_mutations() {
             panic!("round {round}: block decoders panicked or diverged on {} bytes: {bytes:02x?}", bytes.len());
         }
     }
+    assert!(coded_rounds > 1000, "{coded_rounds} compressed blocks fuzzed");
 }
 
 #[test]

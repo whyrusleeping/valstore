@@ -26,6 +26,7 @@ fn next_after(digests: &[(Vec<u8>, Version)], more: bool, resume: Option<Vec<u8>
 
 #[test]
 fn expired_bucket_digest_serves_resume_to_the_unbounded_page() {
+    let _v6 = vals_store::run::pin_run_write_version(vals_store::run::RUN_RT_VERSION);
     let engine = Engine::create_prewiped(
         MemBlockDevice::new(256, 262_144),
         Config {

@@ -70,7 +70,11 @@ impl<D: BlockDevice> OpenRun<D> {
     }
 
     fn rewrite_bound(&self, out_version: u16) -> usize {
-        self.meta.handle.len as usize + run::rewrite_growth_bytes(&self.run, out_version)
+        self.policy_len() as usize + run::rewrite_growth_bytes(&self.run, out_version)
+    }
+
+    fn policy_len(&self) -> u64 {
+        self.meta.handle.len.saturating_add(self.run.compression_savings())
     }
 
     fn rewrite_output_bound<'a>(inputs: impl Iterator<Item = &'a Self> + Clone) -> usize

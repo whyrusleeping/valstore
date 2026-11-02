@@ -587,7 +587,7 @@ impl<D: BlockDevice> Engine<D> {
 
     pub(super) fn flush_run_version(&self, rts: &[RtRecord]) -> u16 {
         let configured = run::run_write_version();
-        if rts.is_empty() { configured } else { configured.max(run::RUN_VERSION) }
+        if rts.is_empty() { configured } else { configured.max(run::RUN_RT_VERSION) }
     }
 
     pub(super) fn input_rts(&self, inputs: &[RunMeta]) -> Vec<RtRecord> {
@@ -618,7 +618,7 @@ impl<D: BlockDevice> Engine<D> {
         let (bytes, _) = run::build_run_checked_rts(
             &[],
             RunBuildOpts::default(),
-            run::RUN_VERSION,
+            run::run_write_version().max(run::RUN_RT_VERSION),
             run::EncodePath::Flush,
             run::RunSource::Inline,
             run::RunRts::NONE,

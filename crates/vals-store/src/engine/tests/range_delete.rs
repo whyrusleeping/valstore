@@ -984,6 +984,7 @@ fn flushes_drop_entries_covered_by_accounted_range_tombstones() {
 
 #[test]
 fn compaction_reclaims_the_run_and_value_log_space_of_covered_entries() {
+    let _v6 = uncompressed_runs();
     if merge_env() {
         return;
     }
@@ -1034,6 +1035,7 @@ fn compaction_reclaims_the_run_and_value_log_space_of_covered_entries() {
 
 #[test]
 fn shadow_estimator_counts_accounted_covered_entries_as_garbage() {
+    let _v6 = uncompressed_runs();
     if co_compact_env(false) {
         return;
     }

@@ -2741,9 +2741,10 @@ fn frozen_runs_are_never_recurring_inputs_and_bounded_merges_are_paced() {
     }
     run_flush(&mut e, opts).unwrap();
     let base = e.runs[0].meta.handle.clone();
-    e.merge_policy.size_cap = base.len;
+    let base_len = e.runs[0].policy_len();
+    e.merge_policy.size_cap = base_len;
     assert_eq!(e.frozen_run_count(), 1, "a run at the cap is frozen");
-    assert_eq!(e.max_run_bytes(), base.len);
+    assert_eq!(e.max_run_bytes(), base_len);
     take_plan_log();
     for batch in 0..60u32 {
         for i in 0..150u32 {
@@ -2754,9 +2755,8 @@ fn frozen_runs_are_never_recurring_inputs_and_bounded_merges_are_paced() {
         run_flush(&mut e, opts).unwrap();
         while run_compact_once(&mut e, false).unwrap().is_some() {}
         assert_eq!(e.runs[0].meta.handle, base, "batch {batch}: the frozen base was rewritten");
-        let sizes: Vec<u64> = e.runs.iter().map(|or| or.meta.handle.len).collect();
         assert!(
-            select_recurring_merge(&sizes, &e.merge_policy).is_none(),
+            select_recurring_merge(&e.policy_sizes(), &e.merge_policy).is_none(),
             "batch {batch}: merges drained to a fixpoint"
         );
     }
@@ -2764,12 +2764,12 @@ fn frozen_runs_are_never_recurring_inputs_and_bounded_merges_are_paced() {
     assert!(log.iter().any(|r| r.kind == MergeKind::Forced), "the valve fired: {log:?}");
     for r in &log {
         assert!(matches!(r.kind, MergeKind::Recurring | MergeKind::Forced), "{r:?}");
-        assert!(r.input_bytes <= base.len, "merge input over the cap: {r:?}");
+        assert!(r.input_bytes <= base_len, "merge input over the cap: {r:?}");
         assert_eq!(r.frozen_inputs, 0, "{r:?}");
         assert!(r.paced, "{r:?}");
     }
     assert!(e.frozen_run_count() >= 1);
-    assert!(e.max_run_bytes() >= base.len);
+    assert!(e.max_run_bytes() >= base_len);
     for batch in 0..60u32 {
         assert_eq!(e.get(format!("b{batch:03}-001").as_bytes()).unwrap().as_deref(), Some(&b"w"[..]));
         assert_eq!(e.get(format!("base{:05}", batch * 50).as_bytes()).unwrap().as_deref(), Some(&b"w"[..]));

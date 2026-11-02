@@ -29,6 +29,11 @@ use super::*;
         true
     }
 
+    /// Pins this thread to writing v6 (uncompressed) runs, for tests whose premise is the stored size of runs.
+    fn uncompressed_runs() -> run::RunWriteVersionPin {
+        run::pin_run_write_version(run::RUN_RT_VERSION)
+    }
+
     fn co_compact_env(on: bool) -> bool {
         compact_env(on, false)
     }
@@ -1241,7 +1246,9 @@ use super::*;
         let record = PlanRecord {
             kind: plan.kind(),
             input_bytes: plan.input_bytes(),
-            frozen_inputs: plan.merged_inputs.iter().filter(|m| policy.frozen(m.handle.len)).count(),
+            frozen_inputs: plan.merged_inputs.iter().filter(|m| {
+                policy.frozen(e.runs.iter().find(|or| or.meta.handle == m.handle).map_or(m.handle.len, |or| or.policy_len()))
+            }).count(),
             paced: plan.paced,
         };
         PLAN_LOG.with(|log| log.borrow_mut().push(record));

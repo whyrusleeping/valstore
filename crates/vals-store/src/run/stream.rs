@@ -11,6 +11,8 @@ pub(super) struct BlockWalker {
     blocks: Arc<FenceIndex>,
     pub(super) next_block: usize,
     pub(super) win: Vec<u8>,
+    blk: Vec<u8>,
+    decoded: bool,
     win_off: u64,
     win_end_block: usize,
     cur_block: usize,
@@ -30,6 +32,8 @@ impl BlockWalker {
             blocks,
             next_block: start,
             win: Vec::new(),
+            blk: Vec::new(),
+            decoded: false,
             win_off: 0,
             win_end_block: start,
             cur_block: start,
@@ -84,9 +88,28 @@ impl BlockWalker {
                     .filter(|s| s + *len as usize <= self.win.len())
                     .ok_or(SnapshotError::Corrupt("run block outside its read window"))?;
                 let block = &self.win[s..s + *len as usize];
-                self.left = block_frame(block).map_err(|e| SnapshotError::Corrupt(e.run_block_why()))?;
-                self.pos = s + 4;
-                self.body_end = s + block.len() - 4;
+                let coded = coded_body_len(block);
+                if coded > self.blk.capacity() && !reserve((coded - self.blk.capacity()) as u64) {
+                    return Ok(Walk::Blocked);
+                }
+                if coded > 0 {
+                    self.blk = Vec::new();
+                }
+                match block_body(block).map_err(|e| SnapshotError::Corrupt(e.run_block_why()))? {
+                    std::borrow::Cow::Owned(body) => {
+                        self.blk = body;
+                        self.decoded = true;
+                        self.pos = 4;
+                        self.body_end = self.blk.len();
+                    }
+                    std::borrow::Cow::Borrowed(body) => {
+                        self.decoded = false;
+                        self.pos = s + 4;
+                        self.body_end = s + body.len();
+                    }
+                }
+                let body = if self.decoded { &self.blk[..] } else { &self.win[self.pos - 4..self.body_end] };
+                self.left = body_count(body).map_err(SnapshotError::Corrupt)?;
                 self.in_block = true;
                 self.first_in_block = true;
             }
@@ -98,7 +121,8 @@ impl BlockWalker {
                 self.cur_block += 1;
                 continue;
             }
-            let mut c = Cursor { b: &self.win[..self.body_end], off: self.pos };
+            let buf = if self.decoded { &self.blk[..self.body_end] } else { &self.win[..self.body_end] };
+            let mut c = Cursor { b: buf, off: self.pos };
             let prev_len = if self.first_in_block { 0 } else { self.key.len() };
             let k = c.entry_key(prev_len).map_err(SnapshotError::Corrupt)?;
             let version = c.entry_version().map_err(SnapshotError::Corrupt)?;
@@ -129,7 +153,7 @@ pub struct BlockVersionStream<D: BlockDevice> {
 
 impl<D: BlockDevice> BlockVersionStream<D> {
     pub fn resident_bound_bytes(&self) -> u64 {
-        (SIDECAR_CURSOR_WINDOW.max(self.walker.win.capacity()) + self.walker.key.capacity()) as u64
+        (SIDECAR_CURSOR_WINDOW.max(self.walker.win.capacity()) + self.walker.blk.capacity() + self.walker.key.capacity()) as u64
     }
 
     pub fn next_step_reserving(&mut self, mut reserve: impl FnMut(u64) -> bool)
@@ -238,6 +262,7 @@ pub struct BlockVersionCursor {
     pub(super) base: u64,
     pub(super) num_buckets: u32,
     pub(super) max_block: usize,
+    pub(super) max_body: usize,
     pub(super) walker: BlockWalker,
 }
 
@@ -251,7 +276,7 @@ impl BlockVersionCursor {
     }
 
     pub fn resident_bound_bytes(&self) -> usize {
-        SIDECAR_CURSOR_WINDOW.max(self.max_block).saturating_mul(2).saturating_add(self.max_block)
+        SIDECAR_CURSOR_WINDOW.max(self.max_block).saturating_mul(2).saturating_add(self.max_block).saturating_add(self.max_body)
     }
 
     pub async fn next_matching_step<D: AsyncRead + BlockDevice>(

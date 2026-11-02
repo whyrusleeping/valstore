@@ -361,7 +361,7 @@ impl<D: BlockDevice> Engine<D> {
             return 0;
         }
         let rt_bytes = crate::range_tombstone::rt_block_len_of(self.rts.tail.iter().map(|(r, _)| r));
-        let version = if rt_bytes > 0 { run::run_write_version().max(run::RUN_VERSION) } else { run::run_write_version() };
+        let version = if rt_bytes > 0 { run::run_write_version().max(run::RUN_RT_VERSION) } else { run::run_write_version() };
         run::run_len_upper_bound_agg(
             self.index.len(),
             self.index.key_bytes() as usize,
@@ -709,9 +709,9 @@ impl<D: BlockDevice> Engine<D> {
                 continue;
             }
             let mut end = t + 1;
-            let mut bytes = self.runs[t].meta.handle.len;
-            while end < self.runs.len() && bytes.saturating_add(self.runs[end].meta.handle.len) <= cap {
-                bytes += self.runs[end].meta.handle.len;
+            let mut bytes = self.runs[t].policy_len();
+            while end < self.runs.len() && bytes.saturating_add(self.runs[end].policy_len()) <= cap {
+                bytes += self.runs[end].policy_len();
                 end += 1;
             }
             let output_segs = (bytes as usize).div_ceil(seg_bytes).max(1) as u64;

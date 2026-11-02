@@ -197,11 +197,6 @@ impl BlockedBloom {
     }
 
     #[inline]
-    fn block_base_and_hashes(&self, key: &[u8]) -> (usize, u64, u64) {
-        self.block_base_and_hashes_z(BloomKey::new(key).z)
-    }
-
-    #[inline]
     fn block_base_and_hashes_z(&self, z: u64) -> (usize, u64, u64) {
         let num_blocks = self.num_bits / BLOOM_BLOCK_BITS;
         let block = ((z as u128 * num_blocks as u128) >> 64) as usize;
@@ -210,7 +205,11 @@ impl BlockedBloom {
     }
 
     pub(super) fn insert(&mut self, key: &[u8]) {
-        let (base, h1, h2) = self.block_base_and_hashes(key);
+        self.insert_z(BloomKey::new(key).z);
+    }
+
+    pub(super) fn insert_z(&mut self, z: u64) {
+        let (base, h1, h2) = self.block_base_and_hashes_z(z);
         for i in 0..self.k as u64 {
             let pos = h1.wrapping_add(i.wrapping_mul(h2)) % BLOOM_BLOCK_BITS;
             self.bits[base + (pos / 64) as usize] |= 1u64 << (pos % 64);

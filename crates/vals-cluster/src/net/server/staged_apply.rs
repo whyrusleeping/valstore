@@ -3840,6 +3840,7 @@
     fn capped_unplannable_multi_run_is_terminal_not_busy() {
         if crate::testutil::isolated_env_test(&[("VALS_VLOG_GC", "0")]) { return; }
         let dev = MemBlockDevice::new(256, 256);
+        let _v6 = vals_store::run::pin_run_write_version(vals_store::run::RUN_RT_VERSION);
         let engine = Engine::create_prewiped(
             dev,
             Config {

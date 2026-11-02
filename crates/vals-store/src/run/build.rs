@@ -2,18 +2,23 @@ use super::*;
 
 pub(super) fn parse_run_write_version(raw: Option<&str>) -> u16 {
     match raw.map(str::trim) {
-        None | Some("6") => RUN_VERSION,
+        None | Some("7") => RUN_VERSION,
+        Some("6") => RUN_RT_VERSION,
         Some("5") => RUN_BLOCK_VERSION,
         Some("4") => RUN_SIDECAR_VERSION,
         Some(other) => {
-            log::error!("VALS_RUN_WRITE_VERSION={other:?} is not 4, 5 or 6; writing sidecar runs (version 4)");
+            log::error!("VALS_RUN_WRITE_VERSION={other:?} is not 4, 5, 6 or 7; writing sidecar runs (version 4)");
             RUN_SIDECAR_VERSION
         }
     }
 }
 
 pub fn version_supports_range_tombstones(version: u16) -> bool {
-    version >= RUN_VERSION
+    version >= RUN_RT_VERSION
+}
+
+pub fn version_compresses_blocks(version: u16) -> bool {
+    version >= RUN_COMPRESSED_VERSION
 }
 
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -22,14 +27,23 @@ thread_local! {
 }
 
 #[cfg(any(test, feature = "test-fixtures"))]
-pub fn with_run_write_version<R>(version: u16, f: impl FnOnce() -> R) -> R {
-    struct Restore(Option<u16>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            WRITE_VERSION_OVERRIDE.with(|c| c.set(self.0));
-        }
+pub struct RunWriteVersionPin(Option<u16>);
+
+#[cfg(any(test, feature = "test-fixtures"))]
+impl Drop for RunWriteVersionPin {
+    fn drop(&mut self) {
+        WRITE_VERSION_OVERRIDE.with(|c| c.set(self.0));
     }
-    let _restore = Restore(WRITE_VERSION_OVERRIDE.with(|c| c.replace(Some(version))));
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn pin_run_write_version(version: u16) -> RunWriteVersionPin {
+    RunWriteVersionPin(WRITE_VERSION_OVERRIDE.with(|c| c.replace(Some(version))))
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn with_run_write_version<R>(version: u16, f: impl FnOnce() -> R) -> R {
+    let _pin = pin_run_write_version(version);
     f()
 }
 
@@ -53,11 +67,14 @@ pub fn merge_write_version(input_versions: impl IntoIterator<Item = u16>) -> u16
 }
 
 pub fn rewrite_growth_bytes<D: BlockDevice>(input: &DeviceRun<D>, out_version: u16) -> usize {
-    if out_version >= RUN_VERSION && input.version < RUN_VERSION {
-        input.index.len() * std::mem::size_of::<u64>() + INDEX_RT_TRAILER_LEN
-    } else {
-        0
+    let mut growth = 0;
+    if out_version >= RUN_RT_VERSION && input.version < RUN_RT_VERSION {
+        growth += input.index.len() * std::mem::size_of::<u64>() + INDEX_RT_TRAILER_LEN;
     }
+    if version_compresses_blocks(out_version) && !version_compresses_blocks(input.version) {
+        growth += INDEX_RAW_TRAILER_LEN;
+    }
+    growth
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -88,6 +105,8 @@ pub fn run_build_verify_totals() -> (u64, u64) {
 }
 
 pub const DEFAULT_RUN_BLOCK_TARGET_BYTES: usize = 32 * 1024;
+pub(super) const CODEC_BATCH_BLOCKS: usize = 256;
+pub(super) const STREAM_CODEC_BATCH_BLOCKS: usize = 32;
 pub const RUN_BLOCK_TARGET_BYTES_RANGE: std::ops::RangeInclusive<usize> = 4096..=256 * 1024;
 pub const DEFAULT_RUN_BLOOM_BITS_PER_KEY: usize = 10;
 pub const RUN_BLOOM_BITS_PER_KEY_RANGE: std::ops::RangeInclusive<usize> = 4..=24;
@@ -296,7 +315,7 @@ pub fn build_run_into_checked_rts<S: RunSink>(
 ) -> Result<RunBuilt, Box<EncodeIntegrityError>> {
     debug_assert!(
         (RUN_SIDECAR_VERSION..=RUN_VERSION).contains(&version),
-        "runs are written as version 4, 5 or 6"
+        "runs are written as version 4, 5, 6 or 7"
     );
     let v6 = version_supports_range_tombstones(version);
     let mut index = FenceBuilder::default();
@@ -305,36 +324,46 @@ pub fn build_run_into_checked_rts<S: RunSink>(
     let data_start = sink.position();
     let mut hashes: Vec<u64> = Vec::new();
 
+    let compress = version_compresses_blocks(version);
     let mut i = 0;
     while i < entries.len() {
-        let start = i;
-        let mut est = 0usize;
-        while i < entries.len() && (i == start || est < opts.block_target_bytes) {
-            est += entries[i].key.len() + ENTRY_FIELDS_LEN;
-            i += 1;
-        }
-        let src = &entries[start..i];
-        let expect = match source {
-            RunSource::Inline => {
-                hashes.clear();
-                hashes.extend(src.iter().map(snapshot_entry_hash));
-                Expect::Entries(&hashes)
+        let mut batch: Vec<&[SnapshotEntry]> = Vec::new();
+        while i < entries.len() && batch.len() < CODEC_BATCH_BLOCKS {
+            let start = i;
+            let mut est = 0usize;
+            while i < entries.len() && (i == start || est < opts.block_target_bytes) {
+                est += entries[i].key.len() + ENTRY_FIELDS_LEN;
+                i += 1;
             }
-            RunSource::Attested(groups) => Expect::Groups { groups, all: entries },
-        };
-        let (block, first_key) = check.block(src, expect, &mut bloom)?;
-        let off = sink.position();
-        if v6 {
-            index.push_with_max_hlc(&first_key, off, block.len() as u32, check.last_block_max_hlc())
-        } else {
-            index.push(&first_key, off, block.len() as u32)
+            batch.push(&entries[start..i]);
         }
-        .map_err(|why| check.index_error(why))?;
-        sink.write(&block);
-        check.retire(block);
+        for (src, coded) in batch.iter().zip(check.code_blocks(&batch, compress)) {
+            let expect = match source {
+                RunSource::Inline => {
+                    hashes.clear();
+                    hashes.extend(src.iter().map(snapshot_entry_hash));
+                    Expect::Entries(&hashes)
+                }
+                RunSource::Attested(groups) => Expect::Groups { groups, all: entries },
+            };
+            let (block, first_key) = check.block_coded(src, coded, expect, &mut bloom)?;
+            let off = sink.position();
+            if v6 {
+                index.push_with_max_hlc(&first_key, off, block.len() as u32, check.last_block_max_hlc())
+            } else {
+                index.push(&first_key, off, block.len() as u32)
+            }
+            .map_err(|why| check.index_error(why))?;
+            sink.write(&block);
+            check.retire(block);
+        }
     }
     check.finish_source(source)?;
-    let index = index.finish();
+    let mut index = index.finish();
+    if version_compresses_blocks(version) {
+        let (data_len, max_block) = check.raw_data();
+        index.set_raw(data_len, max_block);
+    }
 
     let bloom_off = sink.position();
     let bloom_bytes = bloom.encode();
@@ -354,7 +383,7 @@ pub fn build_run_into_checked_rts<S: RunSink>(
 
     let index_off = sink.position();
     let idx = encode_index_bytes(&index, rt);
-    check.verify_index(&idx, data_start, bloom_off, rt)?;
+    check.verify_index(&idx, data_start, bloom_off, rt, index.raw().is_some())?;
     sink.write(&idx);
 
     let sidecar_off = sink.position();
@@ -425,6 +454,9 @@ pub fn run_len_upper_bound_agg(
     if version_supports_range_tombstones(version) {
         bound += n_blocks * std::mem::size_of::<u64>() + INDEX_RT_TRAILER_LEN;
     }
+    if version_compresses_blocks(version) {
+        bound += INDEX_RAW_TRAILER_LEN;
+    }
     bound += FOOTER_LEN;
     bound
 }
@@ -437,6 +469,7 @@ pub struct RunStreamBuilder<'a, D: BlockDevice> {
     cur: Vec<SnapshotEntry>,
     cur_hashes: Vec<u64>,
     cur_est: usize,
+    pending: Vec<(Vec<SnapshotEntry>, Vec<u64>)>,
     entry_count: u64,
     version: u16,
     verify: bool,
@@ -463,6 +496,7 @@ impl<'a, D: BlockDevice> RunStreamBuilder<'a, D> {
             cur: Vec::new(),
             cur_hashes: Vec::new(),
             cur_est: 0,
+            pending: Vec::new(),
             entry_count: 0,
             version: run_write_version(),
             verify: run_build_verify(),
@@ -524,7 +558,28 @@ impl<'a, D: BlockDevice> RunStreamBuilder<'a, D> {
 
     fn close_block(&mut self) {
         if self.failed.is_none() {
-            match self.check.block(&self.cur, Expect::Entries(&self.cur_hashes), &mut self.bloom) {
+            let compress = version_compresses_blocks(self.version);
+            let (cur, hashes) = (std::mem::take(&mut self.cur), std::mem::take(&mut self.cur_hashes));
+            self.pending.push((cur, hashes));
+            if !compress || self.pending.len() >= STREAM_CODEC_BATCH_BLOCKS {
+                self.write_pending();
+            }
+        }
+        self.cur.clear();
+        self.cur_hashes.clear();
+        self.cur_est = 0;
+    }
+
+    fn write_pending(&mut self) {
+        let pending = std::mem::take(&mut self.pending);
+        if self.failed.is_some() || pending.is_empty() {
+            return;
+        }
+        let compress = version_compresses_blocks(self.version);
+        let srcs: Vec<&[SnapshotEntry]> = pending.iter().map(|(cur, _)| cur.as_slice()).collect();
+        let coded = self.check.code_blocks(&srcs, compress);
+        for ((cur, hashes), coded) in pending.iter().zip(coded) {
+            match self.check.block_coded(cur, coded, Expect::Entries(hashes), &mut self.bloom) {
                 Ok((block, first_key)) => {
                     let off = self.sink.position();
                     let pushed = if version_supports_range_tombstones(self.version) {
@@ -540,12 +595,12 @@ impl<'a, D: BlockDevice> RunStreamBuilder<'a, D> {
                     self.sink.write(&block);
                     self.check.retire(block);
                 }
-                Err(e) => self.failed = Some(e),
+                Err(e) => {
+                    self.failed = Some(e);
+                    return;
+                }
             }
         }
-        self.cur.clear();
-        self.cur_hashes.clear();
-        self.cur_est = 0;
     }
 
     #[cfg(test)]
@@ -562,10 +617,15 @@ impl<'a, D: BlockDevice> RunStreamBuilder<'a, D> {
         if !self.cur.is_empty() {
             self.close_block();
         }
+        self.write_pending();
         if let Some(e) = self.failed.take() {
             return Err(SnapshotError::EncodeIntegrity(e));
         }
-        let index = std::mem::take(&mut self.index).finish();
+        let mut index = std::mem::take(&mut self.index).finish();
+        if version_compresses_blocks(self.version) {
+            let (data_len, max_block) = self.check.raw_data();
+            index.set_raw(data_len, max_block);
+        }
         let built = self.check.bounds();
         let bloom_off = self.sink.position();
         let bloom_bytes = self.bloom.encode();
@@ -585,7 +645,7 @@ impl<'a, D: BlockDevice> RunStreamBuilder<'a, D> {
         let index_off = self.sink.position();
         let idx = encode_index_bytes(&index, rt);
         self.check
-            .verify_index(&idx, self.data_start, bloom_off, rt)
+            .verify_index(&idx, self.data_start, bloom_off, rt, index.raw().is_some())
             .map_err(SnapshotError::EncodeIntegrity)?;
         self.sink.write(&idx);
         let sidecar_off = self.sink.position();

@@ -1,11 +1,14 @@
 use super::*;
 
 pub(crate) const RUN_MAGIC: u32 = 0x4e55_5256;
-pub const RUN_VERSION: u16 = 6;
+pub const RUN_VERSION: u16 = 7;
+pub const RUN_COMPRESSED_VERSION: u16 = 7;
+pub const RUN_RT_VERSION: u16 = 6;
 pub const RUN_BLOCK_VERSION: u16 = 5;
 pub const RUN_SIDECAR_VERSION: u16 = 4;
 pub(crate) const FOOTER_LEN: usize = 4 + 2 + 2 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 4;
 pub(super) const INDEX_RT_TRAILER_LEN: usize = 8 + 8 + 8;
+pub(super) const INDEX_RAW_TRAILER_LEN: usize = 8 + 4;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RtLocator {
@@ -16,6 +19,7 @@ pub struct RtLocator {
 
 pub(super) fn encode_index_bytes(index: &FenceIndex, rt: Option<RtLocator>) -> Vec<u8> {
     debug_assert!(rt.is_none() || index.has_max_hlc(), "a v6 index carries max_hlc for every block");
+    debug_assert!(index.raw().is_none() || rt.is_some(), "a v7 index carries the v6 trailer");
     let mut idx = Vec::new();
     idx.extend_from_slice(&(index.len() as u64).to_le_bytes());
     for (i, (k, off, len)) in index.iter().enumerate() {
@@ -26,6 +30,10 @@ pub(super) fn encode_index_bytes(index: &FenceIndex, rt: Option<RtLocator>) -> V
         if rt.is_some() {
             idx.extend_from_slice(&index.max_hlc(i).unwrap_or(u64::MAX).to_le_bytes());
         }
+    }
+    if let Some((data_len, max_block)) = index.raw() {
+        idx.extend_from_slice(&data_len.to_le_bytes());
+        idx.extend_from_slice(&max_block.to_le_bytes());
     }
     if let Some(rt) = rt {
         idx.extend_from_slice(&rt.seq_floor.to_le_bytes());
@@ -90,7 +98,9 @@ pub(super) fn decode_index(bytes: &[u8], version: u16) -> Result<(FenceIndex, Op
         return Err("index crc mismatch");
     }
     let v6 = version_supports_range_tombstones(version);
+    let v7 = version_compresses_blocks(version);
     let (entry_fixed, trailer) = if v6 { (24, INDEX_RT_TRAILER_LEN) } else { (16, 0) };
+    let trailer = trailer + if v7 { INDEX_RAW_TRAILER_LEN } else { 0 };
     let mut c = Cursor { b: body, off: 0 };
     let n = c.u64()?;
     if body.len() - c.off < trailer || n > ((body.len() - c.off - trailer) / entry_fixed) as u64 {
@@ -121,6 +131,10 @@ pub(super) fn decode_index(bytes: &[u8], version: u16) -> Result<(FenceIndex, Op
             out.push(k, off, len)?;
         }
     }
+    let mut index = out.finish();
+    if v7 {
+        index.set_raw(c.u64()?, c.u32()?);
+    }
     let rt = if v6 {
         Some(RtLocator { seq_floor: c.u64()?, off: c.u64()?, len: c.u64()? })
     } else {
@@ -129,7 +143,7 @@ pub(super) fn decode_index(bytes: &[u8], version: u16) -> Result<(FenceIndex, Op
     if c.off != body.len() {
         return Err("trailing bytes");
     }
-    Ok((out.finish(), rt))
+    Ok((index, rt))
 }
 
 pub(super) struct Footer {

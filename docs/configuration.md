@@ -118,20 +118,27 @@ makes incompatible persisted state readable.
 ### Run format version
 
 Run files (the engine's sorted index files) have an on-disk version. Current
-builds write version 6, which adds per-block version bounds and range-tombstone
-records; version 5 has no sidecar file; version 4 is the older sidecar format.
-A build refuses runs newer than it understands, so a rollback window needs the
-cluster to keep writing the older version. `VALS_RUN_WRITE_VERSION` (read once
-at startup) selects the format new runs are written in:
+builds write version 7, which compresses each data block with zstd (runs are
+about 70% smaller on the ATProto replay); version 6 adds per-block version
+bounds and range-tombstone records; version 5 has no sidecar file; version 4 is
+the older sidecar format. A build refuses runs newer than it understands, so a
+rollback window needs the cluster to keep writing the older version.
+`VALS_RUN_WRITE_VERSION` (read once at startup) selects the format new runs are
+written in:
 
-- `6` or unset: version 6 (the default).
+- `7` or unset: version 7 (the default).
+- `6`: version 6, for a rollback window to a release that cannot read version
+  7, or for a read-heavy store that would rather not spend the CPU: a point
+  read that reaches a version-7 block decompresses it, about 17 µs per 32 KiB
+  block, against about 3 µs to search a version-6 block. It must be set before
+  the first version-7 run is written. A merge with any version-7 input still
+  writes version 7.
 - `5`: version 5, for a rollback window to a release that cannot read version
   6. It must be set before the first version-6 run is written. A merge with any
-  version-6 input still writes version 6. Range deletes are refused in this
-  mode.
+  version-6 or version-7 input still writes that version. Range deletes are
+  refused in this mode.
 - `4`: the sidecar format, for a rollback window to a release that cannot read
-  version 5. A merge with any version-5 input writes version 5, and with any
-  version-6 input writes version 6.
+  version 5. A merge with any newer input writes the newest input's version.
 - Any other value, including an empty string (an unexpanded template variable),
   logs an error and writes version 4.
 
@@ -303,7 +310,7 @@ code, not a contract.
 | `VALS_MERGE_TIER_MIN_K` | 16 (4 before 0563), clamped to 2..K; a recurring merge waits for this many similar tail runs | same |
 | `VALS_MERGE_FORCE_RUNS` | 16 (= K; minimum 2): runs in the active tail (newer than the newest frozen run) at which the valve forces a capped merge | same |
 | `VALS_MERGE_TIER_SIZE_RATIO` | 1.5 (positive) | same |
-| `VALS_MERGE_INPUT_CAP_BYTES` | 2147483648 (positive): hard limit on recurring and forced merge input | merge input sizing A-B; may affect reclaim progress, same |
+| `VALS_MERGE_INPUT_CAP_BYTES` | 2147483648 (positive): hard limit on recurring and forced merge input, measured as uncompressed run length | merge input sizing A-B; may affect reclaim progress, same |
 | `VALS_MERGE_FREEZE_BYTES` | the input cap (positive) | runs at or above it are never recurring/forced inputs (frozen top tier); runs too large for a balanced capped window are frozen regardless, same |
 | `VALS_VICTIM_DEAD_FRACTION` | 0.5 (0..1) | reclaim selection A-B, same |
 | `VALS_SHADOW_EST` / `VALS_SHADOW_FOLD` | on; exactly 0 disables | estimator/fold comparisons, same |
@@ -317,6 +324,7 @@ code, not a contract.
 | `VALS_MAINT_DUTY_PCT` | 33; 0 or >=100 disables pacing | maintenance pacing A-B, `vals-store/pace.rs` |
 | `VALS_MAINT_FLUSH_BYTES` | 16777216 (16 MiB) | pacer accounting flush granularity, same |
 | `VALS_RUN_BUILD_VERIFY` | on; exactly 0 disables (read once) | pre-publication device readback of streamed merge outputs after their last write completes (no reads from the writer's buffer): every data block's CRC, plus the footer, filter and index CRCs and a byte compare against the encoded copies (see [deploy.md](deploy.md#merge-output-verification)); device-read cost A-B (`vals_run_build_verify_bytes_total`, `_failures_total`), `vals-store/run/build.rs`. Off still CRC-checks footer, filter and index from the device before publication, uncounted |
+| `VALS_RUN_CODEC_THREADS` | 4; 1..=64, anything else logs an error and uses the default (read once) | threads, the building one included, that encode, zstd-compress, CRC and decompress-check run format v7 blocks during a flush (256 blocks at a time) or merge (32 at a time); the building thread then checks each block against its source in order. 1 codes on the building thread alone. Flushes share one maintenance lane, which compression alone saturated on the two-node replay. `vals-store/run/encode_check.rs` |
 | `VALS_RUN_BLOCK_TARGET_BYTES` | 32768; clamped to 4096..=262144, non-numeric logs an error and uses the default (read once) | estimated encoded bytes at which new run data blocks close. Trades fence RAM (one first-key copy per block) against bytes read per run probe. New flushes and merges only; old runs keep their block size and mixed sizes are read normally (no format change). Overwrite-heavy workloads pay 15–20% (release build, 20k hot keys) for old-version probes at 32 KiB and may prefer 8192–16384; see [deploy.md](deploy.md#memory-sizing). `vals-store/run/build.rs` |
 | `VALS_RUN_BLOOM_BITS_PER_KEY` | 10; clamped to 4..=24 (read once) | per-run blocked-bloom bits per entry for new runs (k = round(0.69 × bits)). Old filters carry their own size and k. Same file |
 | `VALS_KEY_FILTER` | on; exactly 0 disables | turns off the engine-wide key filter (RAM-only, rebuilt by cover scans at startup). `vals-store/keyfilter.rs`; see [out-of-core-index.md](out-of-core-index.md) |

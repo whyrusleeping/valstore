@@ -2947,6 +2947,7 @@
 
     #[test]
     fn forget_plan_allocation_error_rolls_back_pending_and_replans() {
+        let _v6 = vals_store::run::pin_run_write_version(vals_store::run::RUN_RT_VERSION);
         let mut failed: Option<(VersionedStore<MemBlockDevice>, Version)> = None;
         for count in (40..180usize).step_by(5) {
             let dev = MemBlockDevice::new(BS, 256);

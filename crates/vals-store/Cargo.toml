@@ -23,6 +23,10 @@ log = "0.4"
 # allocation-free on the hot Apply/BatchApply resolve path.
 smallvec = "1"
 libc = "0.2"
+# Run format v7 compresses each run data block (task 0564): zstd level 1 left
+# 29% of real run block bytes against 43% for LZ4, and nothing hand-written
+# gets near its entropy coding of base32 DIDs and record keys.
+zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 backtrace = "0.3"

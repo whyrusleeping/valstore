@@ -493,6 +493,24 @@ impl<D: BlockDevice> DeviceRun<D> {
         self.index.last().map_or(0, |(_, off, len)| off + *len as u64)
     }
 
+    /// The run's length with every data block stored uncompressed (its stored length below v7).
+    pub fn uncompressed_len(&self) -> u64 {
+        self.handle.len.saturating_add(self.compression_savings())
+    }
+
+    /// How many bytes compression saved on the run's data blocks (0 below v7).
+    pub fn compression_savings(&self) -> u64 {
+        self.index.raw().map_or(0, |(data_len, _)| data_len.saturating_sub(self.data_bytes()))
+    }
+
+    fn max_body_bytes(&self) -> usize {
+        self.index.raw().map_or(0, |(_, max_block)| max_block as usize)
+    }
+
+    pub fn max_uncompressed_block_bytes(&self) -> usize {
+        self.index.raw().map_or(self.max_block, |(_, max_block)| max_block as usize)
+    }
+
     pub fn blocks_for_bytes(&self, bytes: usize) -> usize {
         let n = self.index.len().max(1);
         let avg = (self.data_bytes() as usize).div_ceil(n).max(1);
@@ -563,6 +581,7 @@ impl<D: BlockDevice> DeviceRun<D> {
             base,
             num_buckets: self.num_buckets,
             max_block: self.max_block,
+            max_body: self.max_body_bytes(),
             walker: BlockWalker::new(self.index.clone(), start),
         })
     }

@@ -1298,17 +1298,17 @@ impl<D: BlockDevice> Engine<D> {
     }
 
     pub fn frozen_run_count(&self) -> usize {
-        self.runs.iter().filter(|or| self.merge_policy.frozen(or.meta.handle.len)).count()
+        self.runs.iter().filter(|or| self.merge_policy.frozen(or.policy_len())).count()
     }
 
     pub fn stranded_run_count(&self) -> usize {
-        let end = self.runs.iter().rposition(|or| self.merge_policy.frozen(or.meta.handle.len));
+        let end = self.runs.iter().rposition(|or| self.merge_policy.frozen(or.policy_len()));
         end.map_or(0, |end| self.runs[..end].iter()
-            .filter(|or| !self.merge_policy.frozen(or.meta.handle.len)).count())
+            .filter(|or| !self.merge_policy.frozen(or.policy_len())).count())
     }
 
     pub fn max_run_bytes(&self) -> u64 {
-        self.runs.iter().map(|or| or.meta.handle.len).max().unwrap_or(0)
+        self.runs.iter().map(|or| or.policy_len()).max().unwrap_or(0)
     }
 
     #[cfg(any(test, feature = "test-fixtures"))]
@@ -1377,8 +1377,7 @@ impl<D: BlockDevice> Engine<D> {
         if self.poisoned || self.compact_in_flight {
             return false;
         }
-        let sizes: Vec<u64> = self.runs.iter().map(|or| or.meta.handle.len).collect();
-        select_recurring_merge(&sizes, &self.merge_policy).is_some()
+        select_recurring_merge(&self.policy_sizes(), &self.merge_policy).is_some()
     }
 
     pub fn run_handles(&self) -> Vec<crate::run::RunHandle> {
@@ -1730,8 +1729,12 @@ impl<D: BlockDevice> Engine<D> {
         None
     }
 
+    pub(super) fn policy_sizes(&self) -> Vec<u64> {
+        self.runs.iter().map(|or| or.policy_len()).collect()
+    }
+
     fn select_compaction_start(&self, kind: PlanKind) -> Option<StartSelection> {
-        let sizes: Vec<u64> = self.runs.iter().map(|or| or.meta.handle.len).collect();
+        let sizes = self.policy_sizes();
         let selection = match kind {
             PlanKind::Forget(_) => StartSelection {
                 start: 0,

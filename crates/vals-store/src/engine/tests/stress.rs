@@ -522,16 +522,17 @@ fn concurrent_in_place_forced_windows_never_corrupt_merge_outputs() {
     let inner_before = inner_window_merges_total();
     let mut total = StressStats::default();
     let runs = [
-        (1u64, 4, true, 1, false),
-        (7, 4, true, 6, false),
-        (42, 8, false, 3, false),
-        (1_000_003, 8, true, 6, false),
-        (2, 4, true, 1, true),
-        (8, 4, false, 2, true),
-        (43, 8, true, 1, true),
-        (1_000_004, 6, true, 3, true),
+        (1u64, 4, true, 1, false, true),
+        (7, 4, true, 6, false, true),
+        (42, 8, false, 3, false, false),
+        (1_000_003, 8, true, 6, false, false),
+        (2, 4, true, 1, true, false),
+        (8, 4, false, 2, true, false),
+        (43, 8, true, 1, true, false),
+        (1_000_004, 6, true, 3, true, false),
     ];
-    for (seed, engines, deferred, merge_gate, bulky) in runs {
+    for (seed, engines, deferred, merge_gate, bulky, uncompressed) in runs {
+        let _v6 = uncompressed.then(uncompressed_runs);
         let cfg = StressConfig {
             engines,
             ops: 20_000,

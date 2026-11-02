@@ -1,6 +1,130 @@
 use super::*;
+use std::borrow::Cow;
+use std::cell::RefCell;
 
 const SUFFIX_TOMB_BIT: u32 = 1 << 31;
+const BLOCK_CODEC_ZSTD: u32 = 1;
+const CODED_HEADER_LEN: usize = 8;
+pub(super) const MAX_BLOCK_BODY: usize = 64 << 20;
+const ZSTD_LEVEL: i32 = 1;
+
+const ZSTD_CONTEXT_POOL_MAX: usize = 64;
+
+#[derive(Default)]
+struct ZstdContexts {
+    compressor: Option<zstd::bulk::Compressor<'static>>,
+    decompressor: Option<zstd::bulk::Decompressor<'static>>,
+}
+
+static ZSTD_CONTEXT_POOL: std::sync::Mutex<Vec<ZstdContexts>> = std::sync::Mutex::new(Vec::new());
+
+struct ThreadZstdContexts(ZstdContexts);
+
+impl Drop for ThreadZstdContexts {
+    fn drop(&mut self) {
+        if let Ok(mut pool) = ZSTD_CONTEXT_POOL.lock() {
+            if pool.len() < ZSTD_CONTEXT_POOL_MAX {
+                pool.push(std::mem::take(&mut self.0));
+            }
+        }
+    }
+}
+
+thread_local! {
+    static ZSTD_CONTEXTS: RefCell<Option<ThreadZstdContexts>> = const { RefCell::new(None) };
+}
+
+fn with_zstd<R>(f: impl FnOnce(&mut ZstdContexts) -> R) -> R {
+    ZSTD_CONTEXTS.with(|z| {
+        let mut z = z.borrow_mut();
+        let ctx = z.get_or_insert_with(|| {
+            ThreadZstdContexts(ZSTD_CONTEXT_POOL.lock().ok().and_then(|mut pool| pool.pop()).unwrap_or_default())
+        });
+        f(&mut ctx.0)
+    })
+}
+
+fn new_compressor() -> std::io::Result<zstd::bulk::Compressor<'static>> {
+    let mut c = zstd::bulk::Compressor::new(ZSTD_LEVEL)?;
+    c.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
+    Ok(c)
+}
+
+/// The compressed v7 form of an encoded block body, `[u32 body_len][u32 codec][zstd frame]`
+/// without the CRC, or `None` when compression does not make it shorter.
+pub(super) fn compress_block_body(body: &[u8]) -> Option<Vec<u8>> {
+    if body.len() > MAX_BLOCK_BODY {
+        return None;
+    }
+    let bound = zstd::zstd_safe::compress_bound(body.len());
+    let mut out = vec![0u8; CODED_HEADER_LEN + bound];
+    out[..4].copy_from_slice(&(body.len() as u32).to_le_bytes());
+    out[4..8].copy_from_slice(&BLOCK_CODEC_ZSTD.to_le_bytes());
+    let n = with_zstd(|z| {
+        if z.compressor.is_none() {
+            z.compressor = new_compressor().ok();
+        }
+        z.compressor.as_mut()?.compress_to_buffer(body, &mut out[CODED_HEADER_LEN..]).ok()
+    })?;
+    if CODED_HEADER_LEN + n >= body.len() {
+        return None;
+    }
+    out.truncate(CODED_HEADER_LEN + n);
+    Some(out)
+}
+
+/// Decodes the payload of a block (its bytes before the CRC) to the encoded entry body:
+/// a payload whose bytes 4..8 are zero, or that is shorter than a coded header, is already
+/// the body (the first entry of a block always has a zero shared-prefix length there).
+pub(super) fn decode_block_payload(payload: &[u8]) -> Result<Cow<'_, [u8]>, FrameError> {
+    if payload.len() < CODED_HEADER_LEN || payload[4..8] == [0; 4] {
+        return Ok(Cow::Borrowed(payload));
+    }
+    let body_len = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+    if u32::from_le_bytes(payload[4..8].try_into().unwrap()) != BLOCK_CODEC_ZSTD {
+        return Err(FrameError::Codec);
+    }
+    if body_len > MAX_BLOCK_BODY {
+        return Err(FrameError::Decompress);
+    }
+    let mut body = vec![0u8; body_len];
+    let n = with_zstd(|z| {
+        if z.decompressor.is_none() {
+            z.decompressor = zstd::bulk::Decompressor::new().ok();
+        }
+        z.decompressor.as_mut()?.decompress_to_buffer(&payload[CODED_HEADER_LEN..], &mut body[..]).ok()
+    });
+    if n != Some(body_len) {
+        return Err(FrameError::Decompress);
+    }
+    Ok(Cow::Owned(body))
+}
+
+/// The decoded body length a stored v7 block declares (0 for a plain block), capped at
+/// `MAX_BLOCK_BODY`, so a reader can reserve the memory before decompressing.
+pub(super) fn coded_body_len(block: &[u8]) -> usize {
+    if block.len() < CODED_HEADER_LEN + 4 || block[4..8] == [0; 4] {
+        return 0;
+    }
+    (u32::from_le_bytes(block[..4].try_into().unwrap()) as usize).min(MAX_BLOCK_BODY)
+}
+
+/// CRC-checks an on-disk block and returns its encoded entry body, decompressing a v7 block.
+#[inline]
+pub(super) fn block_body(block: &[u8]) -> Result<Cow<'_, [u8]>, FrameError> {
+    if block.len() < 8 {
+        return Err(FrameError::Truncated);
+    }
+    if !block_crc_ok(block) {
+        return Err(FrameError::Crc);
+    }
+    decode_block_payload(&block[..block.len() - 4])
+}
+
+#[inline]
+pub(super) fn body_count(body: &[u8]) -> Result<u32, &'static str> {
+    Ok(u32::from_le_bytes(body.get(..4).ok_or("truncated")?.try_into().unwrap()))
+}
 
 pub fn encode_block(entries: &[SnapshotEntry]) -> Vec<u8> {
     debug_assert!(
@@ -71,13 +195,17 @@ const ENTRY_VERSION_AT: usize = 8 + 4 + 4 + 8;
 pub(super) enum FrameError {
     Truncated,
     Crc,
+    Codec,
+    Decompress,
 }
 
 impl FrameError {
-    fn why(self) -> &'static str {
+    pub(super) fn why(self) -> &'static str {
         match self {
             FrameError::Truncated => "truncated",
             FrameError::Crc => "crc mismatch",
+            FrameError::Codec => "unknown block codec",
+            FrameError::Decompress => "block decompression failed",
         }
     }
 
@@ -85,24 +213,10 @@ impl FrameError {
         match self {
             FrameError::Truncated => "run block truncated",
             FrameError::Crc => "run block crc mismatch",
+            FrameError::Codec => "run block has an unknown codec",
+            FrameError::Decompress => "run block decompression failed",
         }
     }
-}
-
-#[inline]
-pub(super) fn block_frame(block: &[u8]) -> Result<u32, FrameError> {
-    if block.len() < 8 {
-        return Err(FrameError::Truncated);
-    }
-    if !block_crc_ok(block) {
-        return Err(FrameError::Crc);
-    }
-    Ok(u32::from_le_bytes(block[..4].try_into().unwrap()))
-}
-
-#[inline]
-fn block_entries(block: &[u8]) -> Cursor<'_> {
-    Cursor { b: &block[..block.len() - 4], off: 4 }
 }
 
 pub(super) struct EntryKey<'a> {
@@ -159,8 +273,7 @@ impl<'a> Cursor<'a> {
 }
 
 pub fn decode_block(bytes: &[u8]) -> Result<Vec<SnapshotEntry>, &'static str> {
-    let count = block_frame(bytes).map_err(FrameError::why)?;
-    decode_entries(block_entries(bytes), count)
+    decode_block_body(&block_body(bytes).map_err(FrameError::why)?)
 }
 
 pub(super) fn decode_block_body(body: &[u8]) -> Result<Vec<SnapshotEntry>, &'static str> {
@@ -187,8 +300,9 @@ fn decode_entries(mut c: Cursor<'_>, count: u32) -> Result<Vec<SnapshotEntry>, &
 }
 
 pub fn block_lookup(bytes: &[u8], key: &[u8]) -> Result<Option<SnapshotEntry>, &'static str> {
-    let count = block_frame(bytes).map_err(FrameError::why)?;
-    let mut c = block_entries(bytes);
+    let body = block_body(bytes).map_err(FrameError::why)?;
+    let count = body_count(&body)?;
+    let mut c = Cursor { b: &body, off: 4 };
     let mut prev_len = 0usize;
     let mut matched = 0usize;
     for _ in 0..count {
@@ -226,9 +340,18 @@ pub struct BlockCursor {
 
 impl BlockCursor {
     pub fn new(bytes: Vec<u8>, lo: Option<&[u8]>, exclusive: bool) -> Result<Self, &'static str> {
-        let left = block_frame(&bytes).map_err(FrameError::why)?;
+        let decoded = match block_body(&bytes).map_err(FrameError::why)? {
+            Cow::Owned(body) => Some(body),
+            Cow::Borrowed(_) => None,
+        };
+        let bytes = decoded.unwrap_or_else(|| {
+            let mut bytes = bytes;
+            bytes.truncate(bytes.len() - 4);
+            bytes
+        });
+        let left = body_count(&bytes)?;
         let mut cursor = BlockCursor {
-            body_end: bytes.len() - 4,
+            body_end: bytes.len(),
             bytes,
             pos: 4,
             left,
@@ -294,15 +417,11 @@ impl BlockCursor {
 }
 
 pub fn block_first_key(bytes: &[u8]) -> Result<Option<Vec<u8>>, &'static str> {
-    if bytes.len() < 8 {
-        return Err("truncated");
-    }
-    let mut c = block_entries(bytes);
-    let count = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-    if count == 0 {
+    let body = block_body(bytes).map_err(FrameError::why)?;
+    if body_count(&body)? == 0 {
         return Ok(None);
     }
-    Ok(Some(c.entry_key(0)?.suffix.to_vec()))
+    Ok(Some(Cursor { b: &body, off: 4 }.entry_key(0)?.suffix.to_vec()))
 }
 
 pub(super) fn block_crc_ok(block: &[u8]) -> bool {

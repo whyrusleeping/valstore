@@ -1054,6 +1054,13 @@ they are load-bearing and worth recording. Full rationale is in `ARCHITECTURE.md
     Most of the remaining time is manifest publication.
 - **Bounded merges and the frozen top tier** (`engine/merge.rs`
   `select_recurring_merge`, task 0381). The rules:
+  - **Sizes.** Every rule below measures a run by its uncompressed length: the stored
+    length plus what compression saved on its data blocks (run format v7, task 0564;
+    the index records the uncompressed data length). Merges therefore select the same
+    entries as they would over uncompressed runs, and a merge reserves the inputs'
+    uncompressed length for its output. That reservation is a hard bound, because a
+    compressed block is never stored larger than its plain form, while the inputs'
+    stored length is not: a merged block can compress worse than its inputs did.
   - **Cap.** No recurring or forced merge reads more than `VALS_MERGE_INPUT_CAP_BYTES`
     of run input.
   - **Frozen runs.** A run is frozen when it is at or above `VALS_MERGE_FREEZE_BYTES`

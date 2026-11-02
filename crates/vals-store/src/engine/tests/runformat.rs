@@ -64,7 +64,11 @@ fn mixed_format_engine() -> (Engine<MemBlockDevice>, Model) {
     let manifest = Manifest { generation: 1, covered_seq: 300, covered_epoch: 1, runs: vec![meta] };
     snapshot_io::write_manifest(&dev, &mut alloc, &manifest, 1, None).unwrap();
     let mut e = Engine::open(dev, cfg).unwrap();
-    for (lo, hi, base, version) in [(200u64, 500u64, 1_000u128, run::RUN_SIDECAR_VERSION), (400, 700, 2_000, run::RUN_VERSION)] {
+    for (lo, hi, base, version) in [
+        (200u64, 500u64, 1_000u128, run::RUN_SIDECAR_VERSION),
+        (400, 700, 2_000, run::RUN_VERSION),
+        (600, 900, 3_000, run::RUN_RT_VERSION),
+    ] {
         for i in lo..hi {
             let key = fmt_key(i);
             if i % 7 == 0 {
@@ -137,21 +141,23 @@ fn assert_serves_model(e: &Engine<MemBlockDevice>, model: &Model, ctx: &str) {
 }
 
 #[test]
-fn mixed_v2_v4_v5_runs_serve_reads_digests_cover_scans_and_merge_to_v5() {
+fn mixed_v2_v4_v7_v6_runs_serve_reads_digests_cover_scans_and_merge_to_v7() {
     let (mut e, model) = mixed_format_engine();
     let versions: Vec<u16> = e.runs.iter().map(|or| or.run.format_version()).collect();
-    assert_eq!(versions, vec![2, run::RUN_SIDECAR_VERSION, run::RUN_VERSION]);
+    assert_eq!(versions, vec![2, run::RUN_SIDECAR_VERSION, run::RUN_VERSION, run::RUN_RT_VERSION]);
+    assert!(e.runs[2].run.compression_savings() > 0 && e.runs[3].run.compression_savings() == 0);
     assert!(e.runs[2].run.sidecar_len() == 0 && e.runs[1].run.sidecar_len() > 0);
     let stats = e.capacity_stats();
     assert_eq!(stats.sidecar_disk_bytes, e.runs[0].run.sidecar_len() + e.runs[1].run.sidecar_len());
     assert_serves_model(&e, &model, "mixed");
-    assert_eq!(cover_every_run(&mut e), 3);
-    assert_eq!(e.key_filter_stats().covered_runs, 3);
+    assert_eq!(cover_every_run(&mut e), 4);
+    assert_eq!(e.key_filter_stats().covered_runs, 4);
 
     let handles = e.run_handles();
     assert!(e.run_version_stream(&handles[0]).unwrap().is_none());
     assert!(matches!(e.run_version_stream(&handles[1]).unwrap(), Some(run::RunVersionStream::Sidecar(_))));
     assert!(matches!(e.run_version_stream(&handles[2]).unwrap(), Some(run::RunVersionStream::Blocks(_))));
+    assert!(matches!(e.run_version_stream(&handles[3]).unwrap(), Some(run::RunVersionStream::Blocks(_))));
 
     let before = e.version_digest_page(&all_buckets(), vdp_bucket, None, usize::MAX, 0).unwrap();
     e.compact_runs(fmt_opts(), None).unwrap();
@@ -564,7 +570,7 @@ fn assert_block_paths(e: &Engine<MemBlockDevice>, model: &Model, ctx: &str) {
 fn block_shape(e: &Engine<MemBlockDevice>) -> Vec<(u64, usize)> {
     e.runs
         .iter()
-        .map(|or| (or.meta.entry_count / or.run.index_len() as u64, or.run.max_block_bytes()))
+        .map(|or| (or.meta.entry_count / or.run.index_len() as u64, or.run.max_uncompressed_block_bytes()))
         .collect()
 }
 

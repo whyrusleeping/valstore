@@ -59,6 +59,7 @@ fn free_before_barrier_does_not_destroy_durable_references() {
 
 #[test]
 fn durable_merge_frees_are_zeroed_bounded_and_reopen_cleanly() {
+    let _v6 = uncompressed_runs();
     let mut e = Engine::create_prewiped(MemBlockDevice::new(BS, 4096), config());
     populate(&mut e);
     e.set_device_dealloc(true);
@@ -131,6 +132,7 @@ fn co_compact_value_segments_wait_for_manifest_and_recover_after_dealloc() {
 
 #[test]
 fn reused_segment_is_not_deallocated() {
+    let _v6 = uncompressed_runs();
     let mut e = Engine::create_prewiped(MemBlockDevice::new(BS, 4096), config());
     populate(&mut e);
     e.set_device_dealloc(true);

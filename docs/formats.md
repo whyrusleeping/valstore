@@ -674,8 +674,25 @@ data blocks | filter | [v6: RT block] | index | [v1–v4: sidecar] | footer (80 
   sidecar_off(8) | sidecar_len(8) | num_buckets(4) | crc32c(4)`. Readers reject a
   version above their own (`unsupported run version`), and they read the footer
   before log replay, so a run version bump is a downgrade fence.
+- **Data block** (v1–v6, and a v7 block compression did not shrink):
+  `[u32 count] count × ([u32 shared][u32 suffix_len | tombstone << 31][suffix]
+  [u64 segment][u32 offset][u32 len][u64 seq][u128 version]) [crc32c]`, keys
+  front-coded against the previous entry (the first entry's `shared` is 0).
+- **Compressed data block** (v7): `[u32 body_len][u32 codec = 1][zstd frame]
+  [crc32c]`, where the zstd frame (level 1, with its content checksum) decodes to
+  the `body_len`-byte block body above without its CRC. Readers tell the two
+  layouts apart by bytes 4..8: zero is a plain block's first `shared`, anything
+  else a codec; an unknown codec or a frame that does not decode to `body_len`
+  bytes is corrupt. The CRC covers the stored bytes. The builder compresses each
+  block, decompresses it again and checks the decoded entries against its source
+  before writing, and stores the plain layout when compression saves nothing.
 - **Index**: `[u64 n] n × ([u32 len][first key][u64 off][u32 len][v6: u64 max_hlc])
-  [v6: u64 rt_seq_floor][v6: u64 rt_off][v6: u64 rt_len] [crc32c]`. `max_hlc` is
+  [v7: u64 uncompressed_data_len][v7: u32 max_uncompressed_block]
+  [v6: u64 rt_seq_floor][v6: u64 rt_off][v6: u64 rt_len] [crc32c]`. `off`/`len`
+  are the stored block's. `uncompressed_data_len` is the data section's length
+  with every block in the plain layout, and `max_uncompressed_block` the largest
+  such block; the merge policy sizes v7 runs by their uncompressed length, so a
+  merge's output reservation stays a hard bound. `max_hlc` is
   the largest `version >> 64` (the HLC of the packed `Version`) among the block's
   entries, so `max_hlc < V.hlc` proves every entry of the block is older than V.
   It stays resident with the fence index (8 B per block).
@@ -686,10 +703,11 @@ data blocks | filter | [v6: RT block] | index | [v1–v4: sidecar] | footer (80 
   and build verify byte-compares it from the device. `rt_seq_floor` records the
   highest RT record seq the build filtered with (docs/range-deletes.md §7).
 - **Versions**: v4 keeps the per-run sidecar, v5 drops it (0365), v6 (0451) adds
-  `max_hlc`, the index trailer and the RT block. A run with no point entries
-  (`entry_count = 0`, no data blocks) is valid in v6 and holds only RT records.
-  `VALS_RUN_WRITE_VERSION` selects 4, 5 or 6 (default) for new runs; merges write
-  at least the newest non-sidecar input version, so a v6 input stays v6.
+  `max_hlc`, the index trailer and the RT block, v7 (0564) compresses data blocks
+  and adds the uncompressed-size fields. A run with no point entries
+  (`entry_count = 0`, no data blocks) is valid in v6 and v7 and holds only RT
+  records. `VALS_RUN_WRITE_VERSION` selects 4, 5, 6 or 7 (default) for new runs;
+  merges write at least the newest non-sidecar input version, so a v7 input stays v7.
 
 ### 2.3 Cluster value encoding — `vals-cluster`
 

@@ -1,6 +1,9 @@
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use super::{decode_block_body, encode_block_body, BlockedBloom, Cursor, EntryKey, RtLocator};
+use super::{
+    compress_block_body, decode_block_body, decode_block_payload, encode_block_body, BlockedBloom, Cursor, EntryKey,
+    RtLocator,
+};
 use crate::range_tombstone::{decode_rt_block, encode_rt_block, RtRecord};
 use crate::crc;
 use crate::index::{
@@ -96,6 +99,7 @@ pub mod test_seams {
     thread_local! {
         static KNOCKOUTS: Cell<u8> = const { Cell::new(0) };
         static BUFFER_FLIP: Cell<Option<(usize, usize, u8)>> = const { Cell::new(None) };
+        static CODED_FLIP: Cell<Option<(usize, usize, u8)>> = const { Cell::new(None) };
         static STREAM_FLIP: Cell<Option<(u64, usize, u8, bool)>> = const { Cell::new(None) };
         static INDEX_FLIP: Cell<Option<(usize, u8)>> = const { Cell::new(None) };
         static RT_FLIP: Cell<Option<(usize, u8)>> = const { Cell::new(None) };
@@ -135,6 +139,24 @@ pub mod test_seams {
         BUFFER_FLIP.with(|c| c.get().is_some())
     }
 
+    pub fn arm_coded_flip(block: usize, offset: usize, mask: u8) {
+        CODED_FLIP.with(|c| c.set(Some((block, offset, mask))));
+    }
+
+    pub fn coded_flip_armed() -> bool {
+        CODED_FLIP.with(|c| c.get().is_some())
+    }
+
+    pub(crate) fn take_coded_flip(block: usize) -> Option<(usize, u8)> {
+        CODED_FLIP.with(|c| match c.get() {
+            Some((b, offset, mask)) if b == block => {
+                c.set(None);
+                Some((offset, mask))
+            }
+            _ => None,
+        })
+    }
+
     pub fn arm_stream_entry_flip(entry: u64, byte: usize, mask: u8, before_hash: bool) {
         STREAM_FLIP.with(|c| c.set(Some((entry, byte, mask, before_hash))));
     }
@@ -163,15 +185,14 @@ pub mod test_seams {
         KNOCKOUTS.with(|c| c.get())
     }
 
-    pub(crate) fn flip_buffer(block: usize, body: &mut [u8]) {
-        BUFFER_FLIP.with(|c| {
-            if let Some((b, offset, mask)) = c.get() {
-                if b == block {
-                    body[offset] ^= mask;
-                    c.set(None);
-                }
+    pub(crate) fn take_buffer_flip(block: usize) -> Option<(usize, u8)> {
+        BUFFER_FLIP.with(|c| match c.get() {
+            Some((b, offset, mask)) if b == block => {
+                c.set(None);
+                Some((offset, mask))
             }
-        });
+            _ => None,
+        })
     }
 
     pub(crate) fn take_stream_flip(entry: u64) -> Option<(usize, u8, bool)> {
@@ -183,6 +204,105 @@ pub mod test_seams {
             _ => None,
         })
     }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct BlockFlips {
+    body: Option<(usize, u8)>,
+    coded: Option<(usize, u8)>,
+}
+
+fn take_flips(_block: usize) -> BlockFlips {
+    #[cfg(any(test, feature = "test-fixtures"))]
+    {
+        BlockFlips { body: test_seams::take_buffer_flip(_block), coded: test_seams::take_coded_flip(_block) }
+    }
+    #[cfg(not(any(test, feature = "test-fixtures")))]
+    {
+        BlockFlips::default()
+    }
+}
+
+/// One encoded block before its sequential source check: the stored bytes without their CRC,
+/// the CRC, and for a compressed block its decompressed body.
+pub(super) struct CodedBlock {
+    stored: Vec<u8>,
+    crc: u32,
+    decoded: Result<Option<Vec<u8>>, super::FrameError>,
+    facts: Option<BlockFacts>,
+}
+
+/// What `verify_body` derives from a block body that needs no state from earlier blocks,
+/// computed where the block is coded: per entry its source hash and bloom hash. `None` when
+/// the body does not decode cleanly or its keys are not strictly ascending.
+struct BlockFacts {
+    entries: Vec<(u64, u64)>,
+    first_key: Vec<u8>,
+    last_key: Vec<u8>,
+    max_hlc: u64,
+}
+
+fn block_facts(body: &[u8]) -> Option<BlockFacts> {
+    let mut c = Cursor { b: body, off: 0 };
+    let count = c.u32().ok()? as usize;
+    let mut entries = Vec::with_capacity(count.min(1 << 16));
+    let (mut key, mut first_key, mut max_hlc) = (Vec::new(), Vec::new(), 0u64);
+    for j in 0..count {
+        let r = read_raw(&mut c, if j == 0 { 0 } else { key.len() }).ok()?;
+        if j > 0 && &key[r.shared..] >= r.suffix {
+            return None;
+        }
+        key.truncate(r.shared);
+        key.extend_from_slice(r.suffix);
+        if j == 0 {
+            first_key = key.clone();
+        }
+        max_hlc = max_hlc.max(crate::range_tombstone::version_hlc(r.version));
+        let h = entry_hash_fields(&key, r.segment, r.offset, r.len, r.seq, r.tombstone, r.version);
+        entries.push((h, super::BloomKey::new(&key).z()));
+    }
+    (c.off == body.len()).then_some(BlockFacts { entries, first_key, last_key: key, max_hlc })
+}
+
+fn code_block(src: &[SnapshotEntry], compress: bool, flips: BlockFlips) -> CodedBlock {
+    let mut body = encode_block_body(src);
+    if let Some((offset, mask)) = flips.body {
+        body[offset] ^= mask;
+    }
+    if let Some(mut coded) = compress.then(|| compress_block_body(&body)).flatten() {
+        drop(body);
+        if let Some((offset, mask)) = flips.coded {
+            coded[offset] ^= mask;
+        }
+        let crc = crc::crc32(&coded);
+        let decoded = decode_block_payload(&coded).map(|d| Some(d.into_owned()));
+        let facts = decoded.as_ref().ok().and_then(|d| block_facts(d.as_deref()?));
+        return CodedBlock { stored: coded, crc, decoded, facts };
+    }
+    let crc = crc::crc32(&body);
+    let facts = block_facts(&body);
+    CodedBlock { stored: body, crc, decoded: Ok(None), facts }
+}
+
+pub const DEFAULT_RUN_CODEC_THREADS: usize = 4;
+
+pub(super) fn parse_run_codec_threads(raw: Option<&str>) -> usize {
+    match raw.map(str::trim) {
+        None | Some("") => DEFAULT_RUN_CODEC_THREADS,
+        Some(s) => match s.parse::<usize>() {
+            Ok(v) if (1..=64).contains(&v) => v,
+            _ => {
+                log::error!("VALS_RUN_CODEC_THREADS={s:?} is not 1..=64; using {DEFAULT_RUN_CODEC_THREADS}");
+                DEFAULT_RUN_CODEC_THREADS
+            }
+        },
+    }
+}
+
+/// Threads (the building thread included) that encode and compress a batch of v7 run blocks.
+pub fn run_codec_threads() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| parse_run_codec_threads(std::env::var("VALS_RUN_CODEC_THREADS").ok().as_deref()))
 }
 
 #[inline]
@@ -243,6 +363,9 @@ pub(super) struct EncodeCheck {
     group_start: u64,
     group_hashes: Vec<u64>,
     retired: Option<(u64, Vec<u8>)>,
+    coded_body: Option<Vec<u8>>,
+    raw_data: u64,
+    max_raw_block: u32,
 }
 
 impl EncodeCheck {
@@ -262,11 +385,28 @@ impl EncodeCheck {
             group_start: 0,
             group_hashes: Vec::new(),
             retired: None,
+            coded_body: None,
+            raw_data: 0,
+            max_raw_block: 0,
         }
     }
 
-    pub(super) fn retire(&mut self, block: Vec<u8>) {
-        self.retired = Some((self.block_base, block));
+    fn note_raw_block(&mut self, body_len: usize) {
+        let len = body_len as u64 + 4;
+        self.raw_data += len;
+        self.max_raw_block = self.max_raw_block.max(u32::try_from(len).unwrap_or(u32::MAX));
+    }
+
+    pub(super) fn raw_data(&self) -> (u64, u32) {
+        (self.raw_data, self.max_raw_block)
+    }
+
+    pub(super) fn retire(&mut self, mut block: Vec<u8>) {
+        let body = self.coded_body.take().unwrap_or_else(|| {
+            block.truncate(block.len().saturating_sub(4));
+            block
+        });
+        self.retired = Some((self.block_base, body));
     }
 
     pub(super) fn bounds(&self) -> RunBuilt {
@@ -303,21 +443,115 @@ impl EncodeCheck {
         self.fail("decode", self.blocks, entry, source_first_key, None, format!("reason={why}"))
     }
 
+    #[cfg(test)]
     pub(super) fn block(
         &mut self,
         src: &[SnapshotEntry],
         expect: Expect<'_>,
         bloom: &mut BlockedBloom,
+        compress: bool,
     ) -> Result<(Vec<u8>, Vec<u8>), Box<EncodeIntegrityError>> {
-        #[allow(unused_mut)]
-        let mut body = encode_block_body(src);
-        #[cfg(any(test, feature = "test-fixtures"))]
-        test_seams::flip_buffer(self.blocks, &mut body);
-        let crc = crc::crc32(&body);
-        let first = self.verify_body(&body, src, &expect, bloom)?;
-        body.extend_from_slice(&crc.to_le_bytes());
+        let coded = code_block(src, compress, take_flips(self.blocks));
+        self.block_coded(src, coded, expect, bloom)
+    }
+
+    /// Encodes (and for v7 compresses and decompresses) the next `srcs.len()` blocks, on up to
+    /// `run_codec_threads()` threads when compressing; `block_coded` then checks each in order.
+    pub(super) fn code_blocks(&self, srcs: &[&[SnapshotEntry]], compress: bool) -> Vec<CodedBlock> {
+        let flips: Vec<BlockFlips> = (0..srcs.len()).map(|i| take_flips(self.blocks + i)).collect();
+        let threads = if compress { run_codec_threads().min(srcs.len()) } else { 1 };
+        let code = |t: usize| -> Vec<(usize, CodedBlock)> {
+            (t..srcs.len()).step_by(threads).map(|i| (i, code_block(srcs[i], compress, flips[i]))).collect()
+        };
+        if threads <= 1 {
+            return code(0).into_iter().map(|(_, c)| c).collect();
+        }
+        let mut out: Vec<Option<CodedBlock>> = (0..srcs.len()).map(|_| None).collect();
+        std::thread::scope(|s| {
+            let workers: Vec<_> = (1..threads).map(|t| s.spawn(move || code(t))).collect();
+            let mut done = vec![code(0)];
+            for w in workers {
+                done.push(w.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
+            }
+            for (i, c) in done.into_iter().flatten() {
+                out[i] = Some(c);
+            }
+        });
+        out.into_iter().map(|c| c.expect("every block is coded")).collect()
+    }
+
+    pub(super) fn block_coded(
+        &mut self,
+        src: &[SnapshotEntry],
+        coded: CodedBlock,
+        expect: Expect<'_>,
+        bloom: &mut BlockedBloom,
+    ) -> Result<(Vec<u8>, Vec<u8>), Box<EncodeIntegrityError>> {
+        self.coded_body = None;
+        let CodedBlock { mut stored, crc, decoded, facts } = coded;
+        let first = match decoded {
+            Err(e) => {
+                let first = src.first().map_or(&[][..], |e| e.key.as_slice());
+                return Err(self.decode_fail(self.entries, first, e.run_block_why()));
+            }
+            Ok(Some(decoded)) => {
+                let first = self.verify_facts(&decoded, facts, src, &expect, bloom)?;
+                self.note_raw_block(decoded.len());
+                self.coded_body = Some(decoded);
+                first
+            }
+            Ok(None) => {
+                let first = self.verify_facts(&stored, facts, src, &expect, bloom)?;
+                self.note_raw_block(stored.len());
+                first
+            }
+        };
+        stored.extend_from_slice(&crc.to_le_bytes());
         self.blocks += 1;
-        Ok((body, first))
+        Ok((stored, first))
+    }
+
+    /// `verify_body` from precomputed facts; any block the facts do not vouch for (a decode
+    /// failure, a wrong count, an ordering violation) is rechecked by `verify_body`, which
+    /// reports it.
+    fn verify_facts(
+        &mut self,
+        body: &[u8],
+        facts: Option<BlockFacts>,
+        src: &[SnapshotEntry],
+        expect: &Expect<'_>,
+        bloom: &mut BlockedBloom,
+    ) -> Result<Vec<u8>, Box<EncodeIntegrityError>> {
+        let knock = knockouts();
+        let Some(facts) = facts.filter(|f| {
+            !f.entries.is_empty()
+                && f.entries.len() == src.len()
+                && (knock & KNOCK_ORDER != 0 || self.entries == 0 || self.key < f.first_key)
+        }) else {
+            return self.verify_body(body, src, expect, bloom);
+        };
+        self.block_base = self.entries;
+        for (j, &(h, z)) in facts.entries.iter().enumerate() {
+            if knock & KNOCK_SOURCE_HASH == 0 {
+                match expect {
+                    Expect::Entries(want) => {
+                        if want[j] != h {
+                            return Err(self.entry_mismatch(body, src, j, want[j]));
+                        }
+                    }
+                    Expect::Groups { groups, all } => self.group_step(h, groups, all, body, src)?,
+                }
+            }
+            bloom.insert_z(z);
+            self.entries += 1;
+        }
+        self.first_key_hashes.push(key_hash(&facts.first_key));
+        if self.min_key.is_none() {
+            self.min_key = Some(facts.first_key.clone());
+        }
+        self.key = facts.last_key;
+        self.max_hlcs.push(facts.max_hlc);
+        Ok(facts.first_key)
     }
 
     fn verify_body(
@@ -566,9 +800,7 @@ impl EncodeCheck {
         let (block, body, base, s) = match at.checked_sub(self.block_base) {
             Some(j) if (j as usize) < src.len() => (self.blocks, body, self.block_base, &src[j as usize]),
             _ => match (&self.retired, all.and_then(|a| a.get(at as usize))) {
-                (Some((base, retired)), Some(s)) if at >= *base && retired.len() >= 4 => {
-                    (self.blocks.saturating_sub(1), &retired[..retired.len() - 4], *base, s)
-                }
+                (Some((base, retired)), Some(s)) if at >= *base => (self.blocks.saturating_sub(1), &retired[..], *base, s),
                 _ => return (self.blocks, None, "detail=entry encoded in an earlier block".to_string()),
             },
         };
@@ -624,6 +856,7 @@ impl EncodeCheck {
         data_start: u64,
         data_end: u64,
         rt: Option<RtLocator>,
+        raw: bool,
     ) -> Result<(), Box<EncodeIntegrityError>> {
         if knockouts() & KNOCK_INDEX != 0 {
             return Ok(());
@@ -665,6 +898,13 @@ impl EncodeCheck {
                 self.first_key_hashes.len(),
                 format!("reason=index covers data through {expect_off} but blocks end at {data_end}"),
             ));
+        }
+        if raw {
+            let n = self.first_key_hashes.len();
+            let got = (|| Ok::<_, &'static str>((c.u64()?, c.u32()?)))().map_err(|why| bad(n, format!("reason={why}")))?;
+            if got != self.raw_data() {
+                return Err(bad(n, format!("reason=index uncompressed-size trailer {got:?} differs from {:?}", self.raw_data())));
+            }
         }
         if let Some(rt) = rt {
             let n = self.first_key_hashes.len();
@@ -822,11 +1062,11 @@ mod tests {
             index.extend_from_slice(&8u32.to_le_bytes());
         }
         index.extend_from_slice(&0u32.to_le_bytes());
-        let error = check.verify_index(&index, 0, 16, None).unwrap_err();
+        let error = check.verify_index(&index, 0, 16, None, false).unwrap_err();
         assert!(error.detail.contains("prev_bytes=4096"));
         assert!(error.detail.len() < 800);
         check.first_key_hashes[0] ^= 1;
-        let error = check.verify_index(&index, 0, 16, None).unwrap_err();
+        let error = check.verify_index(&index, 0, 16, None, false).unwrap_err();
         assert!(error.detail.contains("key_bytes=4096"));
         assert!(error.detail.len() < 800);
     }
@@ -1086,7 +1326,7 @@ mod tests {
         };
         let checked_flush = || {
             let mut sink = VecSink::new();
-            crate::run::build_run_into_checked(&src, opts, RUN_VERSION, EncodePath::Flush, RunSource::Attested(&g), &mut sink)
+            crate::run::build_run_into_checked(&src, opts, crate::run::RUN_RT_VERSION, EncodePath::Flush, RunSource::Attested(&g), &mut sink)
                 .unwrap();
             sink.into_inner().len()
         };
@@ -1100,7 +1340,7 @@ mod tests {
             let mut est = 0usize;
             let mut close = |cur: &mut Vec<SnapshotEntry>, hashes: &mut Vec<u64>, sink: &mut VecSink, bloom: &mut BlockedBloom| {
                 if checked {
-                    let (block, first) = check.block(cur, Expect::Entries(hashes), bloom).unwrap();
+                    let (block, first) = check.block(cur, Expect::Entries(hashes), bloom, false).unwrap();
                     index.push((first, sink.position(), block.len() as u32));
                     sink.write(&block);
                     check.retire(block);

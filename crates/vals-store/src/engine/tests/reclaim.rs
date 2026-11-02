@@ -426,7 +426,7 @@ fn recurring_merge_shrinks_to_fit_manifest_headroom() {
     let seg_bytes = e.alloc.blocks_per_segment() as usize * e.block_size;
     let two_run_bytes: usize = e.runs[2..]
         .iter()
-        .map(|or| or.meta.handle.len as usize)
+        .map(|or| or.policy_len() as usize)
         .sum();
     let target_free = e.manifest_headroom_segs()
         + two_run_bytes.div_ceil(seg_bytes).max(1) as u64;
@@ -435,7 +435,7 @@ fn recurring_merge_shrinks_to_fit_manifest_headroom() {
     }
     let full_bytes: usize = e.runs
         .iter()
-        .map(|or| or.meta.handle.len as usize)
+        .map(|or| or.policy_len() as usize)
         .sum();
     assert!(
         full_bytes.div_ceil(seg_bytes).max(1) as u64 + e.manifest_headroom_segs()
@@ -1489,6 +1489,7 @@ fn pressure_and_over_cap_tombstone_gc_are_capped() {
 
 #[test]
 fn distinct_key_pressure_merge_stalls_without_single_run_victims() {
+    let _v6 = uncompressed_runs();
     if co_compact_env(false) { return; }
     let opts = RunBuildOpts::default();
     let mut engine = Engine::create_prewiped(
@@ -2388,6 +2389,7 @@ fn orphan_sweep_keeps_memtable_referenced_value_segments() {
 
 #[test]
 fn shadow_estimator_sees_cross_run_shadowing() {
+    let _v6 = uncompressed_runs();
     if co_compact_env(false) { return; }
     let dev = MemBlockDevice::new(BS, 6144);
     let mut e = Engine::create_prewiped(
@@ -2435,6 +2437,7 @@ fn shadow_estimator_sees_cross_run_shadowing() {
 
 #[test]
 fn shadow_estimator_stays_quiet_on_disjoint_keys() {
+    let _v6 = uncompressed_runs();
     if co_compact_env(false) { return; }
     let dev = MemBlockDevice::new(BS, 6144);
     let mut e = Engine::create_prewiped(
@@ -2490,6 +2493,7 @@ fn shadow_estimator_stays_quiet_on_disjoint_keys() {
 
 #[test]
 fn shadow_fold_extends_pressure_suffix_and_reclaims() {
+    let _v6 = uncompressed_runs();
     if co_compact_env(false) { return; }
     let dev = MemBlockDevice::new(BS, 12288);
     let mut e = Engine::create_prewiped(
@@ -2734,6 +2738,7 @@ fn region_exhausted_clears_when_garbage_appears() {
 
 #[test]
 fn frozen_runs_keep_overwrite_and_delete_garbage_bounded() {
+    let _v6 = uncompressed_runs();
     if co_compact_env(false) { return; }
     let mut r = shadow_repro(131072);
     let mut live: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
@@ -2846,9 +2851,10 @@ fn frozen_runs_keep_overwrite_and_delete_garbage_bounded() {
 fn cached_one_run_victim_needs_match_uncached_reference() {
     if co_compact_env(false) { return; }
     fn reference<D: BlockDevice>(e: &Engine<D>, meta: &RunMeta, seg_bytes: usize, headroom: u64) -> Option<u64> {
-        reference_open(meta, seg_bytes, headroom, e.log.open_segment())
+        let len = e.runs.iter().find(|or| or.meta.handle == meta.handle).map_or(meta.handle.len, |or| or.run.uncompressed_len());
+        reference_open(meta, len, seg_bytes, headroom, e.log.open_segment())
     }
-    fn reference_open(meta: &RunMeta, seg_bytes: usize, headroom: u64, open: Option<SegmentId>) -> Option<u64> {
+    fn reference_open(meta: &RunMeta, len: u64, seg_bytes: usize, headroom: u64, open: Option<SegmentId>) -> Option<u64> {
         type D = MemBlockDevice;
         let usable = seg_bytes.saturating_sub(SEG_HEADER_LEN).max(1);
         let threshold = super::super::merge::victim_dead_fraction();
@@ -2857,7 +2863,7 @@ fn cached_one_run_victim_needs_match_uncached_reference() {
         let k = Engine::<D>::gainful_victim_prefix_len(&lives, usable)?;
         let live: u64 = lives[..k].iter().map(|&(_, live)| live).sum();
         let vlog = if live == 0 { 0 } else { 2 * (live as usize).div_ceil(usable).max(1) as u64 + 2 };
-        Some((meta.handle.len as usize).div_ceil(seg_bytes).max(1) as u64 + headroom + vlog)
+        Some((len as usize).div_ceil(seg_bytes).max(1) as u64 + headroom + vlog)
     }
     fn check<D: BlockDevice>(e: &Engine<D>) -> (usize, usize) {
         let seg_bytes = e.alloc.blocks_per_segment() as usize * e.block_size;
@@ -2928,7 +2934,7 @@ fn cached_one_run_victim_needs_match_uncached_reference() {
     let open = e.log.open_segment();
     assert!(e.runs[0].meta.value_segs.as_ref().unwrap().iter().any(|&seg| Some(seg) == open));
     let seg_bytes = e.alloc.blocks_per_segment() as usize * e.block_size;
-    let with_open = reference_open(&e.runs[0].meta, seg_bytes, 0, None);
+    let with_open = reference_open(&e.runs[0].meta, e.runs[0].run.uncompressed_len(), seg_bytes, 0, None);
     assert_ne!(reference(&e, &e.runs[0].meta, seg_bytes, 0), with_open, "the open segment must change the plan");
     assert_eq!(check(&e).1, 1);
     while e.log.open_segment() == open {

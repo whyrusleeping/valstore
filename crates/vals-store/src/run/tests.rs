@@ -1,6 +1,7 @@
 mod bounds;
 mod decode_fuzz;
 mod v6;
+mod v7;
 use super::*;
 
 fn entry(key: &[u8], seq: u64, version: u128) -> SnapshotEntry {
@@ -504,7 +505,7 @@ fn device_run_for_each_bucket_digest_streams_every_bucket_once() {
 
 #[test]
 fn write_run_device_full_rolls_back() {
-    let bytes = build_run(&firehose(2000), RunBuildOpts::default());
+    let bytes = build_run_versioned(&firehose(2000), RunBuildOpts::default(), RUN_RT_VERSION);
     let (dev, mut alloc) = dev_alloc(16, 2);
     let before = alloc.free_segments();
     let err = write_run(&*dev, &mut alloc, &bytes).unwrap_err();
@@ -1693,11 +1694,11 @@ fn max_bucket_run_streams_into_a_device_sized_to_its_reservation() {
 #[test]
 fn readers_capped_at_older_versions_reject_newer_runs_and_write_version_parses() {
     let entries = firehose(50);
-    for version in [RUN_SIDECAR_VERSION, RUN_BLOCK_VERSION, RUN_VERSION] {
+    for version in [RUN_SIDECAR_VERSION, RUN_BLOCK_VERSION, RUN_RT_VERSION, RUN_VERSION] {
         let bytes = build_run_versioned(&entries, RunBuildOpts::default(), version);
         let footer = &bytes[bytes.len() - FOOTER_LEN..];
         assert_eq!(decode_footer(footer).unwrap().version, version);
-        for reader in [RUN_SIDECAR_VERSION, RUN_BLOCK_VERSION, RUN_VERSION] {
+        for reader in [RUN_SIDECAR_VERSION, RUN_BLOCK_VERSION, RUN_RT_VERSION, RUN_VERSION] {
             let old = decode_footer_capped(footer, reader);
             assert_eq!(old.is_ok(), version <= reader, "v{version} run, v{reader} reader");
             if version > reader {
@@ -1710,7 +1711,8 @@ fn readers_capped_at_older_versions_reject_newer_runs_and_write_version_parses()
     stamp_footer_version(&mut f[n - FOOTER_LEN..], RUN_VERSION + 1);
     assert!(Run::parse(f).is_err());
     assert_eq!(parse_run_write_version(None), RUN_VERSION);
-    assert_eq!(parse_run_write_version(Some("6")), RUN_VERSION);
+    assert_eq!(parse_run_write_version(Some("7")), RUN_VERSION);
+    assert_eq!(parse_run_write_version(Some("6")), RUN_RT_VERSION);
     assert_eq!(parse_run_write_version(Some("5")), RUN_BLOCK_VERSION);
     assert_eq!(parse_run_write_version(Some(" 4 ")), RUN_SIDECAR_VERSION);
     assert_eq!(parse_run_write_version(Some("v4")), RUN_SIDECAR_VERSION);
@@ -1727,6 +1729,8 @@ fn readers_capped_at_older_versions_reject_newer_runs_and_write_version_parses()
     assert_eq!(merge_as(RUN_BLOCK_VERSION, &[RUN_BLOCK_VERSION]), RUN_BLOCK_VERSION);
     assert_eq!(merge_as(RUN_BLOCK_VERSION, &[RUN_VERSION, RUN_SIDECAR_VERSION]), RUN_VERSION);
     assert_eq!(merge_as(RUN_VERSION, &[RUN_SIDECAR_VERSION]), RUN_VERSION);
+    assert_eq!(merge_as(RUN_RT_VERSION, &[RUN_RT_VERSION, RUN_BLOCK_VERSION]), RUN_RT_VERSION);
+    assert_eq!(merge_as(RUN_RT_VERSION, &[RUN_RT_VERSION, RUN_VERSION]), RUN_VERSION);
     assert_eq!(merge_write_version([]), RUN_VERSION);
 }
 
@@ -2705,7 +2709,15 @@ fn record_entries(n: usize, seed: u64) -> Vec<SnapshotEntry> {
 }
 
 fn open_built(entries: &[SnapshotEntry], opts: RunBuildOpts) -> (Arc<MemBlockDevice>, Allocator, DeviceRun<MemBlockDevice>) {
-    let bytes = build_run_versioned(entries, opts, RUN_VERSION);
+    open_built_versioned(entries, opts, RUN_VERSION)
+}
+
+fn open_built_versioned(
+    entries: &[SnapshotEntry],
+    opts: RunBuildOpts,
+    version: u16,
+) -> (Arc<MemBlockDevice>, Allocator, DeviceRun<MemBlockDevice>) {
+    let bytes = build_run_versioned(entries, opts, version);
     let (dev, mut alloc) = dev_alloc((bytes.len() / BS) as u64 * 2 + 64, 256);
     let handle = write_run(&*dev, &mut alloc, &bytes).unwrap();
     let run = DeviceRun::open(dev.clone(), &alloc, handle).unwrap();
@@ -2741,7 +2753,7 @@ fn default_runs_build_32k_fences_and_10_bit_blooms() {
     let entries = backlink_entries(20_000, 0x0378_0000_0000_0002);
     let n = entries.len();
     assert_eq!(n, 20_000);
-    let (_dev, alloc, run) = open_built(&entries, RunBuildOpts::default());
+    let (_dev, alloc, run) = open_built_versioned(&entries, RunBuildOpts::default(), RUN_RT_VERSION);
     let per_block = n / run.index_len();
     assert!((150..=200).contains(&per_block), "{per_block} entries per default block");
     assert!((12 * 1024..=34 * 1024).contains(&run.max_block_bytes()), "max block {}", run.max_block_bytes());
@@ -2782,6 +2794,10 @@ fn old_12_bit_4k_runs_still_read_and_10_bits_hold_fpr() {
 
 #[test]
 fn block_larger_than_the_stream_window_streams_seeds_digests_and_keys() {
+    with_run_write_version(RUN_RT_VERSION, block_larger_than_the_stream_window)
+}
+
+fn block_larger_than_the_stream_window() {
     let entries = backlink_entries(8_000, 0x0378_0000_0000_0004);
     let opts = RunBuildOpts { block_target_bytes: SIDECAR_CURSOR_WINDOW * 3, bloom_bits_per_key: 10, num_buckets: 16 };
     let (dev, alloc, run) = build_streamed(&entries, opts, entries.len(), 8192, 16);

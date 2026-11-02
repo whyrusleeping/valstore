@@ -65,17 +65,17 @@ fn v6_round_trips_block_max_hlc_rt_records_and_floor() {
     let (bytes, built) = build_run_checked_rts(
         &entries,
         small_blocks(),
-        RUN_VERSION,
+        RUN_RT_VERSION,
         EncodePath::Merge,
         RunSource::Inline,
         RunRts { seq_floor: 41, records: &recs },
     )
     .unwrap();
     assert_eq!((built.min_key.as_slice(), built.max_key.as_slice()), (&entries[0].key[..], &entries[599].key[..]));
-    let bound = run_len_upper_bound_for(&entries, small_blocks(), RUN_VERSION) + crate::range_tombstone::rt_block_len(&recs);
+    let bound = run_len_upper_bound_for(&entries, small_blocks(), RUN_RT_VERSION) + crate::range_tombstone::rt_block_len(&recs);
     assert!(bytes.len() <= bound);
 
-    let (dev, alloc, result) = stream_build(&entries, small_blocks(), RUN_VERSION, Some((41, recs.clone())), bound);
+    let (dev, alloc, result) = stream_build(&entries, small_blocks(), RUN_RT_VERSION, Some((41, recs.clone())), bound);
     let (handle, parts) = result.unwrap();
     assert_eq!(handle.len, bytes.len() as u64, "streamed and in-memory builds agree");
     let lbas: Vec<u64> = handle.segs.iter().map(|s| alloc.segment_range(*s).0).collect();
@@ -84,7 +84,7 @@ fn v6_round_trips_block_max_hlc_rt_records_and_floor() {
     let from_parts = DeviceRun::from_parts(dev.clone(), SEG_BYTES, handle.clone(), parts);
     let opened = DeviceRun::open(dev, &alloc, handle).unwrap();
     for run in [&from_parts, &opened] {
-        assert_eq!(run.format_version(), RUN_VERSION);
+        assert_eq!(run.format_version(), RUN_RT_VERSION);
         assert!(run.supports_range_tombstones() && run.has_range_tombstones());
         assert_eq!(run.rt_seq_floor(), 41);
         assert_eq!(run.read_range_tombstones(&alloc).unwrap(), recs);
@@ -107,9 +107,9 @@ fn v6_without_records_reads_no_rt_block_and_keeps_its_floor() {
     let (dev, alloc, result) = stream_build(
         &entries,
         small_blocks(),
-        RUN_VERSION,
+        RUN_RT_VERSION,
         Some((7, Vec::new())),
-        run_len_upper_bound_for(&entries, small_blocks(), RUN_VERSION),
+        run_len_upper_bound_for(&entries, small_blocks(), RUN_RT_VERSION),
     );
     let (handle, _) = result.unwrap();
     let run = DeviceRun::open(dev, &alloc, handle).unwrap();
@@ -128,7 +128,7 @@ fn v6_fence_costs_eight_bytes_per_block_over_v5() {
         let handle = write_run(&*dev, &mut alloc, &bytes).unwrap();
         (DeviceRun::open(dev, &alloc, handle).unwrap(), bytes.len())
     };
-    let ((v5, v5_len), (v6, v6_len)) = (open(RUN_BLOCK_VERSION), open(RUN_VERSION));
+    let ((v5, v5_len), (v6, v6_len)) = (open(RUN_BLOCK_VERSION), open(RUN_RT_VERSION));
     assert_eq!(v5.index_len(), v6.index_len());
     let blocks = v6.index_len() as u64;
     assert_eq!(v6.resident_stats().fence_bytes - v5.resident_stats().fence_bytes, 8 * blocks);
@@ -144,14 +144,14 @@ fn rt_only_runs_build_open_and_hold_no_point_key() {
         let (bytes, built) = build_run_checked_rts(
             &[],
             small_blocks(),
-            RUN_VERSION,
+            RUN_RT_VERSION,
             EncodePath::Flush,
             RunSource::Inline,
             RunRts { seq_floor: 3, records: &records },
         )
         .unwrap();
         assert_eq!(built, RunBuilt::default(), "an RT-only run reports empty point-key bounds");
-        let (dev, alloc, result) = stream_build(&[], small_blocks(), RUN_VERSION, Some((3, records.clone())), bytes.len());
+        let (dev, alloc, result) = stream_build(&[], small_blocks(), RUN_RT_VERSION, Some((3, records.clone())), bytes.len());
         let (handle, _) = result.unwrap();
         assert_eq!(handle.len, bytes.len() as u64);
         let run = DeviceRun::open(dev, &alloc, handle).unwrap();
@@ -191,7 +191,7 @@ fn rt_block_encode_check_catches_a_resealed_flip() {
         let err = build_run_checked_rts(
             &hlc_entries(10),
             small_blocks(),
-            RUN_VERSION,
+            RUN_RT_VERSION,
             EncodePath::Merge,
             RunSource::Inline,
             RunRts { seq_floor: 0, records: &recs },
@@ -204,12 +204,12 @@ fn rt_block_encode_check_catches_a_resealed_flip() {
 #[test]
 fn index_encode_check_catches_a_flipped_max_hlc_and_trailer() {
     let entries = hlc_entries(40);
-    let (bytes, _) = build_run_checked(&entries, small_blocks(), RUN_VERSION, EncodePath::Merge, RunSource::Inline).unwrap();
+    let (bytes, _) = build_run_checked(&entries, small_blocks(), RUN_RT_VERSION, EncodePath::Merge, RunSource::Inline).unwrap();
     let ft = decode_footer(&bytes[bytes.len() - FOOTER_LEN..]).unwrap();
     let first_entry_hlc = 8 + 4 + entries[0].key.len() + 12;
     for at in [first_entry_hlc, ft.index_len as usize - 4 - 8] {
         encode_test_seams::arm_index_flip(at, 0x01);
-        let err = build_run_checked(&entries, small_blocks(), RUN_VERSION, EncodePath::Merge, RunSource::Inline)
+        let err = build_run_checked(&entries, small_blocks(), RUN_RT_VERSION, EncodePath::Merge, RunSource::Inline)
             .unwrap_err();
         assert_eq!(err.check, "index", "flip at index byte {at}: {err}");
     }
@@ -218,15 +218,15 @@ fn index_encode_check_catches_a_flipped_max_hlc_and_trailer() {
 #[test]
 fn v6_decoders_reject_malformed_index_trailers_and_rt_locators() {
     let entries = hlc_entries(40);
-    let bytes = build_run_versioned(&entries, small_blocks(), RUN_VERSION);
+    let bytes = build_run_versioned(&entries, small_blocks(), RUN_RT_VERSION);
     let ft = decode_footer(&bytes[bytes.len() - FOOTER_LEN..]).unwrap();
     let encoded = section(&bytes, ft.index_off, ft.index_len).unwrap().to_vec();
-    let (_, rt) = decode_index(&encoded, RUN_VERSION).unwrap();
+    let (_, rt) = decode_index(&encoded, RUN_RT_VERSION).unwrap();
     assert_eq!(rt, Some(RtLocator { seq_floor: 0, off: ft.index_off, len: 0 }));
     assert!(decode_index(&encoded, RUN_BLOCK_VERSION).is_err(), "a v6 index is not a v5 index");
     let mut cut = encoded[..encoded.len() - 4 - 8].to_vec();
     replace_crc(&mut cut);
-    assert!(decode_index(&cut, RUN_VERSION).is_err());
+    assert!(decode_index(&cut, RUN_RT_VERSION).is_err());
     let filter_end = ft.bloom_off + ft.bloom_len;
     assert_eq!(filter_end, ft.index_off, "no RT block: the index follows the filter");
     let at = |off, len| check_rt_locator(Some(RtLocator { seq_floor: 0, off, len }), &ft);
@@ -247,7 +247,7 @@ fn streamed_v6_build_verify_reads_back_the_rt_block() {
     let (reference, _) = build_run_checked_rts(
         &entries,
         small_blocks(),
-        RUN_VERSION,
+        RUN_RT_VERSION,
         EncodePath::Merge,
         RunSource::Inline,
         RunRts { seq_floor: 2, records: &recs },
@@ -267,7 +267,7 @@ fn streamed_v6_build_verify_reads_back_the_rt_block() {
         };
         let sink = SegmentStreamSink::new(&dev, &segs, &lbas, SEG_BYTES, BS);
         let mut builder = RunStreamBuilder::new(sink, small_blocks(), entries.len())
-            .version(RUN_VERSION)
+            .version(RUN_RT_VERSION)
             .verify(verify)
             .range_tombstones(2, recs.clone());
         for e in &entries {
@@ -296,11 +296,18 @@ fn rewrite_growth_covers_a_v5_input_rewritten_as_v6() {
     for (n, opts) in [(1usize, RunBuildOpts::default()), (2_000, RunBuildOpts::default()), (2_000, small_blocks())] {
         let entries = hlc_entries(n);
         let v5 = build_run_versioned(&entries, opts, RUN_BLOCK_VERSION);
-        let v6 = build_run_versioned(&entries, opts, RUN_VERSION);
+        let v6 = build_run_versioned(&entries, opts, RUN_RT_VERSION);
         let (dev, mut alloc) = dev_alloc(16_384, SEG_BLOCKS);
         let handle = write_run(&*dev, &mut alloc, &v5).unwrap();
         let input = DeviceRun::open(dev, &alloc, handle).unwrap();
-        assert_eq!(v6.len(), v5.len() + rewrite_growth_bytes(&input, RUN_VERSION), "n={n}");
+        assert_eq!(v6.len(), v5.len() + rewrite_growth_bytes(&input, RUN_RT_VERSION), "n={n}");
         assert_eq!(rewrite_growth_bytes(&input, RUN_BLOCK_VERSION), 0);
+        let v7 = build_run_versioned(&entries, opts, RUN_VERSION);
+        let (dev7, mut alloc7) = dev_alloc(16_384, SEG_BLOCKS);
+        let handle7 = write_run(&*dev7, &mut alloc7, &v7).unwrap();
+        let out = DeviceRun::open(dev7, &alloc7, handle7).unwrap();
+        assert!(n == 1 || v7.len() < v6.len(), "n={n}");
+        assert_eq!(out.uncompressed_len() as usize, v5.len() + rewrite_growth_bytes(&input, RUN_VERSION), "n={n}");
+        assert_eq!(rewrite_growth_bytes(&out, RUN_VERSION), 0);
     }
 }

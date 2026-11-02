@@ -339,6 +339,7 @@ fn flush_then_tail_recovers_all() {
 #[test]
 fn paced_flush_build_sleeps_under_a_tiny_duty_share() {
     if isolated_env_test(&[("VALS_MAINT_DUTY_PCT", Some("1"))]) { return; }
+    let _v6 = uncompressed_runs();
     let dev = MemBlockDevice::new(BS, 8192);
     let mut e = Engine::create_prewiped(
         dev,
@@ -1970,7 +1971,8 @@ fn sync_sidecar_stream_is_windowed_ordered_and_crc_checked() {
             }
             assert!(bytes.load(AtomicOrdering::Relaxed) - before <=
                 (run::SIDECAR_CURSOR_WINDOW + 16 * BS) as u64);
-            assert!(stream.resident_bound_bytes() <= (run::SIDECAR_CURSOR_WINDOW + 4 * BS) as u64,
+            let body = if run::version_compresses_blocks(version) { e.runs[0].run.max_uncompressed_block_bytes() } else { 0 };
+            assert!(stream.resident_bound_bytes() <= (run::SIDECAR_CURSOR_WINDOW + 4 * BS + body) as u64,
                 "version {version} resident bound {}", stream.resident_bound_bytes());
         }
         assert_eq!(i, 2_000);
@@ -1989,7 +1991,7 @@ fn sync_sidecar_stream_is_windowed_ordered_and_crc_checked() {
 
 #[test]
 fn async_digest_page_reads_only_bounded_sidecar_windows() {
-    for version in [run::RUN_SIDECAR_VERSION, run::RUN_VERSION] {
+    for version in [run::RUN_SIDECAR_VERSION, run::RUN_RT_VERSION, run::RUN_VERSION] {
         run::with_run_write_version(version, || async_digest_page_bounded_windows(version));
     }
 }
@@ -2015,7 +2017,13 @@ fn async_digest_page_bounded_windows(version: u16) {
     for run_version in 1..=3u128 {
         for i in 0..2_500u32 {
             let mut key = format!("feed.like/{i:08}/").into_bytes();
-            key.resize(512, b'x');
+            let mut x = u64::from(i).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            while key.len() < 512 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                key.push(x as u8);
+            }
             e.put(&key, b"v", run_version).unwrap();
         }
         e.flush(opts).unwrap();
@@ -2057,7 +2065,10 @@ fn async_digest_page_bounded_windows(version: u16) {
     let per_run: usize = e
         .runs
         .iter()
-        .map(|open| 2 * run::SIDECAR_CURSOR_WINDOW + (64 * BS).max(2 * open.run.max_block_bytes()))
+        .map(|open| {
+            let body = if run::version_compresses_blocks(version) { open.run.max_uncompressed_block_bytes() } else { 0 };
+            2 * run::SIDECAR_CURSOR_WINDOW + (64 * BS).max(2 * open.run.max_block_bytes()) + body
+        })
         .sum();
     assert!(resident <= per_run + 4096,
         "version {version} digest plan resident bound {resident}");
@@ -2083,7 +2094,7 @@ fn async_digest_page_bounded_windows(version: u16) {
 
 #[test]
 fn expired_digest_pages_resume_without_gaps_or_duplicates() {
-    for version in [run::RUN_SIDECAR_VERSION, run::RUN_VERSION] {
+    for version in [run::RUN_SIDECAR_VERSION, run::RUN_RT_VERSION] {
         run::with_run_write_version(version, || expired_digest_pages_resume(version));
     }
 }

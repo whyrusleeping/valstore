@@ -295,7 +295,7 @@ fn render() -> String {
     let (drain_count, drain_us, tail_count, tail_us) = vals_store::vlog_sync_totals();
     let (verify_bytes, verify_failures) = vals_store::run::run_build_verify_totals();
     out.push_str(&format!(
-        "# HELP vals_run_write_version Run format version new flushes and merges write (4 = with sidecar, 5 = without, 6 = adds per-block version bounds and range tombstones; VALS_RUN_WRITE_VERSION).\n# TYPE vals_run_write_version gauge\nvals_run_write_version {}\n",
+        "# HELP vals_run_write_version Run format version new flushes and merges write (4 = with sidecar, 5 = without, 6 = adds per-block version bounds and range tombstones, 7 = zstd-compressed data blocks; VALS_RUN_WRITE_VERSION).\n# TYPE vals_run_write_version gauge\nvals_run_write_version {}\n",
         vals_store::run::run_write_version()
     ));
     out.push_str(&format!(
@@ -498,7 +498,7 @@ mod tests {
         }
         assert!(reply.contains("# TYPE vals_run_build_verify_bytes_total counter"), "{reply}");
         assert!(reply.contains("\nvals_run_build_verify_failures_total "), "{reply}");
-        assert!(reply.contains("\nvals_run_write_version 6\n"), "{reply}");
+        assert!(reply.contains("\nvals_run_write_version 7\n"), "{reply}");
         assert!(reply.contains("\nvals_vlog_write_version 2\n"), "{reply}");
         assert!(reply.contains("\nvals_run_block_target_bytes 32768\n"), "{reply}");
         assert!(reply.contains("\nvals_run_bloom_bits_per_key 10\n"), "{reply}");

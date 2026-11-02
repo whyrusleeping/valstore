@@ -650,9 +650,11 @@ Byte layouts are in [`formats.md`](formats.md); the history of format changes
 before the first public release is in [`format-history.md`](format-history.md).
 What matters operationally:
 
-- **Runs.** New flushes and merges write run format v6, which carries a
-  per-block version bound and range-tombstone records. The engine also reads
-  older run formats (v1–v5), and merges rewrite them as v6. Block size
+- **Runs.** New flushes and merges write run format v7, which compresses each
+  data block (zstd) on top of v6's per-block version bound and range-tombstone
+  records. The engine also reads older run formats (v1–v6), and merges rewrite
+  them as v7. A binary that predates v7 refuses a v7 run (`unsupported run
+  version`). Block size
   and bloom parameters are stored per run, so changing them affects only new
   runs and needs no rewrite.
 - **Newer reads older; older refuses newer.** A binary that meets a format it
@@ -669,10 +671,11 @@ What matters operationally:
   `VALS_VLOG_WRITE_VERSION=1`, set before the upgrade, keeps a node writing
   format 1 as a rollback aid; `vals_vlog_write_version` shows the active value.
 - **`VALS_RUN_WRITE_VERSION`** (read once at startup; `vals_run_write_version`
-  shows the active value) can keep a node writing the older v5 (`5`) or v4
-  (`4`) run formats as a rollback aid. Leave it unset. While runs are written
-  below v6 the node refuses range deletes, and any value other than `4`, `5` or
-  `6`, including an empty string, logs an error and writes v4.
+  shows the active value) can keep a node writing the older v6 (`6`), v5 (`5`)
+  or v4 (`4`) run formats as a rollback aid, set before the upgrade. Leave it
+  unset. While runs are written below v6 the node refuses range deletes, and any
+  value other than `4`, `5`, `6` or `7`, including an empty string, logs an
+  error and writes v4.
 - **SPDK layout geometry is fixed at provisioning** (see the [node config
   notes](#node-config-reference)). Provisioning, and every other path that
   formats a region, zeroes every segment header first, so records left on a

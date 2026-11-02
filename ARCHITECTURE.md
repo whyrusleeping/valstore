@@ -234,6 +234,18 @@ Three layers, weakest-but-cheapest to strongest-but-slowest:
   ([`docs/range-deletes.md`](docs/range-deletes.md), layout in `formats.md` §2.2a).
   Merges write at least their newest non-sidecar input's version; pre-v6 binaries
   refuse v6 runs, and `VALS_RUN_WRITE_VERSION=5` keeps a rollback window.
+  **Run format v7** (0564): each data block is stored zstd-compressed (level 1)
+  when that makes it smaller, and the index records the runs' uncompressed data
+  length. Runs on the ATProto replay are ~70% smaller: on the two-node replay
+  device bytes per write fell 26% (node1, 446 → 328) and ingest to 4.5B took 15%
+  less time (3,333 s against 3,931 s for the same binary writing v6). Every block reader
+  decompresses before decoding, so a point read that reaches a run block pays
+  ~17 µs of CPU per 32 KiB block (ingest probes runs ~0.003 times per write).
+  Merge policy and output reservations use uncompressed run lengths. Builders
+  encode, compress and decompress-check batches of blocks on
+  `VALS_RUN_CODEC_THREADS` (4) threads and keep only the in-order source check on
+  the building thread, since compression alone saturated the single flush lane.
+  Pre-v7 binaries refuse v7 runs; `VALS_RUN_WRITE_VERSION=6` keeps a rollback window.
   **Range-tombstone engine core:** a sorted engine keeps a
   canonical fragment set (`range_tombstone::FragmentSet`), appends RTs as record kind
   2, replays unflushed ones from the tail, and moves RT records into flush and rewrite

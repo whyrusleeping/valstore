@@ -255,8 +255,7 @@ impl<D: BlockDevice> Engine<D> {
     }
 
     fn cover_scan_merge_soon_window(&self) -> std::ops::Range<usize> {
-        let sizes: Vec<u64> = self.runs.iter().map(|or| or.meta.handle.len).collect();
-        select_recurring_merge(&sizes, &self.merge_policy)
+        select_recurring_merge(&self.policy_sizes(), &self.merge_policy)
             .map_or(0..0, |w| w.start..w.end)
     }
 

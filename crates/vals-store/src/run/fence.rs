@@ -10,6 +10,7 @@ pub(super) struct FenceIndex {
     keys: Box<[u8]>,
     blocks: Box<[Block]>,
     max_hlc: Box<[u64]>,
+    raw: Option<(u64, u32)>,
 }
 
 impl FenceIndex {
@@ -65,6 +66,14 @@ impl FenceIndex {
         self.blocks.iter().map(|b| b.len as usize).max().unwrap_or(0)
     }
 
+    pub(super) fn set_raw(&mut self, data_len: u64, max_block: u32) {
+        self.raw = Some((data_len, max_block));
+    }
+
+    pub(super) fn raw(&self) -> Option<(u64, u32)> {
+        self.raw
+    }
+
     pub(super) fn allocated_bytes(&self) -> usize {
         self.keys.len()
             + self.blocks.len() * std::mem::size_of::<Block>()
@@ -114,6 +123,7 @@ impl FenceBuilder {
             keys: self.keys.into_boxed_slice(),
             blocks: self.blocks.into_boxed_slice(),
             max_hlc: self.max_hlc.into_boxed_slice(),
+            raw: None,
         }
     }
 }

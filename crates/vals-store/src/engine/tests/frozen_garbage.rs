@@ -650,6 +650,7 @@ fn shadow_fold_sources_read_through_the_maintenance_device() {
 
 #[test]
 fn shadow_fold_collects_a_tombstone_only_run_once_older_copies_are_gone() {
+    let _v6 = uncompressed_runs();
     if co_compact_env(false) {
         return;
     }
