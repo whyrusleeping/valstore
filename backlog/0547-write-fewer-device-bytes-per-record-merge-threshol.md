@@ -1,16 +1,18 @@
 ---
 id: "0547"
 title: 'Write fewer device bytes per record: merge threshold, run-block compression, compact value-log header (key schema/value compression noted for bootes)'
-status: todo
+status: done
 priority: 2
 created: "2026-11-01"
-updated: "2026-11-01"
+updated: "2026-11-02"
 depends_on:
     - "0563"
     - "0564"
     - "0565"
 spec_refs: []
 ---
+
+## Description
 
 ## Description
 ## Why
@@ -37,5 +39,8 @@ Keys are written about three times (log, flush run, merge rewrites). In the 0546
 
 ## Acceptance criteria
 
-## Work log
-- 2026-11-02: split into 0563 (item 1, merge fan-in config N2 A/B), 0564 (item 2, run-block compression) and 0565 (item 3, compact vlog header); item 4 stays an owner note here. This task closes with the B/write summary once the children are done.
+## Outcome
+
+All three vals items kept and default at 27f15c4 (0563 merge fan-in K = min K = valve = 16; 0565 value-log format 2; 0564 run format v7 zstd blocks), each with old-format reads, a rollback knob, docs and tests. N2 replay to 4.5B, post-drain device B/write node1 522.5 -> 469.7 -> 438.7 -> 328.2 (-37.2%: vlog 294.8 -> 262.3, flush runs 97.9 -> 29.2, merge runs 125.1 -> 31.8); node3 542.7 -> 329.3 (-39.3%). Same-binary A/B time steps -5.2%, -4.7%, -15.2%; 4.5B 4,290 -> 3,333 s across builds. Costs: v7 run probe ~20 us CPU, scans 3-5x CPU. Item 4 (owner, bootes, unmeasured): device bytes are now ~80% value log, so a compact key schema mostly saves the ~115 B vlog key copy (halving it ~17%) and value dictionary compression ~4% per 10% of value size.
+
+Commit: 0547: B/write summary: K16 merge fan-in + vlog format 2 + run v7 cut N2 node1 device bytes per write 522.5 -> 328.2 (-37%), node3 542.7 -> 329.3 (-39%), time to 4.5B 4,290 -> 3,333 s
