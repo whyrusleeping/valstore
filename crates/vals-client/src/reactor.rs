@@ -97,6 +97,8 @@ pub fn poll_io() {
 
 const POLL_IO_TIMEOUT_MS: i32 = 1;
 
+/// [`poll_io`] without waiting: flushes queued requests and wakes the tasks
+/// whose sockets are already ready.
 pub fn poll_io_nonblocking() {
     run_flush_hook();
     poll_io_with(0);

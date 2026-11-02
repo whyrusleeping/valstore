@@ -116,10 +116,12 @@ impl<T: Transport + 'static> CoordinatorService<T> {
     }
 
     /// Blocks the thread running `fut` to completion on the service's
-    /// executor (with [`reactor::poll_io`]), advancing the background tasks
-    /// meanwhile.
+    /// executor (with [`reactor::poll_io_nonblocking`] while tasks are
+    /// runnable and [`reactor::poll_io`] otherwise), advancing the background
+    /// tasks meanwhile.
     pub fn run<F: std::future::Future>(&self, fut: F) -> F::Output {
-        self.ex.run_until(fut, reactor::poll_io)
+        self.ex
+            .run_until_with(fut, reactor::poll_io_nonblocking, reactor::poll_io)
     }
 
     /// [`submit_write_batch_in`](Self::submit_write_batch_in) for the default
@@ -171,7 +173,11 @@ impl<T: Transport + 'static> CoordinatorService<T> {
             };
             deliver(&task_outcome, res);
         });
-        self.ex.run_until(SlotFuture { slot: admitted }, reactor::poll_io);
+        self.ex.run_until_with(
+            SlotFuture { slot: admitted },
+            reactor::poll_io_nonblocking,
+            reactor::poll_io,
+        );
         BatchWriteHandle { slot: outcome }
     }
 

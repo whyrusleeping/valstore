@@ -290,7 +290,39 @@ impl LocalExecutor {
 
     /// Runs `fut` to completion, running spawned tasks meanwhile. Tasks still
     /// pending when `fut` completes stay spawned for the next run.
+    ///
+    /// `poll_io` runs after every round of runnable tasks, whether or not
+    /// more tasks are runnable, so I/O keeps progressing while a task keeps
+    /// rescheduling itself. A hook that may wait (such as
+    /// `vals_client::reactor::poll_io`) then waits even when tasks are
+    /// runnable; use [`run_until_with`](Self::run_until_with) to wait only
+    /// when nothing is runnable.
     pub fn run_until<F: Future>(&self, fut: F, mut poll_io: impl FnMut()) -> F::Output {
+        self.drive_until(fut, |_| poll_io())
+    }
+
+    /// [`run_until`](Self::run_until) with separate I/O hooks for busy and
+    /// idle rounds. After a round of runnable tasks, `poll_io_nonblocking`
+    /// runs if a task or `fut` is still runnable and `poll_io` runs
+    /// otherwise, so only `poll_io` may wait for I/O and
+    /// `poll_io_nonblocking` must not block. For `vals-client` these are
+    /// `reactor::poll_io_nonblocking` and `reactor::poll_io`.
+    pub fn run_until_with<F: Future>(
+        &self,
+        fut: F,
+        mut poll_io_nonblocking: impl FnMut(),
+        mut poll_io: impl FnMut(),
+    ) -> F::Output {
+        self.drive_until(fut, |idle| {
+            if idle {
+                poll_io()
+            } else {
+                poll_io_nonblocking()
+            }
+        })
+    }
+
+    fn drive_until<F: Future>(&self, fut: F, mut poll_io: impl FnMut(bool)) -> F::Output {
         let mut fut = Box::pin(fut);
         let woken = Arc::new(WakeFlag::new());
         let fg_waker = Waker::from(woken.clone());
@@ -302,9 +334,7 @@ impl LocalExecutor {
                     return v;
                 }
             }
-            if self.shared.ready.is_empty() && !woken.is_set() {
-                poll_io();
-            }
+            poll_io(self.shared.ready.is_empty() && !woken.is_set());
         }
     }
 }
@@ -1147,6 +1177,83 @@ mod tests {
             || fg_reactor.complete_all(),
         );
         assert_eq!(out, 7);
+    }
+
+    fn spawn_yielding_counter(ex: &LocalExecutor, iters: usize) -> Rc<Cell<usize>> {
+        let yields = Rc::new(Cell::new(0usize));
+        let counter = yields.clone();
+        ex.spawn(async move {
+            for _ in 0..iters {
+                yield_now().await;
+                counter.set(counter.get() + 1);
+            }
+        });
+        yields
+    }
+
+    #[test]
+    fn run_until_polls_io_while_a_background_task_keeps_yielding() {
+        const ITERS: usize = 1000;
+        let ex = LocalExecutor::new();
+        let yields = spawn_yielding_counter(&ex, ITERS);
+        let reactor = Rc::new(MockReactor::default());
+        let fg = reactor.clone();
+        let fg_yields = yields.clone();
+        let seen = ex.run_until(
+            async move {
+                fg.submit().await;
+                fg_yields.get()
+            },
+            || reactor.complete_all(),
+        );
+        assert!(
+            seen <= 2,
+            "the I/O-driven foreground op completed only after {seen} of {ITERS} background yields"
+        );
+    }
+
+    #[test]
+    fn run_until_with_polls_nonblocking_io_while_a_background_task_keeps_yielding() {
+        const ITERS: usize = 1000;
+        let ex = LocalExecutor::new();
+        let yields = spawn_yielding_counter(&ex, ITERS);
+        let reactor = Rc::new(MockReactor::default());
+        let fg = reactor.clone();
+        let fg_yields = yields.clone();
+        let seen = ex.run_until_with(
+            async move {
+                fg.submit().await;
+                fg_yields.get()
+            },
+            || reactor.complete_all(),
+            || panic!("parked while a task was runnable"),
+        );
+        assert!(
+            seen <= 2,
+            "the I/O-driven foreground op completed only after {seen} of {ITERS} background yields"
+        );
+    }
+
+    #[test]
+    fn run_until_with_parks_only_when_nothing_is_runnable() {
+        let ex = LocalExecutor::new();
+        let reactor = Rc::new(MockReactor::default());
+        let parks = Cell::new(0usize);
+        let fg = reactor.clone();
+        let out = ex.run_until_with(
+            async move {
+                fg.submit().await;
+                fg.submit().await;
+                9
+            },
+            || panic!("nonblocking poll while nothing was runnable"),
+            || {
+                parks.set(parks.get() + 1);
+                reactor.complete_all();
+            },
+        );
+        assert_eq!(out, 9);
+        assert_eq!(parks.get(), 2);
     }
 
     #[test]
