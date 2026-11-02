@@ -209,7 +209,9 @@ impl<D: BlockDevice> Engine<D> {
     /// earlier successful write survives a crash. How durable a device flush
     /// is depends on the device (for a file, `fsync`; a memory device has no
     /// durability). On error, treat the writes since the last successful sync
-    /// as possibly lost.
+    /// as possibly lost. After an asynchronous value-log write fails, every
+    /// later sync and append fails with `LogError::WriteLost` until the engine
+    /// is reopened.
     pub fn sync(&mut self) -> Result<(), EngineError> {
         self.log.sync(&self.dev)?;
         Ok(())

@@ -208,6 +208,9 @@ pub enum LogError {
     Backpressure,
     Corrupt(&'static str),
     Unsupported(&'static str),
+    /// An earlier asynchronous value-log write failed, so records appended
+    /// into it are not on the device.
+    WriteLost,
 }
 
 impl std::fmt::Display for LogError {
@@ -227,6 +230,11 @@ impl std::fmt::Display for LogError {
                 f,
                 "value log holds an intact {what} this release does not know \
                  (written by a newer release?); refusing to open"
+            ),
+            LogError::WriteLost => write!(
+                f,
+                "an earlier asynchronous value-log write failed, so records appended \
+                 before it are not on the device; reopen the engine to recover"
             ),
         }
     }
@@ -1241,6 +1249,10 @@ pub struct ValueLog {
     staged_lba: std::cell::Cell<u64>,
     tail_segs: Vec<(u64, SegmentId)>,
     epoch_fence_pending: bool,
+    /// Set when a reaped asynchronous write failed. Its bytes are not kept,
+    /// so the records in it can never be written: from then on every sync
+    /// and append fails, whichever caller reaped the failure.
+    write_lost: std::cell::Cell<bool>,
 }
 
 impl ValueLog {
@@ -1274,6 +1286,7 @@ impl ValueLog {
             staged_lba: std::cell::Cell::new(0),
             tail_segs: Vec::new(),
             epoch_fence_pending: false,
+            write_lost: std::cell::Cell::new(false),
         }
     }
 
@@ -1297,6 +1310,7 @@ impl ValueLog {
             if inflight[i].is_done() {
                 let h = inflight.swap_remove(i);
                 if let Err(e) = h.into_result() {
+                    self.write_lost.set(true);
                     result = Err(e.into());
                 }
             } else {
@@ -1375,10 +1389,29 @@ impl ValueLog {
         submitted
     }
 
+    fn check_written(&self) -> Result<(), LogError> {
+        if self.write_lost.get() {
+            return Err(LogError::WriteLost);
+        }
+        Ok(())
+    }
+
     /// Waits for every in-flight write, then writes the coalescing buffer
     /// synchronously: on failure it is kept, so a retried drain writes it again.
     fn drain_inflight<D: BlockDevice>(&self, dev: &D) -> Result<(), LogError> {
         self.wait_inflight(dev)?;
+        self.write_staged(dev)
+    }
+
+    /// `drain_inflight` for a read: a lost write fails the syncs that cover
+    /// it, not reads of other records (a read of a lost record fails its
+    /// key and checksum checks).
+    fn drain_for_read<D: BlockDevice>(&self, dev: &D) -> Result<(), LogError> {
+        self.quiesce_inflight(dev);
+        self.write_staged(dev)
+    }
+
+    fn write_staged<D: BlockDevice>(&self, dev: &D) -> Result<(), LogError> {
         let mut staged = self.staged.borrow_mut();
         if !staged.is_empty() {
             crate::attribution::write_bytes(0, staged.len());
@@ -1394,16 +1427,20 @@ impl ValueLog {
                 self.reap()?;
             }
         }
-        Ok(())
+        self.check_written()
     }
 
-    pub(crate) fn quiesce<D: BlockDevice>(&self, dev: &D) {
-        let _ = self.submit_staged(dev);
+    fn quiesce_inflight<D: BlockDevice>(&self, dev: &D) {
         while !self.inflight.borrow().is_empty() {
             if dev.poll_writes() > 0 || self.head_done() {
                 let _ = self.reap();
             }
         }
+    }
+
+    pub(crate) fn quiesce<D: BlockDevice>(&self, dev: &D) {
+        let _ = self.submit_staged(dev);
+        self.quiesce_inflight(dev);
     }
 
     pub fn inflight_writes(&self) -> usize {
@@ -1499,6 +1536,7 @@ impl ValueLog {
         key: &[u8],
         value: &[u8],
     ) -> Result<(u64, ValuePtr), LogError> {
+        self.check_written()?;
         let seq = self.next_seq;
         let format = vlog_write_version();
         let first = RecordBase { format, epoch: 0, seq, version }.record_len(seq, version, key, value);
@@ -1594,7 +1632,7 @@ impl ValueLog {
         expected_key: &[u8],
         expected_version: u128,
     ) -> Result<Record, LogError> {
-        self.drain_inflight(dev)?;
+        self.drain_for_read(dev)?;
         let span = self.span_blocks(ptr)?;
         let mut buf = io_buf(span.1 * self.block_size);
         dev.read_at(seg_start_lba + span.0, &mut buf)?;
@@ -1611,7 +1649,7 @@ impl ValueLog {
         items: &[(u64, ValuePtr)],
         expected: &[(&[u8], u128)],
     ) -> Result<Vec<Record>, LogError> {
-        self.drain_inflight(dev)?;
+        self.drain_for_read(dev)?;
         let (spans, mut bufs) = self.read_bufs(items)?;
         {
             let mut ops: Vec<ReadOp<'_>> = bufs
@@ -1634,7 +1672,7 @@ impl ValueLog {
         items: &[(u64, ValuePtr)],
         expected: &[(&[u8], u128)],
     ) -> Result<Vec<Record>, LogError> {
-        self.drain_inflight(dev)?;
+        self.drain_for_read(dev)?;
         let (spans, mut bufs) = self.read_bufs(items)?;
 
         let acks = {
@@ -1662,7 +1700,7 @@ impl ValueLog {
         ptr: &ValuePtr,
         version: u128,
     ) -> Result<ReadPlan, LogError> {
-        self.drain_inflight(dev)?;
+        self.drain_for_read(dev)?;
         let (first_block, nblocks) = self.span_blocks(ptr)?;
         let tail_overlay = self
             .tail_overlay_off(ptr, first_block, nblocks)
@@ -1683,7 +1721,7 @@ impl ValueLog {
         dev: &D,
         items: &[(u64, ValuePtr)],
     ) -> Result<SpanReadPlan, LogError> {
-        self.drain_inflight(dev)?;
+        self.drain_for_read(dev)?;
         let bs = self.block_size;
         let mut plan = plan_read_spans_detached(bs, self.seg_blocks * bs as u64, items)?;
 
@@ -2406,6 +2444,82 @@ mod tests {
         let mut buf = vec![0u8; SEG as usize * BS];
         dev.read_at(start, &mut buf).unwrap();
         assert_eq!(replay_segment(&buf).unwrap().1.len(), 30);
+    }
+
+    /// Fails the device write with index `fail_at` (0-based).
+    struct FailNthWriteDevice {
+        inner: MemBlockDevice,
+        writes: std::sync::atomic::AtomicUsize,
+        fail_at: usize,
+    }
+
+    impl BlockDevice for FailNthWriteDevice {
+        fn block_size(&self) -> usize {
+            self.inner.block_size()
+        }
+        fn num_blocks(&self) -> u64 {
+            self.inner.num_blocks()
+        }
+        fn read_at(&self, lba: u64, buf: &mut [u8]) -> vals_spdk::Result<()> {
+            self.inner.read_at(lba, buf)
+        }
+        fn write_at(&self, lba: u64, buf: &[u8]) -> vals_spdk::Result<()> {
+            if self.writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == self.fail_at {
+                return Err(BlockError::Io(std::io::Error::other("injected write failure")));
+            }
+            self.inner.write_at(lba, buf)
+        }
+        fn flush(&self) -> vals_spdk::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn a_failed_async_write_fails_every_later_sync_whoever_reaped_it() {
+        const SEG: u64 = 8192;
+        let key = |i: u32| format!("k{i:04}").into_bytes();
+        for reaper in ["append", "read"] {
+            // Write 0 is the first coalesced 16 KiB block write, submitted
+            // asynchronously; its error waits in `inflight` for a reaper.
+            let dev = FailNthWriteDevice {
+                inner: MemBlockDevice::new(BS, 2 * SEG),
+                writes: std::sync::atomic::AtomicUsize::new(0),
+                fail_at: 0,
+            };
+            let mut alloc = Allocator::new(2 * SEG, SEG, 0);
+            let mut log = ValueLog::new(BS, SEG, 0, 0);
+            let mut ptrs = Vec::new();
+            let mut i = 0u32;
+            let reaped = loop {
+                match log.append(&dev, &mut alloc, RecordKind::Put, i as u128, &key(i), &[i as u8; 4000]) {
+                    Ok((_, ptr)) => ptrs.push(ptr),
+                    Err(e) => break e,
+                }
+                i += 1;
+                if reaper == "read" && i == 20 {
+                    let ptr = ptrs[10];
+                    let start = alloc.segment_range(ptr.segment).0;
+                    let rec = log.read_checked(&dev, start, &ptr, &key(10), 10).unwrap();
+                    assert_eq!(rec.value, vec![10u8; 4000]);
+                    break LogError::Corrupt("read reaped");
+                }
+                assert!(i < 1000, "the inflight cap never stalled an append");
+            };
+            match reaper {
+                "append" => assert!(matches!(reaped, LogError::Io(_)), "{reaped}"),
+                _ => assert!(log.write_lost.get(), "the read reaped the failure"),
+            }
+            assert!(matches!(log.drain_and_flush_tail(&dev), Err(LogError::WriteLost)), "{reaper}");
+            assert!(matches!(log.sync(&dev), Err(LogError::WriteLost)), "{reaper}");
+            assert!(matches!(
+                log.append(&dev, &mut alloc, RecordKind::Put, 0, b"later", b"v"),
+                Err(LogError::WriteLost)
+            ));
+            let ptr = ptrs[10];
+            let start = alloc.segment_range(ptr.segment).0;
+            let rec = log.read_checked(&dev, start, &ptr, &key(10), 10).unwrap();
+            assert_eq!(rec.value, vec![10u8; 4000], "{reaper}: reads of written records still work");
+        }
     }
 
     const FORMATS: [u16; 2] = [SEG_FORMAT_V1, SEG_FORMAT_V2];
