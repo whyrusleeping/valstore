@@ -1,0 +1,68 @@
+{
+  "description": "First campaign: 3x i4i.metal (8 NVMe, 16 shards each, RF 3, three PDs) + 2x c6in.16xlarge clients. Raw drive/network ceilings, engine-on-drive ceilings, valsd write/read sweeps, verified mixed load, chaos drills, cold restart, full verification.",
+  "hours": 3.0,
+  "hostmon_interval": 1.0,
+  "fleet": {
+    "node": {"type": "i4i.metal", "count": 3, "market": "on-demand", "root_gb": 100},
+    "client": {"type": "c6in.16xlarge", "count": 2, "market": "on-demand", "root_gb": 50}
+  },
+  "cluster": {
+    "backend": "spdk",
+    "drives_per_node": 8,
+    "parts_per_drive": 2,
+    "rf": 3,
+    "vals_profile": "capacity",
+    "sweep": "5s",
+    "gc_grace": "0s",
+    "hugemem_mib": 65536,
+    "default_zone_fraction": 0.6,
+    "named_zone_fraction": 0.15
+  },
+  "steps": [
+    {"name": "prep", "kind": "prep"},
+    {"name": "net", "kind": "net", "cloud_only": true, "secs": 10, "streams": 16, "required": false},
+    {"name": "rawdisk", "kind": "rawdisk", "cloud_only": true, "secs": 30, "required": false},
+    {"name": "spdkbench", "kind": "spdkbench", "cloud_only": true, "ppd": 2, "required": false,
+     "runs": [["mdwrite", 80000000, 100], ["mdwrite", 40000000, 4096], ["mdread", 40000000, 100]]},
+    {"name": "cluster", "kind": "cluster"},
+
+    {"name": "w-100b-c8", "kind": "netload", "workload": "netload", "n": 48000000, "vsize": 100, "coords": 8, "conc": 64, "secs": 60},
+    {"name": "w-100b-c24", "kind": "netload", "workload": "netload", "n": 48000000, "vsize": 100, "coords": 24, "conc": 64, "secs": 60, "profile": true},
+    {"name": "w-100b-c48", "kind": "netload", "workload": "netload", "n": 48000000, "vsize": 100, "coords": 48, "conc": 64, "secs": 60},
+    {"name": "wb-100b-b32", "kind": "netload", "workload": "netbatchwrite", "n": 48000000, "vsize": 100, "coords": 24, "conc": 256, "secs": 60,
+     "env": {"VALS_NETBATCHWRITE_WIDTH": 32}},
+    {"name": "w-4k-c8", "kind": "netload", "workload": "netload", "n": 4800000, "vsize": 4096, "coords": 8, "conc": 64, "secs": 60},
+    {"name": "w-4k-c32", "kind": "netload", "workload": "netload", "n": 4800000, "vsize": 4096, "coords": 32, "conc": 64, "secs": 60, "profile": true},
+    {"name": "wb-100b-device", "kind": "netload", "workload": "netbatchwrite", "n": 48000000, "vsize": 100, "coords": 24, "conc": 256, "secs": 60,
+     "env": {"VALS_NETBATCHWRITE_WIDTH": 32, "VALS_NETBATCHWRITE_PERSISTENCE": "device"}},
+
+    {"name": "prefill", "strict": true, "kind": "netload", "workload": "netbatchwrite", "prefix": "pf", "n": 48000000, "vsize": 100, "coords": 24, "conc": 256,
+     "env": {"VALS_NETBATCHWRITE_WIDTH": 32}, "timeout": 1800},
+    {"name": "r-strong-c16", "kind": "netload", "workload": "netread", "prefix": "pf", "n": 48000000, "vsize": 100, "coords": 16, "conc": 64, "secs": 60},
+    {"name": "r-strong-c48", "kind": "netload", "workload": "netread", "prefix": "pf", "n": 48000000, "vsize": 100, "coords": 48, "conc": 64, "secs": 60, "profile": true},
+    {"name": "r-multi256", "kind": "netload", "workload": "netmultiread", "prefix": "pf", "n": 48000000, "vsize": 100, "coords": 12, "conc": 2, "secs": 60, "profile": true,
+     "env": {"VALS_NETMULTIREAD_BATCH": 256}},
+    {"name": "verify-prefill", "strict": true, "kind": "netload", "workload": "netmultiread", "prefix": "pf", "n": 48000000, "vsize": 100, "coords": 24, "conc": 2, "timeout": 1800,
+     "env": {"VALS_NETMULTIREAD_BATCH": 256}},
+
+    {"name": "m1-closed", "kind": "np", "secs": 600, "threads": 16, "slots": 32, "keys": 8192, "vsize": 256, "read_pct": 65, "multi_pct": 10, "rate": 0, "profile": true, "profile_at": 240},
+    {"name": "m2-open50", "kind": "np", "secs": 300, "threads": 16, "slots": 32, "keys": 8192, "vsize": 256, "read_pct": 65, "multi_pct": 10, "rate_from": "m1-closed", "rate_frac": 0.5},
+    {"name": "m3-device", "kind": "np", "secs": 180, "threads": 16, "slots": 32, "keys": 8192, "vsize": 256, "read_pct": 65, "multi_pct": 10, "persistence": "device", "rate_from": "m1-closed", "rate_frac": 0.25},
+
+    {"name": "chaos", "kind": "np", "secs": 1500, "threads": 16, "slots": 32, "keys": 8192, "vsize": 256, "read_pct": 65, "multi_pct": 10, "rate_from": "m1-closed", "rate_frac": 0.3,
+     "actions": [
+       {"wait": 60, "action": "kill9", "target": "node3", "down_secs": 60},
+       {"wait": 45, "action": "blackhole", "target": "node2", "down_secs": 60},
+       {"wait": 45, "action": "pd-kill", "target": "pd-leader", "down_secs": 30},
+       {"wait": 45, "action": "freeze", "target": "node1", "down_secs": 20},
+       {"wait": 45, "action": "sigterm", "target": "node1", "down_secs": 10}
+     ]},
+    {"name": "settle", "kind": "settle", "timeout": 900},
+    {"name": "converge", "kind": "converge", "wait": 30},
+    {"name": "restart", "kind": "restart"},
+    {"name": "verify-after-restart", "strict": true, "kind": "netload", "workload": "netmultiread", "prefix": "pf", "n": 48000000, "vsize": 100, "coords": 24, "conc": 2, "timeout": 1800,
+     "env": {"VALS_NETMULTIREAD_BATCH": 256}},
+    {"name": "stop", "kind": "stop"},
+    {"name": "nvme-post", "kind": "nvme_post", "cloud_only": true, "required": false}
+  ]
+}

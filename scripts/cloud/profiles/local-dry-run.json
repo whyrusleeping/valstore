@@ -1,0 +1,34 @@
+{
+  "description": "Dry run of the campaign machinery on this machine: three file-backed nodes and one client on localhost (fleet.py local). Tiny sizes; exercises every step kind that does not need AWS.",
+  "hours": 0.5,
+  "hostmon_interval": 1.0,
+  "fleet": {},
+  "cluster": {"backend": "file", "rf": 3, "region_mib": 1024, "sweep": "2s", "gc_grace": "0s"},
+  "steps": [
+    {"name": "prep", "kind": "prep"},
+    {"name": "cluster", "kind": "cluster"},
+    {"name": "w-small", "kind": "netload", "workload": "netload", "n": 20000, "vsize": 100, "coords": 2, "conc": 16, "secs": 5},
+    {"name": "wb-small", "kind": "netload", "workload": "netbatchwrite", "n": 20000, "vsize": 100, "coords": 2, "conc": 32, "secs": 5,
+     "env": {"VALS_NETBATCHWRITE_WIDTH": 8}},
+    {"name": "prefill", "strict": true, "kind": "netload", "workload": "netbatchwrite", "prefix": "pf", "n": 20000, "vsize": 100, "coords": 2, "conc": 32,
+     "env": {"VALS_NETBATCHWRITE_WIDTH": 8}},
+    {"name": "r-strong", "kind": "netload", "workload": "netread", "prefix": "pf", "n": 20000, "vsize": 100, "coords": 2, "conc": 16, "secs": 5},
+    {"name": "verify-prefill", "strict": true, "kind": "netload", "workload": "netmultiread", "prefix": "pf", "n": 20000, "vsize": 100, "coords": 2, "conc": 2,
+     "env": {"VALS_NETMULTIREAD_BATCH": 64}},
+    {"name": "m1-closed", "kind": "np", "secs": 15, "threads": 2, "slots": 4, "keys": 256, "rate": 0},
+    {"name": "m2-open50", "kind": "np", "secs": 10, "threads": 2, "slots": 4, "keys": 256, "rate_from": "m1-closed", "rate_frac": 0.5},
+    {"name": "chaos", "kind": "np", "secs": 150, "threads": 2, "slots": 4, "keys": 256, "rate_from": "m1-closed", "rate_frac": 0.2,
+     "actions": [
+       {"wait": 5, "action": "kill9", "target": "node3", "down_secs": 5, "settle_timeout": 60},
+       {"wait": 5, "action": "freeze", "target": "node1", "down_secs": 5, "settle_timeout": 60},
+       {"wait": 5, "action": "pd-kill", "target": "pd-leader", "down_secs": 5, "settle_timeout": 60},
+       {"wait": 5, "action": "sigterm", "target": "node2", "down_secs": 3, "settle_timeout": 60}
+     ]},
+    {"name": "settle", "kind": "settle", "timeout": 120},
+    {"name": "converge", "kind": "converge", "wait": 5},
+    {"name": "restart", "kind": "restart"},
+    {"name": "verify-after-restart", "strict": true, "kind": "netload", "workload": "netmultiread", "prefix": "pf", "n": 20000, "vsize": 100, "coords": 2, "conc": 2,
+     "env": {"VALS_NETMULTIREAD_BATCH": 64}},
+    {"name": "stop", "kind": "stop"}
+  ]
+}
