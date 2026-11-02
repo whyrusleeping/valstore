@@ -2003,6 +2003,105 @@ fn floor_multi_run_state_reclaims_via_aged_vlog_gc() {
 }
 
 #[test]
+fn floor_aged_vlog_gc_falls_back_to_feasible_lower_ranked_run() {
+    if co_compact_env(false) { return; }
+    let dev = MemBlockDevice::new(BS, 65536);
+    let mut e = Engine::create_prewiped(
+        dev,
+        Config {
+            seg_blocks: 32,
+            reserved_blocks: 0,
+            ordering: Ordering::Unsorted,
+        },
+    );
+    e.set_orphan_reclaim_for_test(false);
+    let mut ver: u128 = 0;
+    let mut aged_pair = |e: &mut Engine<MemBlockDevice>, prefix: &str, nkeys: usize| {
+        for i in 0..nkeys {
+            ver += 1;
+            e.put(format!("{prefix}{i:06}").as_bytes(), &[7u8; 256], ver).unwrap();
+        }
+        assert!(run_flush(e, RunBuildOpts::default()).is_some());
+        for i in (0..nkeys).filter(|i| i % 5 < 3) {
+            ver += 1;
+            e.put(format!("{prefix}{i:06}").as_bytes(), &[8u8; 256], ver).unwrap();
+        }
+        assert!(run_flush(e, RunBuildOpts::default()).is_some());
+        let runs = e.run_count();
+        let plan = e
+            .compact_plan(RunBuildOpts::default(), None)
+            .unwrap()
+            .expect("merge of the two fresh runs");
+        assert_eq!(plan.merged_inputs.len(), 2);
+        let wdev = Arc::new(e.device().sibling().unwrap());
+        let written = vals_rt::block_on(compact_and_write(plan, wdev), || {}).unwrap();
+        e.compact_commit(written).unwrap();
+        assert_eq!(e.run_count(), runs - 1);
+    };
+    e.merge_policy.force_runs = 2;
+    aged_pair(&mut e, "k", 4000);
+    let big = e.runs[0].meta.handle.clone();
+    e.merge_policy.freeze_bytes = big.len;
+    aged_pair(&mut e, "y", 300);
+    assert_eq!(e.run_count(), 2);
+    let small = e.runs[1].meta.handle.clone();
+    assert!(big.len > small.len);
+
+    e.set_maint_reserve_enabled(true);
+    while e.free_segments() > e.maint_reserve_for_test() {
+        e.alloc.allocate().unwrap();
+    }
+    assert!(e.at_maintenance_floor());
+    let seg_bytes = e.alloc.blocks_per_segment() as usize * e.block_size;
+    let usable = seg_bytes.saturating_sub(SEG_HEADER_LEN).max(1) as u64;
+    let (big_dead, small_dead) = (
+        e.aged_vlog_gc_score(0, usable, true).expect("big run qualifies"),
+        e.aged_vlog_gc_score(1, usable, true).expect("small run qualifies"),
+    );
+    assert!(big_dead > small_dead, "the big aged run carries the higher dead-byte estimate");
+    loop {
+        match e.aged_vlog_gc_shape() {
+            Some((0, _, _)) => {
+                e.alloc.allocate().expect("free segments run out before the big run's rewrite is unaffordable");
+            }
+            Some((idx, _, _)) => {
+                assert_eq!(idx, 1);
+                break;
+            }
+            None => panic!(
+                "no aged-vlog GC candidate at {} free segments: the small run's affordable rewrite was hidden",
+                e.free_segments()
+            ),
+        }
+    }
+    assert!(e.aged_vlog_gc_feasible());
+    assert!(
+        !e.region_exhausted(),
+        "a feasible lower-ranked aged-vlog GC keeps the floor state non-terminal"
+    );
+
+    let free_before = e.free_segments();
+    let plan = e
+        .compact_plan_pressure(RunBuildOpts::default(), None)
+        .unwrap()
+        .expect("aged-vlog GC plan for the lower-ranked run");
+    assert_eq!(plan.merged_inputs.len(), 1);
+    assert_eq!(plan.merged_inputs[0].handle, small);
+    assert!(matches!(&plan.vlog_rewrite, VlogRewrite::Victims(v) if !v.is_empty()));
+    let wdev = Arc::new(e.device().sibling().unwrap());
+    let written = vals_rt::block_on(compact_and_write(plan, wdev), || {}).unwrap();
+    e.compact_commit(written).unwrap();
+    assert!(
+        e.free_segments() > free_before,
+        "the lower-ranked GC must net-reclaim: {} -> {}",
+        free_before,
+        e.free_segments()
+    );
+    assert_eq!(e.run_count(), 2);
+    assert_eq!(e.runs[0].meta.handle, big);
+}
+
+#[test]
 fn aged_dead_vlog_gc_reclaims_multi_run_state_pre_floor() {
     if co_compact_env(false) { return; }
     let dev = MemBlockDevice::new(BS, 65536);

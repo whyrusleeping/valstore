@@ -2238,36 +2238,36 @@ impl<D: BlockDevice> Engine<D> {
         )
     }
 
-    fn aged_vlog_gc_candidate(&self, usable: u64, at_floor: bool) -> Option<usize> {
-        let mut best: Option<(usize, u64)> = None;
-        for (i, or) in self.runs.iter().enumerate() {
-            let m = &or.meta;
-            let (Some(segs), Some(live)) = (&m.value_segs, m.value_bytes) else {
-                continue;
-            };
-            let mut dead = (segs.len() as u64)
-                .saturating_mul(usable)
-                .saturating_sub(live);
-            if let (false, Some(bytes)) = (self.gc_excluded_segs.is_empty(), &m.value_seg_bytes) {
-                for (seg, seg_live) in segs.iter().zip(bytes) {
-                    if self.gc_excluded_segs.contains(seg) {
-                        dead = dead.saturating_sub(usable.saturating_sub(*seg_live));
-                    }
+    /// Estimated dead value bytes of run `i` when it is worth an aged value-log GC rewrite. The
+    /// estimate is gross: shared segments and victim headroom are checked by `aged_vlog_gc_shape`.
+    pub(super) fn aged_vlog_gc_score(&self, i: usize, usable: u64, at_floor: bool) -> Option<u64> {
+        let m = &self.runs[i].meta;
+        let (Some(segs), Some(live)) = (&m.value_segs, m.value_bytes) else {
+            return None;
+        };
+        let mut dead = (segs.len() as u64)
+            .saturating_mul(usable)
+            .saturating_sub(live);
+        if let (false, Some(bytes)) = (self.gc_excluded_segs.is_empty(), &m.value_seg_bytes) {
+            for (seg, seg_live) in segs.iter().zip(bytes) {
+                if self.gc_excluded_segs.contains(seg) {
+                    dead = dead.saturating_sub(usable.saturating_sub(*seg_live));
                 }
             }
-            let qualifies = if at_floor {
-                dead > 0
-            } else {
-                dead >= m.handle.len
-            };
-            if qualifies && best.is_none_or(|(_, d)| dead > d) {
-                best = Some((i, dead));
-            }
         }
-        best.map(|(i, _)| i)
+        let qualifies = if at_floor {
+            dead > 0
+        } else {
+            dead >= m.handle.len
+        };
+        qualifies.then_some(dead)
     }
 
-    fn aged_vlog_gc_shape(
+    /// The highest-scored run (earliest on ties) with a gainful, affordable rewrite of victims no
+    /// other run references, so an infeasible top-scored run cannot hide a feasible lower-scored
+    /// one. One pass over the runs: shared-segment references are built once, and a run's victims
+    /// are only checked when its score beats the best feasible run found so far.
+    pub(super) fn aged_vlog_gc_shape(
         &self,
     ) -> Option<(usize, std::collections::HashSet<SegmentId>, u64)> {
         if !vlog_gc_enabled() {
@@ -2279,26 +2279,60 @@ impl<D: BlockDevice> Engine<D> {
         }
         let usable = seg_bytes.saturating_sub(SEG_HEADER_LEN).max(1);
         let at_floor = self.at_maintenance_floor();
-        let idx = self.aged_vlog_gc_candidate(usable as u64, at_floor)?;
-        let meta = &self.runs[idx].meta;
-        let mut shared: std::collections::HashSet<SegmentId> = std::collections::HashSet::new();
-        for (i, or) in self.runs.iter().enumerate() {
-            if i == idx {
+        let commit_headroom = self
+            .manifest_headroom_segs()
+            .saturating_add(self.flush_headroom_segs(seg_bytes));
+        let mut refs: Option<std::collections::HashMap<SegmentId, (usize, bool)>> = None;
+        let mut best: Option<(u64, (usize, std::collections::HashSet<SegmentId>, u64))> = None;
+        for idx in 0..self.runs.len() {
+            let Some(dead) = self.aged_vlog_gc_score(idx, usable as u64, at_floor) else {
+                continue;
+            };
+            if best.as_ref().is_some_and(|&(d, _)| dead <= d) {
                 continue;
             }
-            let vs = or.meta.value_segs.as_ref()?;
-            shared.extend(vs.iter().copied());
+            if refs.is_none() {
+                refs = Some(self.value_seg_run_refs()?);
+            }
+            let shape = refs.as_ref().and_then(|refs| {
+                self.aged_vlog_gc_shape_for(idx, refs, seg_bytes, usable, at_floor, commit_headroom)
+            });
+            if let Some(shape) = shape {
+                best = Some((dead, shape));
+            }
         }
-        let inputs = std::slice::from_ref(meta);
+        best.map(|(_, shape)| shape)
+    }
+
+    /// Each referenced value segment's first referencing run and whether another run references it
+    /// too; `None` when a run's value segments are unknown.
+    fn value_seg_run_refs(&self) -> Option<std::collections::HashMap<SegmentId, (usize, bool)>> {
+        let mut refs = std::collections::HashMap::new();
+        for (i, or) in self.runs.iter().enumerate() {
+            for seg in or.meta.value_segs.as_ref()? {
+                let entry = refs.entry(*seg).or_insert((i, false));
+                entry.1 |= entry.0 != i;
+            }
+        }
+        Some(refs)
+    }
+
+    fn aged_vlog_gc_shape_for(
+        &self,
+        idx: usize,
+        refs: &std::collections::HashMap<SegmentId, (usize, bool)>,
+        seg_bytes: usize,
+        usable: usize,
+        at_floor: bool,
+        commit_headroom: u64,
+    ) -> Option<(usize, std::collections::HashSet<SegmentId>, u64)> {
+        let inputs = std::slice::from_ref(&self.runs[idx].meta);
         let (mut victims, _) = self.select_victims(inputs, usable as u64)?;
-        victims.retain(|s| !shared.contains(s));
+        victims.retain(|s| !refs.get(s).is_some_and(|&(_, shared)| shared));
         if victims.is_empty() {
             return None;
         }
         let lives = Self::victim_lives_ascending(inputs, &victims)?;
-        let commit_headroom = self
-            .manifest_headroom_segs()
-            .saturating_add(self.flush_headroom_segs(seg_bytes));
         let output_segs = OpenRun::rewrite_output_bound(self.runs[idx..=idx].iter()).div_ceil(seg_bytes).max(1) as u64;
         let budget = self
             .alloc

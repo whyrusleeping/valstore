@@ -589,10 +589,14 @@ accounting cannot see: an old version stays "live" in the run that references
 it until a merge folds that run with its shadower, so `lsm_dead_fraction` and
 per-run `value_seg_bytes` under-report dead space in multi-run engines. Once
 merges have folded the shadow chains, an **aged-vlog
-GC** rides pressure sweeps: it rewrites the run with the largest visible dead
-value bytes (once that dead at least matches the run's own index size; at the
-reserve floor any net gain qualifies), carrying the largest affordable
-gainful victim set and freeing the victims at commit. At the floor this keeps
+GC** rides pressure sweeps: it ranks runs by visible dead value bytes (a run
+qualifies once that dead at least matches its own index size; at the reserve
+floor any dead qualifies) and rewrites the highest-ranked one that has a
+gainful, affordable set of victim segments no other run references, carrying
+the largest such set and freeing the victims at commit. A top-ranked run whose
+victims are shared or whose rewrite does not fit the free space therefore does
+not hide a feasible lower-ranked one, and the region is terminal only when no
+run has such a rewrite. At the floor this keeps
 the engine live and retryable rather than terminally wedged, but its staging
 budget there is small, so recovery from a mostly-dead region is slow.
 
