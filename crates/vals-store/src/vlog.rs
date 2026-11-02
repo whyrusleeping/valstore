@@ -1078,6 +1078,18 @@ impl ValueLog {
         self.next_epoch
     }
 
+    /// The epoch a flush started now records as its recovery watermark: the
+    /// open segment's, since records appended after the flush still land in
+    /// it. Not `next_epoch - 1`, which may be an epoch reserved for a value
+    /// rewrite above the open segment. With no open segment, every later tail
+    /// segment gets an epoch of at least `next_epoch`.
+    pub fn flush_watermark(&self) -> u64 {
+        match self.cur_seg {
+            Some(_) => self.cur_epoch,
+            None => self.next_epoch.saturating_sub(1),
+        }
+    }
+
     pub fn reserve_epochs(&mut self, n: usize) -> Vec<u64> {
         let start = self.next_epoch;
         self.next_epoch += n as u64;
@@ -1098,6 +1110,10 @@ impl ValueLog {
             .filter(|(e, _)| *e <= epoch)
             .map(|(_, s)| *s)
             .collect()
+    }
+
+    pub fn tail_segs_after(&self, epoch: u64) -> u64 {
+        self.tail_segs.iter().filter(|(e, _)| *e > epoch).count() as u64
     }
 
     pub fn prune_tail_segs_through(&mut self, epoch: u64) {

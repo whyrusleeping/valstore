@@ -106,6 +106,7 @@ use range_delete::{RtCompaction, RtState};
 mod read;
 mod reclaim;
 mod recovery;
+pub(crate) use recovery::replay_watermark;
 mod scan;
 mod scan_rev;
 mod scan_rev_staged;
@@ -532,7 +533,6 @@ pub struct Engine<D: BlockDevice> {
     live_manifest: Option<LiveSnapshot>,
     last_flush_epoch: u64,
     last_flush_seq: u64,
-    tail_epoch_gap: (u64, u64),
     mutable_tombstones: Option<(u128, u64)>,
     gc_fold_cursor: usize,
     flush_in_flight: bool,

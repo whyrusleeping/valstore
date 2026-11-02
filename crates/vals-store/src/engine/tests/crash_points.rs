@@ -798,3 +798,132 @@ fn recovery_of_a_truncated_store_with_no_visible_header_replays_no_truncated_rec
     assert!(back.is_empty(), "truncated records replayed: {back:?}");
     assert_eq!(e.get(b"new").unwrap().as_deref(), Some(&b"v"[..]));
 }
+
+fn rewrite_epoch_cfg() -> Config {
+    Config { seg_blocks: 8, reserved_blocks: 0, ordering: Ordering::Sorted }
+}
+
+fn rewrite_epoch_opts() -> RunBuildOpts {
+    RunBuildOpts { block_target_bytes: 4096, bloom_bits_per_key: 10, num_buckets: 16 }
+}
+
+fn flush_via(e: &mut Engine<MemBlockDevice>, async_flush: bool) {
+    if async_flush {
+        let plan = e.flush_plan(rewrite_epoch_opts()).unwrap().expect("memtable not empty");
+        let wdev = e.device().sibling().unwrap();
+        let written = vals_rt::block_on(build_and_write_flush(plan, &wdev), || {}).map_err(|(_, err)| err).unwrap();
+        e.flush_commit(written).unwrap();
+    } else {
+        e.flush(rewrite_epoch_opts()).unwrap().expect("memtable not empty");
+    }
+}
+
+#[test]
+fn writes_synced_after_a_flush_survive_epochs_reserved_for_value_rewrites() {
+    if compact_env(false, false) {
+        return;
+    }
+    let cfg = rewrite_epoch_cfg();
+    for commit_gc in [true, false] {
+        for async_flush in [true, false] {
+            let case = format!("commit_gc={commit_gc} async_flush={async_flush}");
+            let mut e = Engine::create_prewiped(MemBlockDevice::new(BS, 16384), cfg);
+            for i in 0..400u32 {
+                if i % 9 == 0 {
+                    e.put(format!("keeper-{i:04}").as_bytes(), &[7u8; 150], 1).unwrap();
+                } else {
+                    e.put(format!("churn-{}", i % 5).as_bytes(), &[7u8; 150], u128::from(i) + 1).unwrap();
+                }
+            }
+            flush_via(&mut e, async_flush);
+            let plan = e.compact_plan_pressure(rewrite_epoch_opts(), None).unwrap().expect("a merge plan");
+            assert_eq!(plan.kind(), MergeKind::VlogGc, "{case}");
+            if commit_gc {
+                let wdev = Arc::new(e.device().sibling().unwrap());
+                let written = vals_rt::block_on(compact_and_write(plan, wdev), || {}).map_err(|(_, err)| err).unwrap();
+                e.compact_commit(written).unwrap();
+            } else {
+                let segs = plan.segments();
+                drop(plan);
+                e.free_compact_segs(&segs);
+            }
+            e.put(b"late-a", b"A", 1).unwrap();
+            let open = e.log.open_segment();
+            assert!(e.log.next_epoch() > e.log.flush_watermark() + 1, "{case}: test premise: epochs reserved above the open segment");
+            assert_eq!(e.tail_epochs(), 0, "{case}: reserved epochs are not tail epochs");
+            flush_via(&mut e, async_flush);
+            e.put(b"late-b", b"B", 1).unwrap();
+            e.put_kind(b"late-tomb", b"", 7, true).unwrap();
+            e.apply_range_delete(Some(b"keeper-0000"), Some(b"keeper-0001"), 50).unwrap();
+            assert_eq!(e.log.open_segment(), open, "{case}: test premise: the late writes share the open segment");
+            assert_eq!(e.tail_epochs(), 0, "{case}: a flush leaves no tail epoch due");
+            e.sync().unwrap();
+            let dev = e.device().share();
+            let alloc = Allocator::new(dev.num_blocks(), cfg.seg_blocks, cfg.reserved_blocks);
+            let (man, _) = snapshot_io::load_manifest(&dev, &alloc).unwrap().expect("a manifest");
+            assert!(man.covered_epoch <= e.log.flush_watermark(), "{case}: the flush covered a reserved epoch");
+            drop(e);
+            let e = Engine::open(dev, cfg).unwrap();
+            assert_eq!(e.get(b"late-a").unwrap().as_deref(), Some(&b"A"[..]), "{case}");
+            assert_eq!(e.get(b"late-b").unwrap().as_deref(), Some(&b"B"[..]), "{case}: synced post-flush put lost");
+            assert_eq!(e.version(b"late-tomb").unwrap(), Some(7), "{case}: synced post-flush tombstone lost");
+            assert_eq!(e.get(b"keeper-0000").unwrap(), None, "{case}: synced post-flush range delete lost");
+            assert_eq!(e.get(b"keeper-0009").unwrap().as_deref(), Some(&[7u8; 150][..]), "{case}");
+            assert_eq!(e.tail_epochs(), 0, "{case}");
+        }
+    }
+}
+
+fn rewrite_covered_epoch(dev: &MemBlockDevice, cfg: Config, epoch: u64) {
+    let mut alloc = Allocator::new(dev.num_blocks(), cfg.seg_blocks, cfg.reserved_blocks);
+    let (mut man, live) = snapshot_io::load_manifest(dev, &alloc).unwrap().expect("a manifest");
+    let log = crate::dump::scan_log_segments(dev, &alloc, BS).unwrap();
+    let runs = man.runs.iter().flat_map(|m| m.handle.segs.iter().chain(m.value_segs.iter().flatten()));
+    for seg in live.segs.iter().chain(log.iter().map(|(s, _, _)| s)).chain(runs) {
+        let _ = alloc.mark_allocated(*seg);
+    }
+    man.covered_epoch = epoch;
+    snapshot_io::write_manifest(dev, &mut alloc, &man, live.generation + 1, Some(&live)).unwrap();
+}
+
+#[test]
+fn a_manifest_covering_a_reserved_epoch_above_the_open_segment_replays_its_later_writes() {
+    let cfg = rewrite_epoch_cfg();
+    for late_writes in [true, false] {
+        let dev = MemBlockDevice::new(BS, 4096);
+        let mut e = Engine::create_prewiped(dev.share(), cfg);
+        for i in 0..40u32 {
+            e.put(format!("old-{i:02}").as_bytes(), &[1u8; 100], 1).unwrap();
+        }
+        e.flush(rewrite_epoch_opts()).unwrap().expect("a run");
+        let open_epoch = e.log.flush_watermark();
+        if late_writes {
+            e.put(b"late", b"L", 1).unwrap();
+            e.put_kind(b"late-tomb", b"", 3, true).unwrap();
+            e.apply_range_delete(Some(b"old-00"), Some(b"old-01"), 9).unwrap();
+        }
+        assert_eq!(e.tail_epochs(), 0, "test premise: the late writes share the open segment");
+        e.sync().unwrap();
+        drop(e);
+        rewrite_covered_epoch(&dev, cfg, open_epoch + 3);
+        let mut e = Engine::open(dev.share(), cfg).unwrap();
+        e.storage_audit_for_test().unwrap();
+        assert_eq!(e.get(b"old-07").unwrap().as_deref(), Some(&[1u8; 100][..]));
+        if !late_writes {
+            assert_eq!(e.last_flush_epoch, open_epoch + 3, "a covered segment below the watermark is not replayed");
+            continue;
+        }
+        assert_eq!(e.last_flush_epoch, open_epoch);
+        assert_eq!(e.get(b"late").unwrap().as_deref(), Some(&b"L"[..]));
+        assert_eq!(e.version(b"late-tomb").unwrap(), Some(3));
+        assert_eq!(e.get(b"old-00").unwrap(), None);
+        assert_eq!(crate::dump::read_range_tombstones(&dev, &cfg, None).unwrap().cover(b"old-00"), Some(9));
+        e.flush(rewrite_epoch_opts()).unwrap().expect("the replayed writes flush");
+        drop(e);
+        let e = Engine::open(dev.share(), cfg).unwrap();
+        e.storage_audit_for_test().unwrap();
+        assert_eq!(e.get(b"late").unwrap().as_deref(), Some(&b"L"[..]));
+        assert_eq!(e.version(b"late-tomb").unwrap(), Some(3));
+        assert_eq!(e.get(b"old-00").unwrap(), None);
+    }
+}

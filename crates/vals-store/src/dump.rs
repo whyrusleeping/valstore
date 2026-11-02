@@ -149,10 +149,17 @@ pub fn read_range_tombstones<D: BlockDevice>(
             records.extend(crate::run::read_run_range_tombstones(dev, &alloc, &meta.handle, pace)?);
         }
     }
-    let covered = manifest.as_ref().map(|man| (man.covered_epoch, man.covered_seq));
     let mut log_segs = scan_log_segments_inner(dev, &alloc, block_size, pacer)?;
     log_segs.sort_by_key(|(_, ep, _)| *ep);
     let mut buf = vec![0u8; cfg.seg_blocks as usize * block_size];
+    let covered = match &manifest {
+        Some(man) => {
+            pace(buf.len());
+            let epoch = crate::engine::replay_watermark(dev, &alloc, &mut buf, &log_segs, man.covered_epoch, man.covered_seq)?;
+            Some((epoch, man.covered_seq))
+        }
+        None => None,
+    };
     for (seg, epoch, not_tail) in &log_segs {
         if *not_tail || covered.is_some_and(|(covered_epoch, _)| *epoch < covered_epoch) {
             continue;

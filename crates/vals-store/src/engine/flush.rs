@@ -243,7 +243,7 @@ impl<D: BlockDevice> Engine<D> {
         self.log.sync(&self.dev)?;
 
         let covered_seq = self.log.next_seq().saturating_sub(1);
-        let covered_epoch = self.log.next_epoch().saturating_sub(1);
+        let covered_epoch = self.log.flush_watermark();
         let mut rts = self.unflushed_rts_through(covered_seq);
         let rt_dominated = crate::range_tombstone::drop_dominated(&mut rts, self.rts.accounted_seq.get());
         let (rt_filter, rt_floor) = self.rt_flush_filter(covered_seq);
@@ -409,7 +409,7 @@ impl<D: BlockDevice> Engine<D> {
                 key_bytes: 0,
                 max_key: 0,
                 covered_seq: self.log.next_seq().saturating_sub(1),
-                covered_epoch: self.log.next_epoch().saturating_sub(1),
+                covered_epoch: self.log.flush_watermark(),
                 snapshot_us: 0,
             });
         }

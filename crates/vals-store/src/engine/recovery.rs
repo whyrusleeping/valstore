@@ -38,7 +38,6 @@ impl<D: BlockDevice> Engine<D> {
             live_manifest: state.live_manifest,
             last_flush_epoch: state.last_flush_epoch,
             last_flush_seq: state.last_flush_seq,
-            tail_epoch_gap: (0, 0),
             mutable_tombstones: None,
             gc_fold_cursor: 0,
             flush_in_flight: false,
@@ -241,11 +240,21 @@ impl<D: BlockDevice> Engine<D> {
 
         let dev = Arc::new(dev);
         let mut runs: Vec<OpenRun<D>> = Vec::new();
+        let mut manifest_epoch = None;
         let (min_replay_epoch, covered_seq, manifest_gen, live_manifest, manifest_driven) =
             match manifest {
                 Some((man, mut live)) => {
-                    let covered_epoch = man.covered_epoch;
                     let covered_seq = man.covered_seq;
+                    manifest_epoch = Some(man.covered_epoch);
+                    let covered_epoch = replay_watermark(&*dev, &alloc, &mut buf, &log_segs, man.covered_epoch, covered_seq)?;
+                    if covered_epoch != man.covered_epoch {
+                        log::warn!(
+                            "engine: manifest generation {} covers epoch {} above the tail segment of epoch {covered_epoch}, \
+                             which holds records it does not cover; replaying that segment too",
+                            live.generation,
+                            man.covered_epoch,
+                        );
+                    }
                     let generation = live.generation;
                     let manifest_driven = man.runs.iter().all(|m| m.value_segs.is_some());
 
@@ -332,11 +341,8 @@ impl<D: BlockDevice> Engine<D> {
         let next_epoch = if max_epoch_all.is_none() && min_replay_epoch.is_none() {
             fresh_epoch_base()
         } else {
-            resume_next_epoch(max_epoch_all, min_replay_epoch).saturating_add(RECOVERY_EPOCH_GAP)
+            resume_next_epoch(max_epoch_all, manifest_epoch).saturating_add(RECOVERY_EPOCH_GAP)
         };
-        let flushed_epoch = min_replay_epoch.unwrap_or(0);
-        let tail_count = log_segs.iter().filter(|(_, ep, not_tail)| !*not_tail && *ep > flushed_epoch).count() as u64;
-        let tail_epoch_gap = next_epoch.saturating_sub(1).saturating_sub(flushed_epoch).saturating_sub(tail_count);
         let mut log = ValueLog::new(block_size, cfg.seg_blocks, next_seq, next_epoch);
         log.require_epoch_fence();
         {
@@ -366,7 +372,6 @@ impl<D: BlockDevice> Engine<D> {
             },
         );
         engine.mutable_tombstones = mutable_tombstones;
-        engine.tail_epoch_gap = (flushed_epoch, tail_epoch_gap);
         engine.refresh_data_reserve();
         engine.build_range_tombstone_max_trees();
         if winner_directory_requested() {
@@ -537,6 +542,33 @@ impl<D: BlockDevice> Engine<D> {
     pub(super) fn bump_mutable_generation(&mut self) {
         self.mutable_gen = self.mutable_gen.wrapping_add(1);
     }
+}
+
+/// The epoch from which recovery replays tail segments, given a manifest's
+/// covered epoch and sequence number. A flush before 0558 could record an
+/// epoch reserved for a value rewrite, above the segment the log still had
+/// open, so records appended to that segment after the flush sit below the
+/// covered epoch. Only the newest tail segment below it can hold such
+/// records; when it holds one newer than `covered_seq`, its epoch is
+/// returned instead.
+pub(crate) fn replay_watermark<D: BlockDevice>(
+    dev: &D,
+    alloc: &Allocator,
+    buf: &mut [u8],
+    log_segs: &[(SegmentId, u64, bool)],
+    covered_epoch: u64,
+    covered_seq: u64,
+) -> Result<u64, EngineError> {
+    let below = log_segs
+        .iter()
+        .filter(|(_, ep, not_tail)| !*not_tail && *ep < covered_epoch)
+        .max_by_key(|(_, ep, _)| *ep);
+    let Some(&(seg, epoch, _)) = below else {
+        return Ok(covered_epoch);
+    };
+    dev.read_at(alloc.segment_range(seg).0, buf)?;
+    let (_, recs) = replay_segment(buf)?;
+    Ok(if recs.iter().any(|(_, rec)| rec.seq > covered_seq) { epoch } else { covered_epoch })
 }
 
 fn fresh_epoch_base() -> u64 {

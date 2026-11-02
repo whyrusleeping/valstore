@@ -444,6 +444,20 @@ replay never needs a run entry's old log record to stay dead:
   flush before 0466) or any run entry while `covered_seq` is 0 appends a Delete
   record for it, like a forget of a memtable entry.
 
+A flush records as `covered_epoch` the epoch of the log segment open when it
+starts, or, with none open, the epoch just below the next one the log hands
+out, because records appended after the flush still go into the open segment.
+Value-log rewrites reserve the epochs of their value segments from the same
+counter, so the epoch just below the next one can sit above the open segment.
+Flushes before 0558 recorded that epoch, and recovery then skipped the open
+segment, losing records synced into it after the flush. For such a manifest,
+recovery reads the newest ordinary segment below `covered_epoch`. If it holds a
+record with `seq > covered_seq`, recovery replays (and keeps allocated) from that
+segment's epoch instead. Only that segment can hold such records, because the
+log gave every later segment an epoch above the reserved ones.
+`Engine::tail_epochs` counts the ordinary segments above the watermark, not
+reserved epochs, so a merge's reservations do not make a flush due.
+
 A `covered_seq` of 0 filters nothing, because a fence manifest written before any
 flush also records 0. The cluster packs
 `(hlc, writer)` so unsigned u128 order is the
