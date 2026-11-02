@@ -496,6 +496,44 @@ fn scan_over_runs_pages_and_is_bounded() {
 }
 
 #[test]
+fn scan_refuses_a_record_pointer_with_the_wrong_key_or_version() {
+    let cfg = Config { seg_blocks: 16, reserved_blocks: 0, ordering: Ordering::Sorted };
+    let opts = RunBuildOpts { block_target_bytes: 256, bloom_bits_per_key: 10, num_buckets: 16 };
+    for (case, reason) in [("key", "record key mismatch"), ("version", "record version mismatch")] {
+        for flushed in [false, true] {
+            let what = format!("{case} flushed={flushed}");
+            let mut e = Engine::create_prewiped(MemBlockDevice::new(BS, 4096), cfg);
+            e.put(b"alpha/first", b"value-alpha", 1).unwrap();
+            e.put(b"bravo/other", b"value-bravo", 2).unwrap();
+            let wrong = if case == "key" {
+                e.index.get(b"bravo/other").unwrap().ptr
+            } else {
+                let stale = e.index.get(b"alpha/first").unwrap().ptr;
+                e.put(b"alpha/first", b"value-alpha-2", 3).unwrap();
+                stale
+            };
+            e.sync().unwrap();
+            e.set_mutable_ptr_for_test(b"alpha/first", wrong);
+            if flushed {
+                e.flush(opts).unwrap();
+                assert_eq!(e.run_count(), 1, "{what}");
+            }
+            let refused = |r: Result<(), EngineError>| {
+                let err = r.expect_err(&what).to_string();
+                assert!(err.contains(reason), "{what}: {err}");
+            };
+            refused(e.get(b"alpha/first").map(drop));
+            refused(e.scan(None, None).map(drop));
+            refused(e.scan_bounded(None, None, 10, usize::MAX).map(drop));
+            refused(e.scan_bounded_versioned(None, None, 10, usize::MAX).map(drop));
+            let (rest, more) = e.scan_bounded_versioned(Some(b"b"), None, 10, usize::MAX).unwrap();
+            assert_eq!(rest, [(b"bravo/other".to_vec(), b"value-bravo".to_vec(), 2)], "{what}");
+            assert!(!more, "{what}");
+        }
+    }
+}
+
+#[test]
 fn scan_over_runs_honors_exclusive_upper_bound() {
     let dev = MemBlockDevice::new(BS, 4096);
     let cfg = Config {

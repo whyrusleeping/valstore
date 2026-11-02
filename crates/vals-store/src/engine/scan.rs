@@ -20,11 +20,7 @@ impl<D: BlockDevice> Engine<D> {
         max_bytes: usize,
     ) -> Result<(Vec<KvPair>, bool), EngineError> {
         let (entries, more) = self.scan_winners_page(lo, hi, max_entries, max_bytes)?;
-        let items = self.value_items(entries.iter().map(|(_, e)| &e.ptr))?;
-        let recs = self
-            .log
-            .plan_read_spans(&self.dev, &items)?
-            .execute_sync(&self.dev)?;
+        let recs = self.read_winner_records(&entries)?;
         let mut out = Vec::with_capacity(entries.len());
         for ((key, _), rec) in entries.into_iter().zip(recs) {
             if rec.kind == RecordKind::Put {
@@ -42,11 +38,7 @@ impl<D: BlockDevice> Engine<D> {
         max_bytes: usize,
     ) -> Result<VersionedScanPage, EngineError> {
         let (entries, more) = self.scan_winners_page(lo, hi, max_entries, max_bytes)?;
-        let items = self.value_items(entries.iter().map(|(_, e)| &e.ptr))?;
-        let recs = self
-            .log
-            .plan_read_spans(&self.dev, &items)?
-            .execute_sync(&self.dev)?;
+        let recs = self.read_winner_records(&entries)?;
         let mut out = Vec::with_capacity(entries.len());
         for ((key, e), rec) in entries.into_iter().zip(recs) {
             if rec.kind == RecordKind::Put {
@@ -54,6 +46,18 @@ impl<D: BlockDevice> Engine<D> {
             }
         }
         Ok((out, more))
+    }
+
+    /// Each winner's record, refused unless it carries the winner's key and
+    /// version (as `get` does), so a misdirected pointer is never served.
+    fn read_winner_records(&self, entries: &[(Vec<u8>, IndexEntry)]) -> Result<Vec<Record>, EngineError> {
+        let items = self.value_items(entries.iter().map(|(_, e)| &e.ptr))?;
+        let expected = |slot: usize| {
+            let (key, e) = &entries[slot];
+            (key.as_slice(), e.version)
+        };
+        let plan = self.log.plan_read_spans(&self.dev, &items)?;
+        Ok(plan.execute_sync_checked(&self.dev, &expected).map_err(LogError::from)?)
     }
 
     pub fn winner_count_page(

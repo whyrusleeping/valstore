@@ -520,10 +520,6 @@ impl SpanReadPlan {
         out
     }
 
-    pub fn execute_sync<D: BlockDevice>(&self, dev: &D) -> Result<Vec<Record>, LogError> {
-        Ok(self.execute_sync_inner(dev, None::<&UncheckedSpan>)?)
-    }
-
     pub fn execute_sync_checked<'k, D, F>(
         &self,
         dev: &D,
@@ -533,18 +529,7 @@ impl SpanReadPlan {
         D: BlockDevice,
         F: Fn(usize) -> (&'k [u8], u128),
     {
-        self.execute_sync_inner(dev, Some(expected))
-    }
-
-    fn execute_sync_inner<'k, D, F>(
-        &self,
-        dev: &D,
-        expected: Option<&F>,
-    ) -> Result<Vec<Record>, SpanReadError>
-    where
-        D: BlockDevice,
-        F: Fn(usize) -> (&'k [u8], u128),
-    {
+        let expected = Some(expected);
         let mut bufs: Vec<Vec<u8>> = self
             .spans
             .iter()
