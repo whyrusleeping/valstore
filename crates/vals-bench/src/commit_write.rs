@@ -1,7 +1,7 @@
 use super::*;
 
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// One node's shards on one device, reduced to the engine commit path (task 0546).
 ///
@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 /// in for the node's merge, flush, cover-scan and verify traffic. Writers cycle
 /// over `VALS_BENCH_KEYSPACE` keys each (default 1M), so the memtable stays
 /// bounded while the value log keeps appending; a per-10 s table shows when the
-/// drive reaches steady state.
+/// drive reaches steady state. `VALS_BENCH_FLUSH_DEPTH=n` allows up to `n`
+/// flushes in flight; `VALS_BENCH_FLUSH=0` skips them (not durable; a ceiling).
 pub(super) fn workload_commitwrite(
     backend: &str,
     path: &str,
@@ -32,7 +33,19 @@ pub(super) fn workload_commitwrite(
         .and_then(|v| v.parse().ok())
         .unwrap_or(1_000_000);
     let blocks = device_blocks(per_thread, vsize + 48);
-    let domain = Arc::new(FlushDomain::default());
+    let domain = Arc::new(FlushDomain {
+        depth: std::env::var("VALS_BENCH_FLUSH_DEPTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1),
+        enabled: std::env::var("VALS_BENCH_FLUSH").map_or(true, |v| v != "0"),
+        ..FlushDomain::default()
+    });
+    println!(
+        "  flush depth {}, flush {}",
+        domain.depth,
+        if domain.enabled { "on" } else { "off" }
+    );
     #[cfg(feature = "spdk")]
     let controller = (backend == "spdk").then(|| {
         vals_spdk::spdk::SpdkController::attach(&vals_spdk::spdk::SpdkConfig {
@@ -186,7 +199,7 @@ pub(super) fn workload_commitwrite(
     }
     println!(
         "  device flushes: {}",
-        domain.completed.load(AtomicOrdering::Relaxed)
+        domain.flushes.load(AtomicOrdering::Relaxed)
     );
     for (name, mut v) in [
         ("apply", apply),
@@ -244,11 +257,16 @@ fn background_io(
     }
 }
 
+/// Up to `depth` device flushes in flight; a waiter is covered by any flush
+/// numbered above the claim count it read after its prepare.
 #[derive(Default)]
 struct FlushDomain {
     claimed: AtomicU64,
     completed: AtomicU64,
-    lock: Mutex<()>,
+    flushes: AtomicU64,
+    inflight: std::sync::atomic::AtomicUsize,
+    depth: usize,
+    enabled: bool,
 }
 
 struct WriterTimes {
@@ -292,14 +310,21 @@ fn run_writer(
         e.sync_prepare().expect("sync_prepare");
         let t2 = Instant::now();
         let need = domain.claimed.load(AtomicOrdering::SeqCst) + 1;
-        while domain.completed.load(AtomicOrdering::SeqCst) < need {
-            if let Ok(_g) = domain.lock.try_lock() {
-                if domain.completed.load(AtomicOrdering::SeqCst) >= need {
-                    break;
+        while domain.enabled && domain.completed.load(AtomicOrdering::SeqCst) < need {
+            let n = domain.inflight.load(AtomicOrdering::SeqCst);
+            if n < domain.depth.max(1)
+                && domain
+                    .inflight
+                    .compare_exchange(n, n + 1, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
+                    .is_ok()
+            {
+                if domain.completed.load(AtomicOrdering::SeqCst) < need {
+                    let number = domain.claimed.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                    e.device().flush().expect("device flush");
+                    domain.completed.fetch_max(number, AtomicOrdering::SeqCst);
+                    domain.flushes.fetch_add(1, AtomicOrdering::SeqCst);
                 }
-                let number = domain.claimed.fetch_add(1, AtomicOrdering::SeqCst) + 1;
-                e.device().flush().expect("device flush");
-                domain.completed.fetch_max(number, AtomicOrdering::SeqCst);
+                domain.inflight.fetch_sub(1, AtomicOrdering::SeqCst);
             } else {
                 std::hint::spin_loop();
             }
