@@ -9,8 +9,8 @@ fn failed_after_gc_drops(dropped: Vec<(Vec<u8>, u128)>, source: EngineError) -> 
 }
 
 impl<D: BlockDevice> Engine<D> {
-    pub(super) fn protected_segments(&self) -> std::collections::HashSet<SegmentId> {
-        let mut keep: std::collections::HashSet<SegmentId> = std::collections::HashSet::new();
+    fn retained_segments(&self) -> SegmentSet {
+        let mut keep = SegmentSet::with_capacity(self.alloc.num_segments());
         for or in &self.runs {
             if let Some(vs) = &or.meta.value_segs {
                 keep.extend(vs.iter().copied());
@@ -26,17 +26,34 @@ impl<D: BlockDevice> Engine<D> {
         }
         keep.extend(self.log.tail_segs_through(u64::MAX));
         keep.extend(self.flush_value_segs.iter().copied());
+        keep
+    }
+
+    pub(super) fn protected_segments(&self) -> SegmentSet {
+        let mut keep = self.retained_segments();
         self.for_each_mutable_value_segment(&mut |seg| {
                 keep.insert(seg);
             });
         keep
     }
 
-    pub(super) fn referenced_segments(&self) -> Option<std::collections::HashSet<SegmentId>> {
+    #[cfg(test)]
+    pub(super) fn referenced_segments(&self) -> Option<SegmentSet> {
         if self.runs.iter().any(|or| or.meta.value_segs.is_none()) {
             return None;
         }
         Some(self.protected_segments())
+    }
+
+    pub(super) fn drop_mutable_referenced(&self, segs: &mut Vec<SegmentId>) {
+        if segs.is_empty() {
+            return;
+        }
+        let mut unreferenced: SegmentSet = segs.iter().copied().collect();
+        self.for_each_mutable_value_segment(&mut |seg| {
+                unreferenced.remove(seg);
+            });
+        segs.retain(|seg| unreferenced.contains(seg));
     }
 
     pub(super) fn reclaim_orphan_segments(&mut self) -> usize {
@@ -47,23 +64,21 @@ impl<D: BlockDevice> Engine<D> {
         if self.poisoned || self.flush_in_flight || self.compact_in_flight {
             return 0;
         }
-        let Some(keep) = self.referenced_segments() else {
+        if self.runs.iter().any(|or| or.meta.value_segs.is_none()) {
             return 0;
-        };
-        let mut freed = 0usize;
-        for seg in self.alloc.used_list() {
-            if !keep.contains(&seg) {
-                self.alloc
-                    .free(seg)
-                    .expect("reclaim_orphan_segments: freeing an unreferenced segment");
-                freed += 1;
-            }
         }
-        if freed > 0 {
+        let mut orphans = self.alloc.used_outside(&self.retained_segments());
+        self.drop_mutable_referenced(&mut orphans);
+        for &seg in &orphans {
+            self.alloc
+                .free(seg)
+                .expect("reclaim_orphan_segments: freeing an unreferenced segment");
+        }
+        if !orphans.is_empty() {
             self.bump_storage_generation();
             self.refresh_data_reserve();
         }
-        freed
+        orphans.len()
     }
 
     pub fn forget_keys(

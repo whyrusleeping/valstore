@@ -1030,6 +1030,28 @@ they are load-bearing and worth recording. Full rationale is in `ARCHITECTURE.md
   position of its **oldest input**, preserving recency order for un-merged older runs;
   `lookup_runs` resolves by `argmax(version)`, so a subset merge stays LWW-correct and
   read-transparent (no leaf changes).
+- **Merge commit on the serving shard** (`compact_commit`, task 0559). The commit
+  does work in proportion to the merge, not to the rest of the engine, except
+  for two passes:
+  - **Ownership.** A plan takes a ticket when it reserves its output segments.
+    The commit refuses a written merge whose ticket is not the in-flight plan's,
+    for example one whose plan was aborted, without touching the newer plan's
+    segments. It no longer builds the engine's whole reference set to check
+    that the outputs are unreferenced. Debug builds still check this.
+  - **Orphan reclaim.** The sweep keeps the same reference set as before. It
+    marks the run, manifest, pinned, open-log, tail and in-flight-flush
+    references in a bitmap over the allocator's segments and compares the
+    bitmap with the allocator word by word. It walks the memtable only when
+    some allocated segment is outside that set, and then only to check those
+    segments. The co-compaction dead-segment check works the same way.
+  - **What still scales.** Publishing the manifest rewrites every run's
+    value-segment list, and the bitmap pass touches each reference once. The
+    memtable walk is bounded by the memtable's size.
+  - **Measured** (`small_merge_commit_cost_vs_unaffected_state`, release build,
+    in-memory device, a 2-run merge with about 105 runs alongside): 217K
+    value-segment references and a 1M-entry memtable took 61 ms before and
+    6.8 ms after; with an empty memtable it took 22 ms before and 2.9 ms after.
+    Most of the remaining time is manifest publication.
 - **Bounded merges and the frozen top tier** (`engine/merge.rs`
   `select_recurring_merge`, task 0381). The rules:
   - **Cap.** No recurring or forced merge reads more than `VALS_MERGE_INPUT_CAP_BYTES`

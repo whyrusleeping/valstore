@@ -1581,6 +1581,7 @@ use super::*;
 
 mod attribution;
 mod basic;
+mod commit_scale;
 mod crash_points;
 mod flush;
 mod frozen_garbage;

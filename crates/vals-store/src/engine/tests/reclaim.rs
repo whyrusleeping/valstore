@@ -33,6 +33,43 @@ fn compact_commit_rejects_already_freed_input_before_install() {
 }
 
 #[test]
+fn compact_commit_rejects_a_written_merge_of_an_aborted_plan_and_leaves_the_next_plan_intact() {
+    if co_compact_env(false) { return; }
+    std::env::set_var("VALS_MERGE_TIER_MIN_K", "2");
+    let cfg = Config { seg_blocks: 4, reserved_blocks: 0, ordering: Ordering::Sorted };
+    let opts = RunBuildOpts::default();
+    let mut e = Engine::create_prewiped(MemBlockDevice::new(BS, 4096), cfg);
+    e.put(b"a", b"one", 1).unwrap();
+    run_flush(&mut e, opts).unwrap();
+    e.put(b"b", b"two", 2).unwrap();
+    run_flush(&mut e, opts).unwrap();
+
+    let plan = e.compact_plan(opts, None).unwrap().unwrap();
+    let dev = Arc::new(e.device().sibling().unwrap());
+    let stale = vals_rt::block_on(compact_and_write(plan, dev.clone()), || {}).unwrap();
+    let stale_outputs = stale.output_segments();
+    e.free_compact_segs(&stale_outputs);
+    assert!(matches!(e.compact_commit(stale), Err(EngineError::CompactionConflict)), "commit after abort");
+
+    let plan = e.compact_plan(opts, None).unwrap().unwrap();
+    assert!(plan.segments().iter().any(|seg| stale_outputs.contains(seg)), "test premise: the next plan reuses the aborted plan's segments");
+    let abandoned = vals_rt::block_on(compact_and_write(plan, dev.clone()), || {}).unwrap();
+    assert!(matches!(e.compact_plan(opts, None), Ok(None)), "one merge in flight");
+    e.free_compact_segs(&[]);
+
+    let plan = e.compact_plan(opts, None).unwrap().unwrap();
+    let newest = vals_rt::block_on(compact_and_write(plan, dev), || {}).unwrap();
+    assert!(matches!(e.compact_commit(abandoned), Err(EngineError::CompactionConflict)), "commit while a newer plan is in flight");
+    assert!(e.compact_in_flight(), "a stale commit leaves the newer plan in flight");
+    assert!(newest.output_segments().iter().all(|seg| e.seg_allocated_for_test(*seg)), "a stale commit frees none of the newer plan's segments");
+    let stats = e.compact_commit(newest).unwrap();
+    assert_eq!(stats.runs_merged, 2);
+    assert!(!e.compact_in_flight());
+    assert_eq!(e.get(b"a").unwrap().as_deref(), Some(&b"one"[..]));
+    assert_eq!(e.get(b"b").unwrap().as_deref(), Some(&b"two"[..]));
+}
+
+#[test]
 fn hot_key_orphan_vlog_segments_freed_by_merge() {
     if co_compact_env(true) { return; }
     std::env::set_var("VALS_MERGE_TIER_MIN_K", "2");

@@ -170,6 +170,23 @@ impl Allocator {
         v
     }
 
+    pub fn used_outside(&self, keep: &SegmentSet) -> Vec<SegmentId> {
+        let mut out = Vec::new();
+        let last = self.free.len().saturating_sub(1);
+        for (w, &free) in self.free.iter().enumerate() {
+            let valid = match self.num_segments % 64 {
+                rem if w == last && rem != 0 => (1u64 << rem) - 1,
+                _ => u64::MAX,
+            };
+            let mut bits = !free & valid & !keep.word(w);
+            while bits != 0 {
+                out.push(SegmentId(w as u64 * 64 + bits.trailing_zeros() as u64));
+                bits &= bits - 1;
+            }
+        }
+        out
+    }
+
     pub fn allocate(&mut self) -> Option<SegmentId> {
         if self.free_count == 0 {
             return None;
@@ -245,10 +262,118 @@ impl Allocator {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SegmentSet {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl SegmentSet {
+    pub fn with_capacity(num_segments: u64) -> Self {
+        SegmentSet { words: vec![0; num_segments.div_ceil(64) as usize], len: 0 }
+    }
+
+    fn word(&self, w: usize) -> u64 {
+        self.words.get(w).copied().unwrap_or(0)
+    }
+
+    pub fn insert(&mut self, seg: SegmentId) -> bool {
+        let (w, bit) = ((seg.0 / 64) as usize, 1u64 << (seg.0 % 64));
+        if w >= self.words.len() {
+            self.words.resize(w + 1, 0);
+        }
+        let fresh = self.words[w] & bit == 0;
+        self.words[w] |= bit;
+        self.len += fresh as usize;
+        fresh
+    }
+
+    pub fn remove(&mut self, seg: SegmentId) -> bool {
+        let (w, bit) = ((seg.0 / 64) as usize, 1u64 << (seg.0 % 64));
+        let present = self.word(w) & bit != 0;
+        if present {
+            self.words[w] &= !bit;
+            self.len -= 1;
+        }
+        present
+    }
+
+    pub fn contains(&self, seg: &SegmentId) -> bool {
+        self.word((seg.0 / 64) as usize) & (1u64 << (seg.0 % 64)) != 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = SegmentId> + '_ {
+        self.words.iter().enumerate().flat_map(|(w, &word)| {
+            let mut bits = word;
+            std::iter::from_fn(move || {
+                if bits == 0 {
+                    return None;
+                }
+                let bit = bits.trailing_zeros() as u64;
+                bits &= bits - 1;
+                Some(SegmentId(w as u64 * 64 + bit))
+            })
+        })
+    }
+}
+
+impl Extend<SegmentId> for SegmentSet {
+    fn extend<I: IntoIterator<Item = SegmentId>>(&mut self, iter: I) {
+        for seg in iter {
+            self.insert(seg);
+        }
+    }
+}
+
+impl FromIterator<SegmentId> for SegmentSet {
+    fn from_iter<I: IntoIterator<Item = SegmentId>>(iter: I) -> Self {
+        let mut set = SegmentSet::default();
+        set.extend(iter);
+        set
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn segment_set_and_used_outside_match_a_reference() {
+        let mut a = Allocator::new(130 * 4, 4, 0);
+        let mut used = Vec::new();
+        for _ in 0..130 {
+            used.push(a.allocate().unwrap());
+        }
+        for s in [0u64, 5, 63, 64, 100, 128] {
+            a.free(SegmentId(s)).unwrap();
+        }
+        used.retain(|s| !a.is_free(*s));
+        let mut keep = SegmentSet::with_capacity(16);
+        let mut reference = HashSet::new();
+        for s in [1u64, 1, 63, 65, 127, 129, 4000] {
+            assert_eq!(keep.insert(SegmentId(s)), reference.insert(SegmentId(s)));
+        }
+        assert!(keep.remove(SegmentId(4000)) && reference.remove(&SegmentId(4000)));
+        assert!(!keep.remove(SegmentId(4000)) && !keep.remove(SegmentId(9999)));
+        assert_eq!(keep.len(), reference.len());
+        let mut iterated: Vec<_> = keep.iter().collect();
+        let mut expected: Vec<_> = reference.iter().copied().collect();
+        expected.sort();
+        iterated.sort();
+        assert_eq!(iterated, expected);
+        let expected_orphans: Vec<_> = used.iter().copied().filter(|s| !reference.contains(s)).collect();
+        assert_eq!(a.used_outside(&keep), expected_orphans);
+        assert!(a.used_outside(&keep).iter().all(|s| s.0 < 130), "no padding bits");
+    }
 
     #[test]
     fn dealloc_barrier_excludes_later_frees_and_reuse() {

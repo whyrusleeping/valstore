@@ -253,6 +253,7 @@ pub struct CompactPlan<D: BlockDevice> {
     rt_floor: u64,
     rt_accounted_seq: u64,
     rt_collected: Vec<RtRecord>,
+    ticket: u64,
 }
 
 impl<D: BlockDevice> CompactPlan<D> {
@@ -305,6 +306,7 @@ impl<D: BlockDevice> CompactPlan<D> {
             rt_floor: output.rt.floor,
             rt_accounted_seq: output.rt.accounted_seq,
             rt_collected: output.rt.collected,
+            ticket: 0,
         }
     }
 
@@ -383,6 +385,7 @@ pub struct WrittenCompact<D: BlockDevice> {
     rt_dominated: usize,
     rt_collected: Vec<RtRecord>,
     covered_dropped: u64,
+    ticket: u64,
 }
 
 #[cfg(test)]
@@ -722,6 +725,7 @@ async fn compact_and_write_inner<D: BlockDevice>(
         rt_dominated,
         rt_collected: std::mem::take(&mut plan.rt_collected),
         covered_dropped,
+        ticket: plan.ticket,
     })
 }
 
@@ -1717,8 +1721,8 @@ impl<D: BlockDevice> Engine<D> {
             self.pressure_infeasible_streak = 0;
         }
         if vlog_gc_enabled() {
-            if let Some(plan) = self.plan_aged_vlog_gc(opts) {
-                self.compact_in_flight = true;
+            if let Some(mut plan) = self.plan_aged_vlog_gc(opts) {
+                plan.ticket = self.begin_compaction();
                 self.pressure_infeasible_streak = 0;
                 return Some(plan);
             }
@@ -2056,7 +2060,7 @@ impl<D: BlockDevice> Engine<D> {
         }
         let gc_collect_before = if shadow.as_ref().is_some_and(|s| !s.complete) { None } else { gc_collect_before };
         let at_floor = self.at_maintenance_floor();
-        self.compact_in_flight = true;
+        let ticket = self.begin_compaction();
         self.pressure_infeasible_streak = 0;
 
         if let Some(sources) = &shadow {
@@ -2093,7 +2097,14 @@ impl<D: BlockDevice> Engine<D> {
             },
         );
         plan.shadow = shadow;
+        plan.ticket = ticket;
         Ok(Some(plan))
+    }
+
+    fn begin_compaction(&mut self) -> u64 {
+        self.compact_in_flight = true;
+        self.compact_ticket += 1;
+        self.compact_ticket
     }
 
     fn shadow_sources(
@@ -2588,12 +2599,14 @@ impl<D: BlockDevice> Engine<D> {
                 || !written.forget.is_empty()
                 || written.covered_dropped > 0
                 || !written.rt_collected.is_empty());
+        if !self.compact_in_flight || written.ticket != self.compact_ticket {
+            return Err(EngineError::CompactionConflict);
+        }
         let reserved = written.output_segments();
         if self.poisoned {
             self.free_compact_segs(&reserved);
             return Err(EngineError::Poisoned);
         }
-        let protected = self.protected_segments();
         let mut input_handles = std::collections::HashSet::new();
         let inputs_current = !written.merged_inputs.is_empty()
             && written.merged_inputs.iter().all(|meta| {
@@ -2612,9 +2625,14 @@ impl<D: BlockDevice> Engine<D> {
                     && self.runs.iter().any(|or| or.meta == *meta)
             });
         let mut output_segs = std::collections::HashSet::new();
-        let outputs_owned = reserved.iter().all(|seg| {
-            output_segs.insert(*seg) && !self.alloc.is_free(*seg) && !protected.contains(seg)
-        });
+        let outputs_owned = reserved.iter().all(|seg| output_segs.insert(*seg) && !self.alloc.is_free(*seg));
+        debug_assert!(
+            !outputs_owned || {
+                let protected = self.protected_segments();
+                reserved.iter().all(|seg| !protected.contains(seg))
+            },
+            "a compaction's reserved output segment is referenced elsewhere"
+        );
         let sources_current = written
             .shadow_sources
             .iter()
@@ -2630,13 +2648,7 @@ impl<D: BlockDevice> Engine<D> {
         let rebuild_covered = written.key_sink.as_ref().is_some_and(|s| self.key_filter.owns_rebuild(s))
             || self.key_filter_rebuild_inputs_covered(&written.merged_inputs);
 
-        let survivor_metas: Vec<RunMeta> = self
-            .runs
-            .iter()
-            .filter(|or| !is_input(or))
-            .map(|or| or.meta.clone())
-            .collect();
-        let runs_merged = self.runs.len() - survivor_metas.len();
+        let runs_merged = self.runs.iter().filter(|or| is_input(or)).count();
 
         let meta = RunMeta {
             handle: written.handle.clone(),
@@ -2696,7 +2708,7 @@ impl<D: BlockDevice> Engine<D> {
             written.parts,
         );
 
-        let mut run_metas: Vec<RunMeta> = Vec::with_capacity(1 + survivor_metas.len());
+        let mut run_metas: Vec<RunMeta> = Vec::with_capacity(1 + self.runs.len() - runs_merged);
         let mut inserted = false;
         for or in &self.runs {
             if is_input(or) {
@@ -2749,7 +2761,7 @@ impl<D: BlockDevice> Engine<D> {
             note_commit_forget_failures(forget_failures, &e);
         }
         self.append_tail_forget_deletes(&written.tail_forgets);
-        let mut new_runs: Vec<OpenRun<D>> = Vec::with_capacity(1 + survivor_metas.len());
+        let mut new_runs: Vec<OpenRun<D>> = Vec::with_capacity(1 + self.runs.len() - runs_merged);
         let mut removed: Vec<(crate::run::RunHandle, u64)> = Vec::new();
         let mut merged_slot: Option<(RunMeta, DeviceRun<D>)> = Some((meta, run));
         let mut output_rts = Some(std::mem::take(&mut written.rts));
@@ -2803,36 +2815,24 @@ impl<D: BlockDevice> Engine<D> {
                 let _ = self.alloc.free(*seg);
             }
             let inputs_known = written.merged_inputs.iter().all(|m| m.value_segs.is_some());
-            let survivors_known = survivor_metas.iter().all(|m| m.value_segs.is_some());
+            let survivors_known = self.runs.iter().all(|or| or.meta.value_segs.is_some());
             if inputs_known && survivors_known {
-                let mut keep: std::collections::HashSet<SegmentId> =
-                    std::collections::HashSet::new();
-                for m in &survivor_metas {
-                    if let Some(vs) = &m.value_segs {
-                        keep.extend(vs.iter().copied());
-                    }
-                    keep.extend(m.handle.segs.iter().copied());
+                let mut keep = SegmentSet::with_capacity(self.alloc.num_segments());
+                for or in &self.runs {
+                    keep.extend(or.meta.value_segs.iter().flatten().copied());
+                    keep.extend(or.meta.handle.segs.iter().copied());
                 }
-                keep.extend(written.value_segs.iter().copied());
-                keep.extend(written.handle.segs.iter().copied());
                 keep.extend(self.flush_value_segs.iter().copied());
                 if let Some(open) = self.log.open_segment() {
                     keep.insert(open);
                 }
-                self.for_each_mutable_value_segment(&mut |seg| {
-                        keep.insert(seg);
-                    });
-                let mut dead: std::collections::HashSet<SegmentId> =
-                    std::collections::HashSet::new();
-                for m in &written.merged_inputs {
-                    if let Some(vs) = &m.value_segs {
-                        for s in vs {
-                            if !keep.contains(s) {
-                                dead.insert(*s);
-                            }
-                        }
-                    }
-                }
+                let mut dead: Vec<SegmentId> = written
+                    .merged_inputs
+                    .iter()
+                    .flat_map(|m| m.value_segs.iter().flatten().copied())
+                    .filter(|seg| keep.insert(*seg))
+                    .collect();
+                self.drop_mutable_referenced(&mut dead);
                 for seg in dead {
                     if self.alloc.free(seg).is_ok() {
                         segments_freed += 1;

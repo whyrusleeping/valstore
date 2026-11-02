@@ -45,6 +45,7 @@ impl<D: BlockDevice> Engine<D> {
             flush_cleanup: Vec::new(),
             flush_value_segs: std::collections::HashSet::new(),
             compact_in_flight: false,
+            compact_ticket: 0,
             runs_removed_epoch: 0,
             compact_cursor: SegmentId(0),
             maint_reserve_enabled: false,

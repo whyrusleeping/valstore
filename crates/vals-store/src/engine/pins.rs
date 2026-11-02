@@ -132,7 +132,7 @@ impl<D: BlockDevice> Engine<D> {
         self.alloc.blocks_per_segment() * self.block_size as u64
     }
 
-    pub(super) fn extend_pinned_segments(&self, keep: &mut std::collections::HashSet<SegmentId>) {
+    pub(super) fn extend_pinned_segments(&self, keep: &mut impl Extend<SegmentId>) {
         for (handle, _) in &self.run_pins.borrow().retired {
             keep.extend(handle.segs.iter().copied());
         }

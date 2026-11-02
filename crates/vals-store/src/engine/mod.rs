@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use vals_spdk::{AsyncRead, BlockDevice, BlockError, WriteHandle};
 
-use crate::alloc::{Allocator, SegmentId};
+use crate::alloc::{Allocator, SegmentId, SegmentSet};
 use crate::index::{new_index, FxBuildHasher, Index, IndexEntry, PackedEntry};
 use crate::manifest::{Manifest, RunMeta};
 use crate::range_tombstone::{FragmentCapExceeded, FragmentSet, MaxTree, RtRecord};
@@ -541,6 +541,7 @@ pub struct Engine<D: BlockDevice> {
     flush_cleanup: Vec<SnapshotEntry>,
     flush_value_segs: std::collections::HashSet<SegmentId>,
     compact_in_flight: bool,
+    compact_ticket: u64,
     runs_removed_epoch: u64,
     compact_cursor: SegmentId,
     maint_reserve_enabled: bool,
