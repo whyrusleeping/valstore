@@ -203,6 +203,12 @@ The protocol hello requires an exact 14-byte body (`crates/vals-client/src/proto
 
 These are especially worth cleaning up while task 0232 is investigating heap corruption.
 
+> **Scratch item resolved by task 0550 (after `ba4694a`):** pooled heap
+> scratch buffers zero-fill bytes the first time they are exposed and keep
+> them initialized across reuse; DMA scratch comes from `spdk_dma_zmalloc`;
+> the value log's synchronous read buffers are zero-filled. Miri runs the heap
+> scratch test (fresh, reused, grown, failed and partial reads) cleanly.
+
 ## Productization, documentation, and cleanup
 
 ### R15 — Define and shrink the supported product/API surface (P1/P2)

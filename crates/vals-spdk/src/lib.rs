@@ -499,7 +499,7 @@ impl<T: AsyncRead + ?Sized> AsyncRead for std::sync::Arc<T> {
 pub struct Scratch(pub(crate) ScratchKind);
 
 pub(crate) enum ScratchKind {
-    Heap(Vec<u8>),
+    Heap { buf: Vec<u8>, len: usize },
     #[cfg(feature = "spdk")]
     Dma {
         ptr: *mut u8,
@@ -518,27 +518,27 @@ thread_local! {
 impl Scratch {
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         match &mut self.0 {
-            ScratchKind::Heap(v) => v.as_mut_slice(),
+            ScratchKind::Heap { buf, len } => &mut buf[..*len],
             #[cfg(feature = "spdk")]
-            // SAFETY: `ptr` is a live `len`-byte DMA allocation owned by this
-            // Scratch until released; `u8` has no invalid bit patterns.
+            // SAFETY: `ptr` is a live `cap`-byte DMA allocation owned by this
+            // Scratch until released, and `len <= cap`. Every byte is
+            // initialized: `spdk_dma_zmalloc` zeroes the allocation, and reuse
+            // from the pool only exposes bytes that were zeroed or since
+            // written by the device or through this slice.
             ScratchKind::Dma { ptr, len, .. } => unsafe {
                 std::slice::from_raw_parts_mut(*ptr, *len)
             },
         }
     }
 
-    #[allow(clippy::uninit_vec)]
     pub(crate) fn heap_take(len: usize) -> Scratch {
-        let mut v = HEAP_SCRATCH_POOL
+        let mut buf = HEAP_SCRATCH_POOL
             .with(|p| p.borrow_mut().pop())
             .unwrap_or_default();
-        v.clear();
-        v.reserve(len);
-        // SAFETY: `len` bytes reserved; `u8` has no invalid patterns; the read
-        // overwrites all `len` bytes before decode.
-        unsafe { v.set_len(len) };
-        Scratch(ScratchKind::Heap(v))
+        if buf.len() < len {
+            buf.resize(len, 0);
+        }
+        Scratch(ScratchKind::Heap { buf, len })
     }
 
     pub(crate) fn heap_release(buf: Scratch) {
@@ -556,8 +556,8 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         match &mut self.0 {
-            ScratchKind::Heap(v) => {
-                let v = std::mem::take(v);
+            ScratchKind::Heap { buf, .. } => {
+                let v = std::mem::take(buf);
                 HEAP_SCRATCH_POOL.with(|p| {
                     let mut pool = p.borrow_mut();
                     if pool.len() < SCRATCH_POOL_MAX {
@@ -575,7 +575,7 @@ impl std::ops::Deref for Scratch {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         match &self.0 {
-            ScratchKind::Heap(v) => v,
+            ScratchKind::Heap { buf, len } => &buf[..*len],
             #[cfg(feature = "spdk")]
             // SAFETY: see `as_mut_slice`.
             ScratchKind::Dma { ptr, len, .. } => unsafe { std::slice::from_raw_parts(*ptr, *len) },
@@ -1027,6 +1027,51 @@ mod tests {
         HEAP_SCRATCH_POOL.with(|pool| assert!(pool.borrow().is_empty()));
         drop(scratch);
         HEAP_SCRATCH_POOL.with(|pool| assert_eq!(pool.borrow().len(), 1));
+    }
+
+    #[test]
+    fn heap_scratch_bytes_are_initialized_without_a_successful_read() {
+        HEAP_SCRATCH_POOL.with(|pool| pool.borrow_mut().clear());
+        let dev = MemBlockDevice::new(BS, 2);
+        dev.write_at(0, &[0xA5; BS]).unwrap();
+        let sum = |s: &Scratch| s.iter().map(|&b| b as u64).sum::<u64>();
+
+        let fresh = dev.take_scratch(BS);
+        assert_eq!(fresh.len(), BS);
+        assert_eq!(sum(&fresh), 0);
+        drop(fresh);
+
+        let mut reused = dev.take_scratch(BS / 2);
+        assert_eq!(reused.len(), BS / 2);
+        reused.as_mut_slice().fill(7);
+        drop(reused);
+
+        let mut grown = dev.take_scratch(3 * BS);
+        assert_eq!(grown.len(), 3 * BS);
+        assert!(dev.read_at(0, grown.as_mut_slice()).is_err());
+        assert_eq!(sum(&grown), 7 * (BS / 2) as u64);
+        drop(grown);
+
+        let mut partial = dev.take_scratch(2 * BS);
+        let mut missing = [0u8; BS];
+        let mut ops = [
+            ReadOp {
+                lba: 0,
+                buf: &mut partial.as_mut_slice()[..BS],
+            },
+            ReadOp {
+                lba: 9,
+                buf: &mut missing,
+            },
+        ];
+        assert!(dev.read_batch(&mut ops).is_err());
+        assert_eq!(sum(&partial), 0xA5 * BS as u64);
+
+        let shrunk = dev.take_scratch(BS);
+        assert_eq!(shrunk.len(), BS);
+        assert_eq!(sum(&shrunk), 0);
+        drop(shrunk);
+        drop(partial);
     }
 
     #[test]

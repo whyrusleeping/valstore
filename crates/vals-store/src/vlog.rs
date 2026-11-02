@@ -52,15 +52,8 @@ pub fn vlog_stall_totals() -> (u64, u64) {
 }
 
 #[inline]
-#[allow(clippy::uninit_vec)] // deliberate: see SAFETY — the device read fills all
 pub(crate) fn io_buf(len: usize) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(len);
-    // SAFETY: `with_capacity(len)` reserved exactly `len` bytes. `u8` has no
-    // invalid bit patterns, and the contract above guarantees the device read
-    // overwrites all `len` bytes before any read of `buf` (on read error the
-    // caller returns before decoding) — so no uninitialized byte is ever read.
-    unsafe { buf.set_len(len) };
-    buf
+    vec![0u8; len]
 }
 
 const REC_MAGIC: u32 = 0x324C_4156;

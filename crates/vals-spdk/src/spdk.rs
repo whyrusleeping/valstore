@@ -103,6 +103,8 @@ mod ffi {
             ctx: *mut c_void,
         ) -> c_int;
         pub fn vals_spdk_close(dev: *mut vals_spdk_dev);
+        /// Returns zeroed DMA memory (`spdk_dma_zmalloc`); DMA [`crate::Scratch`]
+        /// relies on every byte being initialized.
         pub fn vals_spdk_dma_alloc(nbytes: u64) -> *mut c_void;
         pub fn vals_spdk_dma_free(p: *mut c_void);
     }
