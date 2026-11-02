@@ -507,6 +507,13 @@ same value as `batch_apply_gate`. Raising a client's pipeline depth requires
 raising this gate as well, with room for fanout and mirror work. A larger limit also increases staged memory and tail latency; it does not
 change the one-Flush-per-controller rule.
 
+A device-durable request normally holds its permit until it is acknowledged.
+On a backend whose flushes complete off the serving thread
+(`BlockDevice::flush_completes_off_thread`, today the file backend; task 0523),
+the request gives its permit back once its writes are applied, before it waits
+for the group commit, so writes arriving during one sync can join the next
+instead of getting `Busy`. SPDK keeps the permit until the ack.
+
 ## Off-core maintenance I/O pacing
 
 Off-core maintenance — flush run builds and run-merge folds — competes with

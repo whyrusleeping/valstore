@@ -176,6 +176,16 @@ round (new prepare and a new flush claim). Orphaned in-flight flushes are
 tracked and reaped by the shard. `finalize_shutdown` drains them, bounded to
 5 s, before the devices are closed.
 
+On the file backend (task 0523), `FileBlockDevice::submit_flush` runs
+`fdatasync` on a `vals-fsync` helper thread shared by the zone file's handles.
+Flushes queued while one runs share the next `fdatasync`. The leader registers
+a waker instead of polling the device. When the sync completes, the waker
+signals an eventfd (a kqueue user event on macOS) that wakes the shard out of
+`epoll`/`kqueue`, so the shard serves
+reads and other writes while the sync runs. The ack ordering is unchanged: a
+request is acknowledged only after the flush that covers its writes completes,
+and a failed `fdatasync` fails every request joined to it.
+
 Measured (task 0303 AB01, 2026-09-24, two-node RF2/W2 device-sync on a server-bound dual-link
 client, six attempts in GNNGGN order, all passing the correctness gates): about 2.7× fewer device
 flushes for the same group-commit count, response-ready 25–27 → 19–22 ms, and +14.2 % ACK KV/s

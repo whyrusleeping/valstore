@@ -1,16 +1,17 @@
 ---
 id: "0539"
 title: Describe 0523's off-thread file sync and gate-permit release in ARCHITECTURE.md, batch-writes.md and backpressure.md
-status: todo
+status: done
 priority: 3
 created: "2026-10-29"
-updated: "2026-10-29"
+updated: "2026-11-02"
 depends_on:
     - "0538"
 spec_refs: []
 ---
 
 ## Description
+
 Follow-up from 0523 (commit 3d667b1). 0523 updated docs/benchmarks.md, configuration.md and embedding.md, but ARCHITECTURE.md, docs/batch-writes.md and docs/backpressure.md held 0538's uncommitted docs-pass hunks, so 0523 left them alone.
 
 To do once 0538 lands:
@@ -20,6 +21,8 @@ To do once 0538 lands:
 
 Acceptance: the three docs match the code; no other content changes.
 
-## Acceptance criteria
+## Outcome
 
-## Work log
+batch-writes.md now describes the file backend's vals-fsync helper-thread fdatasync (shared batches, waker + eventfd/kqueue wake, unchanged ack ordering); backpressure.md's Staged BatchApply gate section notes that requests on flush_completes_off_thread backends release their permit before the group commit while SPDK keeps it until the ack; the ARCHITECTURE performance summary replaces "~1.4–5k device-durable writes/s, limited by fsync" with the post-0523 single-host ~11k/s at 256 in flight. Claims verified against apply.rs, connection.rs, vals-spdk FileBlockDevice/Flusher and the reactor Notify; docs-only, self-reviewed.
+
+Commit: 0539: docs: describe 0523's off-thread file fdatasync (batch-writes.md), gate-permit release on off-thread-flush backends (backpressure.md), and point ARCHITECTURE's file-backed device-durable figure at post-0523 ~11k/s

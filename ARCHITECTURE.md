@@ -1223,9 +1223,11 @@ guarantees. 100-byte values unless stated.
   majority writes and reads, 1 KiB values, 4M keys), on the same 24-core hosts
   with a consumer Samsung 990 PRO each, either all three nodes on one host or
   one node per host: **~78k buffered overwrites/s**, **~100–125k warm point
-  reads/s**, and **~1.4–5k device-durable writes/s**. Each node is limited by
-  its single serving thread, or by `fsync` for device-durable writes. Setup,
-  latencies, resource use and a recipe to repeat the runs are in
+  reads/s**. Each node is limited by its single serving thread. Device-durable
+  writes are limited by the drive's sync rate: with the sync on a helper
+  thread (task 0523), all three nodes on one host reached **~11k
+  device-durable writes/s** at 256 writes in flight. Setup, latencies,
+  resource use and a recipe to repeat the runs are in
   [`docs/benchmarks.md`](docs/benchmarks.md).
 
 ### Lessons that shaped the design
