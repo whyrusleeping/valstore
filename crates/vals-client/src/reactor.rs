@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
-use std::os::fd::{OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -15,7 +15,7 @@ pub enum Interest {
 }
 
 struct Reactor {
-    poller: RawFd,
+    poller: OwnedFd,
     wakers: HashMap<RawFd, (Waker, Interest)>,
 }
 
@@ -27,7 +27,7 @@ fn with_reactor<R>(f: impl FnOnce(&mut Reactor) -> R) -> R {
     REACTOR.with(|cell| {
         let mut slot = cell.borrow_mut();
         let reactor = slot.get_or_insert_with(|| Reactor {
-            poller: sys::new_poller(),
+            poller: sys::new_poller().unwrap_or_else(|e| panic!("reactor poller: {e}")),
             wakers: HashMap::new(),
         });
         f(reactor)
@@ -37,7 +37,7 @@ fn with_reactor<R>(f: impl FnOnce(&mut Reactor) -> R) -> R {
 pub fn register(fd: RawFd, interest: Interest, waker: Waker) {
     with_reactor(|r| {
         let old = r.wakers.insert(fd, (waker, interest)).map(|(_, old)| old);
-        sys::arm(r.poller, fd, old, interest);
+        sys::arm(r.poller.as_raw_fd(), fd, old, interest);
     });
 }
 
@@ -45,7 +45,7 @@ pub fn deregister(fd: RawFd) {
     let _ = REACTOR.try_with(|cell| {
         if let Some(r) = cell.borrow_mut().as_mut() {
             if let Some((_, old)) = r.wakers.remove(&fd) {
-                sys::disarm(r.poller, fd, old);
+                sys::disarm(r.poller.as_raw_fd(), fd, old);
             }
         }
     });
@@ -66,12 +66,13 @@ fn run_flush_hook() {
 }
 
 fn poll_io_with(timeout_ms: i32) {
-    let woken: Vec<Waker> = with_reactor(|r| {
-        if r.wakers.is_empty() {
+    let woken: Vec<Waker> = REACTOR.with(|cell| {
+        let slot = cell.borrow();
+        let Some(r) = slot.as_ref().filter(|r| !r.wakers.is_empty()) else {
             return Vec::new();
-        }
+        };
         let mut woken = Vec::new();
-        sys::wait(r.poller, timeout_ms, |fd| {
+        sys::wait(r.poller.as_raw_fd(), timeout_ms, |fd| {
             if let Some((w, _)) = r.wakers.get(&fd) {
                 woken.push(w.clone());
             }
@@ -120,19 +121,16 @@ impl Timer {
     }
 
     pub fn as_raw_fd(&self) -> RawFd {
-        use std::os::fd::AsRawFd;
         self.fd.as_raw_fd()
     }
 
     pub fn drain(&self) {
-        use std::os::fd::AsRawFd;
         let _ = sys::take(self.fd.as_raw_fd());
     }
 }
 
 impl Drop for Timer {
     fn drop(&mut self) {
-        use std::os::fd::AsRawFd;
         deregister(self.fd.as_raw_fd());
     }
 }
@@ -144,7 +142,6 @@ pub struct Tick<'a> {
 impl Future for Tick<'_> {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        use std::os::fd::AsRawFd;
         let fd = self.timer.fd.as_raw_fd();
         if sys::take(fd) {
             Poll::Ready(())
@@ -172,7 +169,6 @@ impl Notify {
     }
 
     pub fn signal(&self) {
-        use std::os::fd::AsRawFd;
         sys::signal(self.fd.as_raw_fd());
     }
 
@@ -183,7 +179,6 @@ impl Notify {
 
 impl Drop for Notify {
     fn drop(&mut self) {
-        use std::os::fd::AsRawFd;
         deregister(self.fd.as_raw_fd());
     }
 }
@@ -195,7 +190,6 @@ pub struct Notified<'a> {
 impl Future for Notified<'_> {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        use std::os::fd::AsRawFd;
         let fd = self.notify.fd.as_raw_fd();
         if sys::take(fd) {
             Poll::Ready(())
@@ -213,8 +207,13 @@ mod sys {
     use std::os::fd::{FromRawFd, OwnedFd, RawFd};
     use std::time::Duration;
 
-    pub(super) fn new_poller() -> RawFd {
-        unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) }
+    pub(super) fn new_poller() -> io::Result<OwnedFd> {
+        // SAFETY: epoll_create1 returns a fresh owned fd (or -1).
+        let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
     }
 
     pub(super) fn arm(epfd: RawFd, fd: RawFd, old: Option<Interest>, interest: Interest) {
@@ -355,9 +354,8 @@ mod sys {
         Ok(unsafe { OwnedFd::from_raw_fd(raw) })
     }
 
-    pub(super) fn new_poller() -> RawFd {
-        use std::os::fd::IntoRawFd;
-        kqueue().map(IntoRawFd::into_raw_fd).unwrap_or(-1)
+    pub(super) fn new_poller() -> io::Result<OwnedFd> {
+        kqueue()
     }
 
     pub(super) fn arm(kq: RawFd, fd: RawFd, old: Option<Interest>, interest: Interest) {
