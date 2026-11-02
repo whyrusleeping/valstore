@@ -279,7 +279,7 @@ per-core ceiling stands; per-range sharding (0050) remains the wall-clock lever.
     value** — `VALS_VLOG_CO_COMPACT=1` clusters on *bottommost* (graduation) merges
     only; default (unset) never clusters.
   - **Tiered/leveled selection**: a recurring merge folds a contiguous **newest-suffix
-    subset** of ~`VALS_MERGE_TIER_K` (default 6) similar-sized runs (input capped at
+    subset** of ~`VALS_MERGE_TIER_K` (default 16 since 0563) similar-sized runs (input capped at
     `VALS_MERGE_INPUT_CAP_BYTES`, default 2 GiB); the base run joins only once the
     newer tiers reach ≈ its own size (graduation → a bottommost merge). Per-key index
     rewrites drop from O(N/flush) to O(log_k N). Runs that can no longer fit a capped

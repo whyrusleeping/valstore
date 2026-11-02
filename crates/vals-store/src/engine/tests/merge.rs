@@ -1758,7 +1758,7 @@ fn version_digest_page_merges_memtable_and_runs_argmax() {
 
 #[test]
 fn recurring_merge_selectable_tracks_tiered_policy() {
-    if co_compact_env(false) { return; }
+    if default_policy_env() { return; }
     let dev = MemBlockDevice::new(BS, 8192);
     let cfg = Config {
         seg_blocks: 8,
@@ -1766,7 +1766,7 @@ fn recurring_merge_selectable_tracks_tiered_policy() {
         ordering: Ordering::Sorted,
     };
     let mut e = Engine::create_prewiped(dev, cfg);
-    for r in 0..4u32 {
+    for r in 0..16u32 {
         assert!(
             !e.recurring_merge_selectable(),
             "below min fan-in ({} runs) nothing is selectable",
@@ -1782,7 +1782,7 @@ fn recurring_merge_selectable_tracks_tiered_policy() {
         }
         e.flush(RunBuildOpts::default()).unwrap();
     }
-    assert_eq!(e.run_count(), 4);
+    assert_eq!(e.run_count(), 16);
     assert!(
         e.recurring_merge_selectable(),
         "min fan-in of similar-size runs is selectable"
@@ -2032,7 +2032,7 @@ fn select_recurring_merge_steady_cadence_bounds_runs_and_merge_input() {
 
 #[test]
 fn recurring_merge_bounds_run_count_and_reads_transparently() {
-    if co_compact_env(false) { return; }
+    if default_policy_env() { return; }
     std::env::remove_var("VALS_VLOG_CO_COMPACT");
     let cfg = Config {
         seg_blocks: 8,
@@ -2054,7 +2054,7 @@ fn recurring_merge_bounds_run_count_and_reads_transparently() {
             .unwrap();
         }
         run_flush(&mut e, opts);
-        while e.run_count() >= 4 {
+        while e.run_count() >= 16 {
             if let Some(plan) = e.compact_plan(opts, None).unwrap() {
                 let wdev = Arc::new(e.device().sibling().unwrap());
                 let written = vals_rt::block_on(compact_and_write(plan, wdev), || {}).unwrap();
@@ -2066,7 +2066,7 @@ fn recurring_merge_bounds_run_count_and_reads_transparently() {
         max_runs = max_runs.max(e.run_count());
     }
     assert!(
-        max_runs <= 8,
+        max_runs <= 16,
         "run count stays bounded, peaked at {max_runs}"
     );
     for k in 0..50u32 {
@@ -2082,7 +2082,7 @@ fn recurring_merge_bounds_run_count_and_reads_transparently() {
 
 #[test]
 fn recurring_merge_cumulative_input_bounded_per_ingested_byte() {
-    if co_compact_env(false) { return; }
+    if default_policy_env() { return; }
     std::env::remove_var("VALS_VLOG_CO_COMPACT");
     let cfg = Config {
         seg_blocks: 8,
@@ -2117,8 +2117,8 @@ fn recurring_merge_cumulative_input_bounded_per_ingested_byte() {
         max_runs = max_runs.max(e.run_count());
     }
     assert!(
-        max_runs <= 12,
-        "resident run count stays bounded under the tiered policy, peaked at {max_runs}"
+        max_runs <= 16,
+        "resident run count stays within one 16-way tier under the tiered policy, peaked at {max_runs}"
     );
     let wa = merge_input as f64 / ingested as f64;
     assert!(

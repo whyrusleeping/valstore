@@ -33,12 +33,33 @@ use super::*;
         compact_env(on, false)
     }
 
+    /// Merge-mechanism tests run on the small pre-0563 fan-in (K 6, min K 4, valve 6) so a handful of
+    /// flushes yields a plan; `default_policy_env` keeps the shipped policy for tests of the policy itself.
     fn compact_env(on: bool, bottommost: bool) -> bool {
+        policy_env(on, if bottommost { [Some("64"), Some("2"), None] } else { [Some("6"), Some("4"), Some("6")] })
+    }
+
+    /// In-process form of `compact_env`'s small fan-in (K 6 / min K 4 / valve 6) for merge-mechanism
+    /// tests, except where the test's environment sets a knob.
+    fn small_fanin<D: BlockDevice>(e: &mut Engine<D>) {
+        let unset = |key| std::env::var(key).is_err();
+        let p = &mut e.merge_policy;
+        if unset("VALS_MERGE_TIER_K") { p.k = 6; }
+        if unset("VALS_MERGE_TIER_MIN_K") { p.min_k = 4; }
+        p.min_k = p.min_k.clamp(2, p.k);
+        if unset("VALS_MERGE_FORCE_RUNS") { p.force_runs = 6; }
+    }
+
+    fn default_policy_env() -> bool {
+        policy_env(false, [None, None, None])
+    }
+
+    fn policy_env(on: bool, [k, min_k, force]: [Option<&str>; 3]) -> bool {
         isolated_env_test(&[
             ("VALS_VLOG_CO_COMPACT", Some(if on { "1" } else { "0" })),
-            ("VALS_MERGE_TIER_K", bottommost.then_some("64")),
-            ("VALS_MERGE_TIER_MIN_K", bottommost.then_some("2")),
-            ("VALS_MERGE_FORCE_RUNS", None),
+            ("VALS_MERGE_TIER_K", k),
+            ("VALS_MERGE_TIER_MIN_K", min_k),
+            ("VALS_MERGE_FORCE_RUNS", force),
             ("VALS_MERGE_READAHEAD", None),
             ("VALS_MERGE_INPUT_CAP_BYTES", None),
             ("VALS_VICTIM_DEAD_FRACTION", None),

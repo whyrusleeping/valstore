@@ -53,6 +53,7 @@ fn kf_engine() -> Engine<MemBlockDevice> {
             ordering: Ordering::Unsorted,
         },
     );
+    small_fanin(&mut e);
     e.key_filter.set_params(small_params(1_000));
     e
 }

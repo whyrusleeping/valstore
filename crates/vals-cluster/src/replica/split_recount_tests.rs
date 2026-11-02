@@ -774,6 +774,7 @@ fn merges_elsewhere_and_at_span_edge_keep_pending_progress() {
 
 #[test]
 fn cooperative_compaction_and_forget_plan_during_pending_span() {
+    if crate::testutil::isolated_env_test(crate::testutil::SMALL_FANIN) { return; }
     let mut s = seeded(1200);
     s.set_gc_grace_ms(1);
     let fallbacks = s.split_recount_fallbacks.get();

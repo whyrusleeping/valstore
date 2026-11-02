@@ -342,6 +342,7 @@ fn recurring_and_forced_merges_reserve_normally_while_reclaim_overdraws() {
 
 #[test]
 fn many_run_engine_defers_recurring_merges_under_ram_pressure_until_capacity_returns() {
+    if crate::testutil::isolated_env_test(crate::testutil::SMALL_FANIN) { return; }
     let _rss = crate::ram::override_for_test(0, u64::MAX);
     let broker = crate::ram_broker::override_for_test(Some(u64::MAX / 2), 1);
     const CFG: Config = Config { seg_blocks: 64, reserved_blocks: 0, ordering: SOrdering::Sorted };
@@ -385,6 +386,7 @@ fn many_run_engine_defers_recurring_merges_under_ram_pressure_until_capacity_ret
 
 #[test]
 fn liveness_wipe_defers_while_an_off_core_merge_is_in_flight() {
+    if crate::testutil::isolated_env_test(crate::testutil::SMALL_FANIN) { return; }
     const CFG: Config = Config { seg_blocks: 64, reserved_blocks: 0, ordering: SOrdering::Sorted };
     let mut store = VersionedStore::new(Engine::create_prewiped(MemBlockDevice::new(512, 65_536), CFG), 1).unwrap();
     for round in 0..4u64 {

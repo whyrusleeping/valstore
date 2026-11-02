@@ -22,6 +22,10 @@ pub(crate) fn isolated_env_test(settings: &[(&str, &str)]) -> bool {
     true
 }
 
+/// Pre-0563 merge fan-in (K 6, min K 4, valve 6) for tests that need a merge plan from a few runs.
+pub(crate) const SMALL_FANIN: &[(&str, &str)] =
+    &[("VALS_MERGE_TIER_K", "6"), ("VALS_MERGE_TIER_MIN_K", "4"), ("VALS_MERGE_FORCE_RUNS", "6")];
+
 const MAX_LIVE_CLUSTERS: usize = 3;
 
 struct Gate {

@@ -267,12 +267,13 @@ Three layers, weakest-but-cheapest to strongest-but-slowest:
   balanced window under the cap (> cap × r/(1+r), 1.2 GiB at r = 1.5), are frozen.
   Only space reclaim (pressure, shadow folds, aged value-log GC, tombstone GC,
   forget) rewrites them, so run count grows ~linearly with data ÷ cap. The run-count
-  valve (`VALS_MERGE_FORCE_RUNS`, 6) now counts only the active tail newer than the
+  valve (`VALS_MERGE_FORCE_RUNS`, 16) now counts only the active tail newer than the
   newest frozen run. It merges the cheapest capped adjacent window there, and it is
   paced like every recurring merge. The old valve forced the two newest runs past the
   cap: a multi-billion-event soak saw merge output per write rise 195 → 1,026 B, and a
   micro-simulation shows rewrite amplification growing without bound (308× at
-  160 GB/engine). The new valve holds it at ~1.5× merge input per flushed byte.
+  160 GB/engine). The new valve holds it at ~1.5× merge input per flushed byte, and
+  16-way tiering (0563) at ~0.9–1.2×.
   ([`docs/algorithms.md`](docs/algorithms.md), [`docs/configuration.md`](docs/configuration.md)).
   **Run-count costs:** shadow estimation caches fixed, run-id-seeded
   block samples. Flushes read only new runs and probe only newly added newer-run

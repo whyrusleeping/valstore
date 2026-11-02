@@ -3019,6 +3019,7 @@
 
     #[test]
     fn cleanup_batch_accumulates_while_maintenance_blocks_planning() {
+        if crate::testutil::isolated_env_test(crate::testutil::SMALL_FANIN) { return; }
         let mut s = sorted_store_big(1);
         for i in 0..600u64 {
             s.apply_at(

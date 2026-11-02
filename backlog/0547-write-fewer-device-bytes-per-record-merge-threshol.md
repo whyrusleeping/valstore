@@ -5,7 +5,10 @@ status: todo
 priority: 2
 created: "2026-11-01"
 updated: "2026-11-01"
-depends_on: []
+depends_on:
+    - "0563"
+    - "0564"
+    - "0565"
 spec_refs: []
 ---
 
@@ -35,3 +38,4 @@ Keys are written about three times (log, flush run, merge rewrites). In the 0546
 ## Acceptance criteria
 
 ## Work log
+- 2026-11-02: split into 0563 (item 1, merge fan-in config N2 A/B), 0564 (item 2, run-block compression) and 0565 (item 3, compact vlog header); item 4 stays an owner note here. This task closes with the B/write summary once the children are done.

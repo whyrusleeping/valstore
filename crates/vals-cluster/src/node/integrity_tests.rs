@@ -175,7 +175,7 @@ fn disabled_policy_keeps_retrying_the_corrupt_flush_forever() {
 
 #[test]
 fn on_disk_run_crc_failures_never_fail_fast() {
-    if crate::testutil::isolated_env_test(&[]) { return; }
+    if crate::testutil::isolated_env_test(crate::testutil::SMALL_FANIN) { return; }
     let mem = MemBlockDevice::new(512, 65_536);
     let disk = mem.share();
     let mut store = sorted_store(mem);

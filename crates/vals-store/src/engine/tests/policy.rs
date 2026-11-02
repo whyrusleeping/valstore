@@ -3,13 +3,13 @@ use super::*;
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
-fn policy(cap: u64, force_runs: usize) -> MergePolicy {
+fn policy(cap: u64) -> MergePolicy {
     MergePolicy {
         k: 6,
         min_k: 4,
         size_ratio: 1.5,
         size_cap: cap,
-        force_runs,
+        force_runs: 6,
         freeze_bytes: cap,
     }
 }
@@ -147,7 +147,7 @@ fn recurring_and_forced_merges_never_exceed_the_cap_or_take_frozen_runs() {
 
 #[test]
 fn creates_only_rewrite_amplification_is_bounded_and_flat_in_data() {
-    let p = policy(2 * GIB, MERGE_FORCE_RUNS);
+    let p = policy(2 * GIB);
     let flush = 200 * MIB;
     let bound = amplification_bound(&p, flush / 2);
     let graduated = p.size_cap as f64 * p.size_ratio / (1.0 + p.size_ratio);
@@ -181,7 +181,7 @@ fn creates_only_rewrite_amplification_is_bounded_and_flat_in_data() {
 
 #[test]
 fn knockout_pre_0381_forced_rule_exceeds_the_cap_and_amplification_grows_with_data() {
-    let p = policy(2 * GIB, MERGE_FORCE_RUNS);
+    let p = policy(2 * GIB);
     let flush = 200 * MIB;
     let bound = amplification_bound(&p, flush / 2);
     let sizes = flush_sizes(3, flush, 1600);
@@ -201,7 +201,7 @@ fn knockout_pre_0381_forced_rule_exceeds_the_cap_and_amplification_grows_with_da
 
 #[test]
 fn valve_folds_an_active_tail_that_tiering_cannot_fold() {
-    let p = policy(2 * GIB, MERGE_FORCE_RUNS);
+    let p = policy(2 * GIB);
     let sizes: Vec<u64> = (0..300).flat_map(|_| (0..6).rev().map(|i| (MIB / 2) << (2 * i))).collect();
     let run = |p: MergePolicy| {
         let mut sim = Sim::default();
@@ -288,7 +288,7 @@ fn forced_window_is_the_cheapest_adjacent_balanced_window_in_the_active_tail() {
 fn merge_policy_micro_simulation() {
     let cap = 2 * GIB;
     let flush = 200 * MIB;
-    let p = policy(cap, MERGE_FORCE_RUNS);
+    let p = policy(cap);
     let sizes = flush_sizes(7, flush, 768);
     let rules: [(&str, &dyn Fn(&[u64]) -> Option<MergeWindow>); 2] = [
         ("pre-0381", &|s: &[u64]| pre_0381_select(s, &p)),

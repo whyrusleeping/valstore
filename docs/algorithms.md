@@ -1012,7 +1012,8 @@ they are load-bearing and worth recording. Full rationale is in `ARCHITECTURE.md
   `compact_and_write` → `compact_commit`, task 0069): a run-merge separates its three
   jobs instead of bundling them. (1) **Index fold** is the always-present job: a
   recurring merge folds a contiguous **newest-suffix subset** of similar-sized runs
-  (tiered selection, fan-in `VALS_MERGE_TIER_K`≈6, input cap `VALS_MERGE_INPUT_CAP_BYTES`;
+  (tiered selection, fan-in `VALS_MERGE_TIER_K` 16 with minimum `VALS_MERGE_TIER_MIN_K` 16,
+  input cap `VALS_MERGE_INPUT_CAP_BYTES`;
   the oldest "base" run joins only when the newer tiers reach ≈ its size — graduation
   → a *bottommost* merge). Entries keep their `ValuePtr`s (**index-only**,
   `VlogRewrite::None`) — no value bytes move, so recurring merge traffic is
@@ -1039,7 +1040,15 @@ they are load-bearing and worth recording. Full rationale is in `ARCHITECTURE.md
     or forced inputs.
   - **Active tail.** Tiered selection works only on the runs newer than the newest
     frozen run.
-  - **Valve.** It fires when the active tail holds `VALS_MERGE_FORCE_RUNS` (6) runs that
+  - **Fan-in.** A recurring merge waits for 16 similar-sized tail runs (K = min K = 16,
+    task 0563). Flush runs are ~0.1 GB on the ATProto replay, so one 16-way merge takes
+    most of them close to the freeze size, and each key is rewritten about once.
+    With K 6 / min K 4, each key was rewritten 1.5–1.7 times on the two-node replay. K 16
+    cut merge-run bytes per write 27–42% and device bytes 7–10%, and ingest to 4.5B ran
+    5.2% faster. Resident runs, key-filter RAM and apply bloom probes did not grow;
+    node1's peak RSS rose 2.5 GB. Merges lag flushes under load, so the real rewrite
+    count depends on lane throughput as well as K.
+  - **Valve.** It fires when the active tail holds `VALS_MERGE_FORCE_RUNS` (16) runs that
     tiering could not fold. It takes the cheapest adjacent window of 2..K tail runs
     under the cap: fewest input bytes per eliminated run, newest and widest on ties. It
     prefers balanced windows (largest input ≤ r × the rest) and otherwise takes any

@@ -720,9 +720,9 @@ async fn compact_and_write_inner<D: BlockDevice>(
 
 const CO_COMPACT_CHUNK: usize = 8192;
 
-const MERGE_TIER_K: usize = 6;
+const MERGE_TIER_K: usize = 16;
 
-const MERGE_TIER_MIN_K: usize = 4;
+const MERGE_TIER_MIN_K: usize = MERGE_TIER_K;
 
 pub(super) const MERGE_FORCE_RUNS: usize = MERGE_TIER_K;
 

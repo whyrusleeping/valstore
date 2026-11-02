@@ -421,6 +421,7 @@ const BIG_BLOCK: usize = run::SIDECAR_CURSOR_WINDOW + 128 * 1024;
 
 fn mixed_block_engine() -> (Engine<MemBlockDevice>, Model) {
     let mut e = Engine::create_prewiped(MemBlockDevice::new(BS, 1 << 18), fmt_cfg());
+    small_fanin(&mut e);
     let mut model = Model::new();
     let rounds = [
         (0u64, 1_500u64, 1_000u128, 4096usize, 12usize, false),

@@ -280,9 +280,9 @@ code, not a contract.
 | `VALS_MALLOC_TRIM_SECS` | unset or 0: off | node only: a positive value starts a low-priority thread that calls glibc `malloc_trim(0)` every that many seconds; invalid values fail startup. Opt-in for RAM-constrained hosts; it measured as a small throughput loss, so watch RAM and write tails and set 0 if they regress. `vals-server/allocator.rs`; see [deploy.md](deploy.md) |
 | `VALS_BATCH_DIGEST_READS` | on; 0/false/off disables | client mixed-batch/scalar comparison, `vals-client/net/client/transport.rs` |
 | `VALS_UDS_DIR` | absent/empty means TCP | local transport diagnostic routing override, `vals-client/net/mod.rs` |
-| `VALS_MERGE_TIER_K` | 6 (minimum 2) | merge policy experiments, `vals-store/engine/merge.rs` |
-| `VALS_MERGE_TIER_MIN_K` | 4, clamped to 2..K | same |
-| `VALS_MERGE_FORCE_RUNS` | 6 (minimum 2): runs in the active tail (newer than the newest frozen run) at which the valve forces a capped merge | same |
+| `VALS_MERGE_TIER_K` | 16 (minimum 2; 6 before 0563) | merge policy experiments, `vals-store/engine/merge.rs` |
+| `VALS_MERGE_TIER_MIN_K` | 16 (4 before 0563), clamped to 2..K; a recurring merge waits for this many similar tail runs | same |
+| `VALS_MERGE_FORCE_RUNS` | 16 (= K; minimum 2): runs in the active tail (newer than the newest frozen run) at which the valve forces a capped merge | same |
 | `VALS_MERGE_TIER_SIZE_RATIO` | 1.5 (positive) | same |
 | `VALS_MERGE_INPUT_CAP_BYTES` | 2147483648 (positive): hard limit on recurring and forced merge input | merge input sizing A-B; may affect reclaim progress, same |
 | `VALS_MERGE_FREEZE_BYTES` | the input cap (positive) | runs at or above it are never recurring/forced inputs (frozen top tier); runs too large for a balanced capped window are frozen regardless, same |

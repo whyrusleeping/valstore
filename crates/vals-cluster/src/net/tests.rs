@@ -4890,6 +4890,7 @@ fn zone_teardown_waits_for_an_offcore_flush() {
 
 #[test]
 fn zone_teardown_waits_for_an_offcore_compaction() {
+    if crate::testutil::isolated_env_test(crate::testutil::SMALL_FANIN) { return; }
     let zid = 7;
     let (shared, provider) = zoned_shared_ordered(zid, Ordering::Sorted);
     let store = shared.zone_store(zid).unwrap();
