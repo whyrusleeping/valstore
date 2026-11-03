@@ -16,8 +16,9 @@ import time
 LOCAL = "local"
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# On-demand / spot USD per hour, us-east-1 Linux, from instances.vantage.sh on
-# 2026-11-02. Spot moves; `fleet.py plan` prints these with their date.
+# On-demand / spot USD per hour, Linux, from instances.vantage.sh (us-east-1) on
+# 2026-11-02; on-demand i4i.metal, c6in.16xlarge and c6i.8xlarge are identical in us-east-2
+# (AWS pricing API, same day). Spot moves; `fleet.py plan` prints these with their date.
 PRICES = {
     "i4i.metal": (10.982, 2.644),
     "i3en.metal": (10.848, 2.507),

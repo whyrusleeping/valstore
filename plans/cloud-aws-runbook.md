@@ -45,15 +45,23 @@ networking, ECC memory. Tooling lives in `scripts/cloud/`; results land in
 3. An IAM user/role limited to EC2 (instances, key pairs, security groups,
    placement groups, tags, describe*), SSM `GetParameters` (Ubuntu AMI lookup)
    and Service Quotas read.
-4. Credentials into this environment with `ycc token set AWS_ACCESS_KEY_ID`,
-   `ycc token set AWS_SECRET_ACCESS_KEY` and `AWS_DEFAULT_REGION` (e.g.
-   us-east-1; prices in `cloudlib.PRICES` are us-east-1). The local aws CLI is
-   v1.22 — fine for these calls; upgrade if a newer instance type is rejected.
+4. Credentials via `ycc token set AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
+   ycc does not export them into agent shells, so prefix AWS commands with the
+   local-only wrapper `bench/cloud/aws-env.sh` (reads the two keys from
+   `~/.config/ycc/secrets.json`, never prints them, defaults the region to
+   **us-east-2**, the owner's choice; on-demand prices there match us-east-1).
+   The local aws CLI is v1.22 — fine for these calls.
+
+Account state (2026-11-02): on-demand standard quota 8 vCPUs in us-east-2;
+increase to 544 requested (`L-1216C47A`, request
+`a01c32b7b5a84db9ad84234639b87fd5POpwsUuC`, PENDING). The keys in use are
+root-account keys; the owner was advised to replace them with a scoped IAM user.
 
 ## Running a campaign
 
 ```sh
-scripts/cloud/fleet.py plan  --profile c1-3node-i4i
+W=bench/cloud/aws-env.sh   # prefix every AWS-touching command with $W
+$W scripts/cloud/fleet.py plan  --profile c1-3node-i4i
 scripts/cloud/fleet.py build --rev <commit>               # ~30-45 min on c6i.8xlarge, ~$1
 scripts/cloud/fleet.py up    --profile c1-3node-i4i --run c1-<date> [--az us-east-1b]
 scripts/cloud/campaign.py run --run c1-<date> --artifact bench/cloud/artifacts/vals-<rev12>.tar.gz

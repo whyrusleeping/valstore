@@ -88,7 +88,7 @@ def cmd_plan(args):
     p = load_profile(args.profile)
     roles = roles_of(p)
     print("profile %s: %s" % (args.profile, p.get("description", "")))
-    print("prices: us-east-1 Linux, %s (instances.vantage.sh); verify before launch" % cl.PRICES_DATE)
+    print("prices: Linux on-demand, us-east-1/us-east-2, %s; verify before launch" % cl.PRICES_DATE)
     for r in roles:
         print("  %-7s %d x %-16s %-9s $%7.3f/h each  %4d vCPU each"
               % (r["role"], r["count"], r["type"], r.get("market", "on-demand"),
