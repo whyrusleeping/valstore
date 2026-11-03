@@ -62,7 +62,7 @@ root-account keys; the owner was advised to replace them with a scoped IAM user.
 ```sh
 W=bench/cloud/aws-env.sh   # prefix every AWS-touching command with $W
 $W scripts/cloud/fleet.py plan  --profile c1-3node-i4i
-scripts/cloud/fleet.py build --rev <commit>               # ~30-45 min on c6i.8xlarge, ~$1
+$W scripts/cloud/fleet.py build --rev <commit> --type c6i.2xlarge  # ~8 min wall, ~$0.05 (fits the 8-vCPU default quota)
 scripts/cloud/fleet.py up    --profile c1-3node-i4i --run c1-<date> [--az us-east-1b]
 scripts/cloud/campaign.py run --run c1-<date> --artifact bench/cloud/artifacts/vals-<rev12>.tar.gz
 scripts/cloud/fleet.py down  --run c1-<date> && scripts/cloud/fleet.py sweep
