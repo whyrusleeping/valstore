@@ -63,9 +63,9 @@ root-account keys; the owner was advised to replace them with a scoped IAM user.
 W=bench/cloud/aws-env.sh   # prefix every AWS-touching command with $W
 $W scripts/cloud/fleet.py plan  --profile c1-3node-i4i
 $W scripts/cloud/fleet.py build --rev <commit> --type c6i.2xlarge  # ~8 min wall, ~$0.05 (fits the 8-vCPU default quota)
-scripts/cloud/fleet.py up    --profile c1-3node-i4i --run c1-<date> [--az us-east-1b]
-scripts/cloud/campaign.py run --run c1-<date> --artifact bench/cloud/artifacts/vals-<rev12>.tar.gz
-scripts/cloud/fleet.py down  --run c1-<date> && scripts/cloud/fleet.py sweep
+$W scripts/cloud/fleet.py up    --profile c1-3node-i4i --run c1-<date> [--az us-east-2b]
+$W scripts/cloud/campaign.py run --run c1-<date> --artifact bench/cloud/artifacts/vals-<rev12>.tar.gz
+$W scripts/cloud/fleet.py down  --run c1-<date> && $W scripts/cloud/fleet.py sweep
 ```
 
 Build on the data nodes' CPU generation (c6i = Ice Lake for i4i; c7i for
