@@ -153,6 +153,9 @@ class Campaign:
                 return
             cl.push(h, self.artifact, "%s/artifact.tar.gz" % h.root)
             cl.sh(h, "cd %s && tar --strip-components=1 -xzf artifact.tar.gz && rm artifact.tar.gz" % h.root)
+            if art_meta.get("pmd_path"):
+                cl.sh(h, "sudo mkdir -p %s && sudo ln -sfn %s/pmds %s"
+                      % (shlex.quote(os.path.dirname(art_meta["pmd_path"])), h.root, shlex.quote(art_meta["pmd_path"])))
             flags = set(cl.sh(h, "grep -m1 '^flags' /proc/cpuinfo").split(":", 1)[1].split())
             missing = cl.missing_isa(art_meta["cpu_flags"], flags)
             if missing:

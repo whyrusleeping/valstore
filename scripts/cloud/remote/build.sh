@@ -66,8 +66,36 @@ log "pack"
 OUT="$BUILD/artifact/vals-$SHORT"
 rm -rf "$OUT" && mkdir -p "$OUT/bin" "$OUT/lib" "$OUT/spdk/include/spdk"
 cp target/release/valsd target/release/vals-bench "$OUT/bin/"
-# DPDK keeps bus/PMD drivers (e.g. librte_bus_pci) in lib/dpdk/pmds-*/: flatten every .so into lib/.
-find "$BUILD/spdk/dpdk/build/lib" -name '*.so*' \( -type f -o -type l \) -exec cp -a {} "$OUT/lib/" \;
+# DPDK: every shared object under dpdk/build/lib, dereferenced and flattened into lib/ (first copy of a
+# name wins; dangling links are skipped). EAL also dlopen()s every driver in its compiled-in plugin
+# directory (RTE_EAL_PMD_PATH, an absolute path on this builder; it holds e.g. librte_mempool_ring,
+# which the linker drops from NEEDED). Ship that directory as pmds/ with links into ../lib (same
+# inodes as the NEEDED copies, so nothing loads twice); deploy recreates the path as a link to pmds/.
+DPDK_LIB="$BUILD/spdk/dpdk/build/lib"
+echo "--- dpdk shared objects (path type link-target)"; find "$DPDK_LIB" -name '*.so*' -printf '%P %y %l\n' | sort
+find "$DPDK_LIB" -name '*.so*' | sort | while read -r f; do
+  n=$(basename "$f")
+  [ -e "$OUT/lib/$n" ] || cp -L "$f" "$OUT/lib/$n" 2>/dev/null || true
+done
+PMD_PATH=$(sed -n 's/^#define RTE_EAL_PMD_PATH "\(.*\)"$/\1/p' "$BUILD/spdk/dpdk/build/include/rte_build_config.h" 2>/dev/null || true)
+[ -n "$PMD_PATH" ] || PMD_PATH=$(find "$DPDK_LIB/dpdk" -maxdepth 1 -type d -name 'pmds-*' | head -1)
+echo "--- RTE_EAL_PMD_PATH=$PMD_PATH"
+mkdir -p "$OUT/pmds"
+if [ -d "$PMD_PATH" ]; then
+  for f in "$PMD_PATH"/*.so*; do
+    [ -e "$f" ] || continue
+    n=$(basename "$f")
+    [ -e "$OUT/lib/$n" ] || cp -L "$f" "$OUT/lib/$n"
+    ln -sfn "../lib/$n" "$OUT/pmds/$n"
+  done
+fi
+# Resolve anything still missing from the whole DPDK tree (e.g. a soname link only under build-tmp).
+for b in valsd vals-bench; do
+  LD_LIBRARY_PATH="$OUT/lib" ldd "$OUT/bin/$b" | awk '/not found/{print $1}' | while read -r n; do
+    f=$(find "$BUILD/spdk/dpdk" -name "$n" | head -1)
+    [ -n "$f" ] && cp -L "$f" "$OUT/lib/$n" && echo "resolved $n from $f"
+  done
+done
 cp -a "$BUILD/spdk/scripts" "$OUT/spdk/"
 cp "$BUILD/spdk/include/spdk/pci_ids.h" "$OUT/spdk/include/spdk/"
 for b in valsd vals-bench; do
@@ -78,9 +106,24 @@ for b in valsd vals-bench; do
   fi
 done
 LD_LIBRARY_PATH="$OUT/lib" ldd "$OUT/bin/valsd" "$OUT/bin/vals-bench" | awk '/=> \//{print $1}' | sort -u > "$OUT/needed-libs.txt"
-python3 - "$OUT/artifact.json" "$REV" "$SPDK_TAG" <<'PY'
+log "smoke test: packed binaries with the build tree moved away"
+SMOKE="$BUILD/smoke.log"
+mv "$BUILD/spdk" "$BUILD/spdk.away"
+mkdir -p "$(dirname "$PMD_PATH")" && ln -sfn "$OUT/pmds" "$PMD_PATH"
+sudo sysctl -q vm.nr_hugepages=1024
+set +e
+sudo env LD_LIBRARY_PATH="$OUT/lib" LD_DEBUG=libs "$OUT/bin/vals-bench" spdk asyncread 16 4096 0000:ff:1f.7 1 >"$SMOKE" 2>&1
+set -e
+rm -rf "$BUILD/spdk" && mv "$BUILD/spdk.away" "$BUILD/spdk"
+grep -E 'spdk_env_init|attach|EAL|panicked' "$SMOKE" | grep -v 'LD_DEBUG\|^ *[0-9]*:' | head -20 || true
+grep -q 'failed to attach NVMe' "$SMOKE" || { echo "smoke: did not get past spdk_env_init"; tail -40 "$SMOKE"; exit 1; }
+grep -q 'calling init: .*/pmds/librte_mempool_ring\|calling init: .*librte_mempool_ring' "$SMOKE" \
+  || { echo "smoke: librte_mempool_ring was not loaded"; grep -i 'mempool\|pmds' "$SMOKE" | head; exit 1; }
+log "smoke ok: EAL initialised from the artifact, mempool_ring loaded, bogus PCI refused"
+
+python3 - "$OUT/artifact.json" "$REV" "$SPDK_TAG" "$PMD_PATH" <<'PY'
 import json, platform, subprocess, sys, datetime
-out, rev, tag = sys.argv[1:]
+out, rev, tag, pmd_path = sys.argv[1:]
 flags, model = [], ""
 for line in open("/proc/cpuinfo"):
     if line.startswith("flags") and not flags:
@@ -94,7 +137,8 @@ json.dump({"rev": rev, "spdk_tag": tag, "rustc": cmd("rustc", "+1.96.0", "-V"),
            "built": datetime.datetime.now(datetime.timezone.utc).isoformat(),
            "builder_instance_type": imds_type, "cpu_model": model, "cpu_flags": sorted(flags),
            "kernel": platform.release(), "glibc": platform.libc_ver()[1],
-           "profile": "release + debug=line-tables-only", "features": ["spdk"]},
+           "profile": "release + debug=line-tables-only", "features": ["spdk"],
+           "pmd_path": pmd_path},
           open(out, "w"), indent=2)
 PY
 tar -C "$BUILD/artifact" -czf "$BUILD/artifact/vals-$SHORT.tar.gz" "vals-$SHORT"
