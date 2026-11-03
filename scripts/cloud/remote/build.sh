@@ -66,14 +66,18 @@ log "pack"
 OUT="$BUILD/artifact/vals-$SHORT"
 rm -rf "$OUT" && mkdir -p "$OUT/bin" "$OUT/lib" "$OUT/spdk/include/spdk"
 cp target/release/valsd target/release/vals-bench "$OUT/bin/"
-cp -a "$BUILD/spdk/dpdk/build/lib/"*.so* "$OUT/lib/" 2>/dev/null || true
+# DPDK keeps bus/PMD drivers (e.g. librte_bus_pci) in lib/dpdk/pmds-*/: flatten every .so into lib/.
+find "$BUILD/spdk/dpdk/build/lib" -name '*.so*' \( -type f -o -type l \) -exec cp -a {} "$OUT/lib/" \;
 cp -a "$BUILD/spdk/scripts" "$OUT/spdk/"
 cp "$BUILD/spdk/include/spdk/pci_ids.h" "$OUT/spdk/include/spdk/"
-if LD_LIBRARY_PATH="$OUT/lib" ldd "$OUT/bin/valsd" | grep -q 'not found'; then
-  LD_LIBRARY_PATH="$OUT/lib" ldd "$OUT/bin/valsd"
-  echo "valsd has unresolved libraries" >&2
-  exit 1
-fi
+for b in valsd vals-bench; do
+  if LD_LIBRARY_PATH="$OUT/lib" ldd "$OUT/bin/$b" | grep -q 'not found'; then
+    LD_LIBRARY_PATH="$OUT/lib" ldd "$OUT/bin/$b"
+    echo "$b has unresolved libraries" >&2
+    exit 1
+  fi
+done
+LD_LIBRARY_PATH="$OUT/lib" ldd "$OUT/bin/valsd" "$OUT/bin/vals-bench" | awk '/=> \//{print $1}' | sort -u > "$OUT/needed-libs.txt"
 python3 - "$OUT/artifact.json" "$REV" "$SPDK_TAG" <<'PY'
 import json, platform, subprocess, sys, datetime
 out, rev, tag = sys.argv[1:]

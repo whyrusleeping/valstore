@@ -39,7 +39,7 @@ SG_NAME = "vals-cloud"
 UBUNTU_AMI_PARAM = "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
 REMOTE_ROOT = "/home/ubuntu/vals"
 PACKAGES = ("fio iperf3 nvme-cli numactl jq ethtool sysstat zstd rsync chrony pciutils hwloc-nox "
-            "linux-tools-common libnuma1 libaio1t64 libuuid1 python3 gdb")
+            "linux-tools-common libnuma1 libaio1t64 libuuid1 libfuse3-3 python3 gdb")
 OPTIONAL_PACKAGES = "netperf linux-tools-aws"
 QUOTA_CODES = {"on-demand": "L-1216C47A", "spot": "L-34B43A08"}
 
