@@ -26,6 +26,7 @@ PRICES = {
     "i7ie.metal-48xl": (24.950, 6.649),
     "c6in.16xlarge": (3.629, 0.992),
     "c6in.32xlarge": (7.258, 1.984),
+    "c6i.2xlarge": (0.340, 0.150),
     "c6i.8xlarge": (1.360, 0.600),
     "c7i.8xlarge": (1.428, 0.800),
     "c7i.large": (0.0893, 0.040),
@@ -33,7 +34,7 @@ PRICES = {
 PRICES_DATE = "2026-11-02"
 VCPUS = {
     "i4i.metal": 128, "i3en.metal": 96, "i7ie.metal-24xl": 96, "i7ie.metal-48xl": 192,
-    "c6in.16xlarge": 64, "c6in.32xlarge": 128, "c6i.8xlarge": 32, "c7i.8xlarge": 32,
+    "c6in.16xlarge": 64, "c6in.32xlarge": 128, "c6i.2xlarge": 8, "c6i.8xlarge": 32, "c7i.8xlarge": 32,
     "c7i.large": 2,
 }
 

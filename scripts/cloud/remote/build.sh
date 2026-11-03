@@ -27,8 +27,9 @@ log() { printf '[build %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
 log "apt build dependencies"
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-sudo -E apt-get update -q
-sudo -E apt-get install -y -q build-essential pkg-config libssl-dev clang git curl \
+APT="apt-get -o DPkg::Lock::Timeout=900"
+sudo -E $APT update -q
+sudo -E $APT install -y -q build-essential pkg-config libssl-dev clang git curl \
   autoconf automake libtool libtool-bin libnuma-dev libaio-dev uuid-dev libncurses-dev \
   meson ninja-build nasm python3-pip python3-pyelftools python3-jinja2 python3-tabulate \
   libcunit1-dev libjson-c-dev libcmocka-dev
