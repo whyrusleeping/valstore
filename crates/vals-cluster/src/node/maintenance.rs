@@ -687,12 +687,12 @@ pub(super) async fn snapshot_loop<D: BlockDevice + AsyncRead + 'static>(
                 ),
             }
         }
+        shared.persist_gc_watermark(physical_now_ms());
         'zones: for zone_id in shared.sweep_zone_ids(false) {
             if let Ok(store) = shared.zone_store(zone_id) {
                 store.borrow_mut().reap_seed_pins();
                 store.borrow_mut().engine_mut().dealloc_step(shared.settings.device_dealloc_segments_per_tick as usize);
                 let now = physical_now_ms();
-                shared.persist_gc_watermark(now);
                 if shared.maintenance_paused_for_wipe() {
                     shared.check_wipe_timeout(std::time::Instant::now());
                     continue;

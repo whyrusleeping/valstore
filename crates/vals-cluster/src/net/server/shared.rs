@@ -724,7 +724,7 @@ impl<D: BlockDevice> ServerShared<D> {
         let wm = self.watermark();
         self.set_watermark_floor(wm);
         if let Some(l) = &self.liveness {
-            if let Err(e) = l.log.store(wm) {
+            if let Err(e) = l.store(wm) {
                 log::error!(
                     "node {}: persisting liveness watermark {wm} during shutdown failed: {e}",
                     self.node_id
@@ -956,7 +956,7 @@ impl<D: BlockDevice> ServerShared<D> {
         };
         let watermark = wall_ms.min(self.watermark());
         if watermark > self.durable_gc_watermark.get() {
-            if let Err(e) = l.log.store(watermark) {
+            if let Err(e) = l.store(watermark) {
                 log::error!(
                     "node {}: persisting tombstone-GC watermark {watermark} failed: {e}",
                     self.node_id
@@ -986,13 +986,9 @@ impl<D: BlockDevice> ServerShared<D> {
         self.last_contact.set(now_ms);
         let wm = self.watermark();
         self.set_watermark_floor(wm);
-        if let Some(l) = &self.liveness {
-            match l.log.store(wm) {
-                Ok(()) => {
-                    if wm > self.durable_gc_watermark.get() {
-                        self.durable_gc_watermark.set(wm);
-                    }
-                }
+        if let Some(l) = self.liveness.as_ref().filter(|_| wm > self.durable_gc_watermark.get()) {
+            match l.store(wm) {
+                Ok(()) => self.durable_gc_watermark.set(wm),
                 Err(e) => {
                     log::error!(
                         "node {}: persisting liveness watermark {wm} failed: {e}",

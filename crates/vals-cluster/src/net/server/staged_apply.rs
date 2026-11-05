@@ -1128,6 +1128,82 @@
         assert!(store.borrow().stored(b"old").unwrap().is_none());
     }
 
+    struct RecordingGcLog {
+        stored: Rc<RefCell<Vec<u64>>>,
+    }
+
+    impl crate::liveness::LivenessLog for RecordingGcLog {
+        fn load(&self) -> Option<u64> {
+            None
+        }
+
+        fn store(&self, watermark_ms: u64) -> std::io::Result<()> {
+            self.stored.borrow_mut().push(watermark_ms);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn unchanged_liveness_watermark_is_not_stored_again_and_gc_trails_durable() {
+        let at = |ms: u64| Version {
+            hlc: ms << crate::hlc::COUNTER_BITS,
+            node: 1,
+        };
+        let zone = |tomb: &[u8], tomb_ms: u64| {
+            let mut s = VersionedStore::new(
+                Engine::create_prewiped(
+                    MemBlockDevice::new(256, 8192),
+                    Config {
+                        seg_blocks: 16,
+                        reserved_blocks: 0,
+                        ordering: SOrdering::Sorted,
+                    },
+                ),
+                1,
+            )
+            .unwrap();
+            s.apply_at(tomb, None, at(tomb_ms), 10_000).unwrap();
+            s.apply_at(b"anchor", Some(b"v"), at(10_000), 10_000).unwrap();
+            s
+        };
+        let stored = Rc::new(RefCell::new(Vec::new()));
+        let shared =
+            ServerShared::single_zone_on(1, zone(b"a", 4_000), Ring::from_members(1, 64, [1]));
+        let b = shared.insert_zone_for_test(DEFAULT_ZONE + 1, zone(b"b", 9_500));
+        let shared = shared.with_liveness(
+            1_000,
+            Box::new(RecordingGcLog {
+                stored: stored.clone(),
+            }),
+        );
+        let a = shared.zone_store(DEFAULT_ZONE).unwrap();
+        let gc = |s: &Rc<RefCell<VersionedStore<MemBlockDevice>>>| {
+            s.borrow_mut().compact(20_000).unwrap().gc_dropped
+        };
+
+        assert!(shared.persist_gc_watermark(6_000));
+        assert!(shared.persist_gc_watermark(6_000));
+        assert_eq!(*stored.borrow(), [6_000]);
+        assert_eq!((gc(&a), gc(&b)), (1, 0));
+
+        shared.record_contact_fenced(6_000);
+        shared.record_contact_fenced(7_000);
+        assert!(shared.persist_gc_watermark(10_000));
+        assert!(shared.persist_gc_watermark(20_000));
+        assert_eq!(*stored.borrow(), [6_000, 10_000]);
+        assert_eq!(gc(&b), 0);
+
+        b.borrow_mut()
+            .apply_at(b"anchor", Some(b"w"), at(11_000), 11_000)
+            .unwrap();
+        shared.record_contact_fenced(11_000);
+        assert_eq!(*stored.borrow(), [6_000, 10_000, 11_000]);
+        assert_eq!(gc(&b), 0);
+        assert!(shared.persist_gc_watermark(11_000));
+        assert_eq!(stored.borrow().len(), 3);
+        assert_eq!(gc(&b), 1);
+    }
+
     fn build_store() -> VersionedStore<MemBlockDevice> {
         let dev = MemBlockDevice::new(256, 8192);
         let engine = Engine::create_prewiped(

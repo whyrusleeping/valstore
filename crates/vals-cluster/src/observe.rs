@@ -392,6 +392,10 @@ counters! {
     wipes,
     /// Failures persisting the liveness watermark (durability degraded).
     watermark_persist_errors,
+    /// Synchronous liveness-watermark stores attempted on a shard thread (each a durable write: file fsync + rename + directory fsync, or a superblock write).
+    watermark_persists,
+    /// Shard-thread wall time spent in liveness-watermark stores, in microseconds.
+    watermark_persist_us,
     /// Failures persisting the adopted zone catalog (pre-replay optimization degraded).
     catalog_persist_errors,
     /// Ring (`SetMembers`) configs adopted.

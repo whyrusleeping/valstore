@@ -148,6 +148,17 @@ struct Liveness {
     log: Box<dyn crate::liveness::LivenessLog>,
 }
 
+impl Liveness {
+    fn store(&self, watermark_ms: u64) -> std::io::Result<()> {
+        let started = std::time::Instant::now();
+        let result = self.log.store(watermark_ms);
+        let c = crate::observe::counters();
+        c.watermark_persists.inc();
+        c.watermark_persist_us.add(started.elapsed().as_micros() as u64);
+        result
+    }
+}
+
 pub(crate) struct ServerShared<D: BlockDevice> {
     pub(crate) settings: crate::node_settings::NodeSettings,
     pub(crate) node_id: NodeId,
