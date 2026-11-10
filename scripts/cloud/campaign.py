@@ -557,7 +557,7 @@ class Campaign:
             env = self.np_env(step, i + 1)
             env["LD_LIBRARY_PATH"] = "%s/lib" % c.root
             jobs.append(cl.RemoteJob(c, "%s-%s" % (step["name"], c.name.rsplit("-", 1)[-1]),
-                                     "%s vals netprogress %s default" % (self.bin(c, "vals-bench"), shlex.quote(self.peers())),
+                                     "%s vals netprogress %s default" % (self.bin(c, "vals-bench"), shlex.quote(self.peers() + ";")),
                                      env=env))
         return jobs
 
