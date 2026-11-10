@@ -448,6 +448,64 @@ fn merge_stream_non_ascending_source_fails_closed_through_stream_builder() {
 }
 
 #[test]
+fn merge_stream_charges_dropped_inputs_and_pauses_when_the_budget_is_spent() {
+    let keys: Vec<Vec<u8>> = (0..10u32).map(|i| format!("k{i:02}").into_bytes()).collect();
+    let older = ScriptSource::new(keys.iter().map(|k| snap_entry(k, 1)).collect());
+    let newer = ScriptSource::new(keys.iter().map(|k| snap_entry(k, 2)).collect());
+    let dropped = std::cell::Cell::new(0);
+    let mut stream = MergeStream::new(vec![older, newer], |e: &SnapshotEntry| {
+        let drop = e.key != b"k07";
+        dropped.set(dropped.get() + usize::from(drop));
+        drop
+    });
+    let mut budget = 5;
+    assert!(matches!(stream.next_within(&mut budget).unwrap(), MergeStep::Paused));
+    assert_eq!(dropped.get(), 3, "each dropped winner consumed two inputs");
+    budget = 100;
+    match stream.next_within(&mut budget).unwrap() {
+        MergeStep::Entry(e) => assert_eq!((e.key.as_slice(), e.version), (&b"k07"[..], 2)),
+        _ => panic!("the survivor is returned"),
+    }
+    assert_eq!(budget, 92);
+    assert!(matches!(stream.next_within(&mut budget).unwrap(), MergeStep::Done));
+    assert_eq!(dropped.get(), 9);
+}
+
+#[test]
+fn all_dropped_merge_input_yields_between_chunks() {
+    if co_compact_env(false) { return; }
+    std::env::set_var("VALS_MERGE_TIER_MIN_K", "2");
+    let cfg = Config {
+        seg_blocks: 8,
+        reserved_blocks: 0,
+        ordering: Ordering::Sorted,
+    };
+    let mut e = Engine::create_prewiped(MemBlockDevice::new(BS, 32768), cfg);
+    let opts = RunBuildOpts {
+        num_buckets: 64,
+        ..Default::default()
+    };
+    for batch in 0..2u128 {
+        for i in 0..9000u32 {
+            e.put_kind(format!("k{i:05}").as_bytes(), b"", batch + 1, true).unwrap();
+        }
+        run_flush(&mut e, opts).unwrap();
+    }
+    let plan = e.compact_plan(opts, Some(100)).unwrap().unwrap();
+    assert!(plan.shadow.is_none(), "premise: tombstones are dropped by the stream predicate");
+    let mut yields = 0;
+    let wdev = Arc::new(e.device().sibling().unwrap());
+    let written = vals_rt::block_on(compact_and_write(plan, wdev), || yields += 1).unwrap();
+    assert!(yields >= 4, "18000 dropped inputs must span three 8192-input chunks, yielded {yields} times");
+    assert_eq!(written.entry_count, 0);
+    assert_eq!(written.dropped_tombstones.len(), 9000);
+    assert!(written.dropped_tombstones.iter().all(|(_, v)| *v == 2));
+    let stats = e.compact_commit(written).unwrap();
+    assert_eq!(stats.current_dropped_tombstones.len(), 9000);
+    assert_eq!(e.version(b"k04242").unwrap(), None);
+}
+
+#[test]
 fn gc_defers_when_an_older_mutable_candidate_could_resurface() {
     let cfg = Config {
         seg_blocks: 4,

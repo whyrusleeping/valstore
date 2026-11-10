@@ -577,8 +577,8 @@ async fn compact_and_write_inner<D: BlockDevice>(
         while chunk.len() < CO_COMPACT_CHUNK && budget > 0 {
             let e = match pending.take() {
                 Some(e) => e,
-                None => match stream.next() {
-                    Ok(Some(e)) => {
+                None => match stream.next_within(&mut budget) {
+                    Ok(MergeStep::Entry(e)) => {
                         if keep_cover.as_mut().is_some_and(|c| range_delete::is_covered(c.cover(&e.key), e.version))
                             || released_cover.as_mut().is_some_and(|c| range_delete::is_covered(c.cover(&e.key), e.version))
                         {
@@ -588,7 +588,8 @@ async fn compact_and_write_inner<D: BlockDevice>(
                         }
                         e
                     }
-                    Ok(None) => {
+                    Ok(MergeStep::Paused) => break,
+                    Ok(MergeStep::Done) => {
                         exhausted = true;
                         break;
                     }
@@ -1186,6 +1187,12 @@ fn merge_cursors<D: BlockDevice, F: FnMut(&SnapshotEntry) -> bool>(
     merge_sources(sources, drop_winner)
 }
 
+pub(super) enum MergeStep {
+    Entry(SnapshotEntry),
+    Paused,
+    Done,
+}
+
 pub(super) struct MergeStream<S: MergeSource, F: FnMut(&SnapshotEntry) -> bool> {
     sources: Vec<S>,
     heads: Vec<Option<SnapshotEntry>>,
@@ -1208,6 +1215,21 @@ impl<S: MergeSource, F: FnMut(&SnapshotEntry) -> bool> MergeStream<S, F> {
     }
 
     pub(super) fn next(&mut self) -> Result<Option<SnapshotEntry>, EngineError> {
+        loop {
+            let mut unbounded = usize::MAX;
+            match self.next_within(&mut unbounded)? {
+                MergeStep::Entry(e) => return Ok(Some(e)),
+                MergeStep::Done => return Ok(None),
+                MergeStep::Paused => {}
+            }
+        }
+    }
+
+    /// Like `next`, but each dropped winner charges `budget` one per input entry it consumed,
+    /// pausing once the budget is spent so an all-drop stretch (tombstone GC, forgets) can't
+    /// drain the stream in one call past the worker's yield/pace/cancel checkpoint.
+    /// Returned entries are left for the caller to charge.
+    pub(super) fn next_within(&mut self, budget: &mut usize) -> Result<MergeStep, EngineError> {
         if !self.primed {
             for s in &mut self.sources {
                 self.heads.push(s.next_entry()?);
@@ -1222,7 +1244,7 @@ impl<S: MergeSource, F: FnMut(&SnapshotEntry) -> bool> MergeStream<S, F> {
                 }
             }
             let Some(min_key) = min_key else {
-                return Ok(None);
+                return Ok(MergeStep::Done);
             };
 
             if let Some(last) = &self.last_key {
@@ -1235,8 +1257,10 @@ impl<S: MergeSource, F: FnMut(&SnapshotEntry) -> bool> MergeStream<S, F> {
             let min_key = min_key.to_vec();
 
             let mut best: Option<SnapshotEntry> = None;
+            let mut consumed = 0;
             for i in (0..self.heads.len()).rev() {
                 if self.heads[i].as_ref().is_some_and(|h| h.key == min_key) {
+                    consumed += 1;
                     let h = self.heads[i].take().unwrap();
                     if best.as_ref().is_none_or(|b| h.version > b.version) {
                         best = Some(h);
@@ -1248,9 +1272,13 @@ impl<S: MergeSource, F: FnMut(&SnapshotEntry) -> bool> MergeStream<S, F> {
             self.last_key = Some(min_key);
             if (self.drop_winner)(&best) {
                 self.dropped.push((best.key.clone(), best.version));
+                *budget = budget.saturating_sub(consumed);
+                if *budget == 0 {
+                    return Ok(MergeStep::Paused);
+                }
                 continue;
             }
-            return Ok(Some(best));
+            return Ok(MergeStep::Entry(best));
         }
     }
 
