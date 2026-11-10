@@ -108,6 +108,8 @@ pub const DEFAULT_RUN_BLOCK_TARGET_BYTES: usize = 32 * 1024;
 pub(super) const CODEC_BATCH_BLOCKS: usize = 256;
 pub(super) const STREAM_CODEC_BATCH_BLOCKS: usize = 32;
 pub const RUN_BLOCK_TARGET_BYTES_RANGE: std::ops::RangeInclusive<usize> = 4096..=256 * 1024;
+pub const DEFAULT_RUN_BLOCK_FRAME_BYTES: usize = 16 * 1024;
+pub const RUN_BLOCK_FRAME_BYTES_RANGE: std::ops::RangeInclusive<usize> = 0..=256 * 1024;
 pub const DEFAULT_RUN_BLOOM_BITS_PER_KEY: usize = 10;
 pub const RUN_BLOOM_BITS_PER_KEY_RANGE: std::ops::RangeInclusive<usize> = 4..=24;
 
@@ -140,6 +142,15 @@ pub fn parse_run_block_target_bytes(raw: Option<&str>) -> usize {
         raw,
         DEFAULT_RUN_BLOCK_TARGET_BYTES,
         RUN_BLOCK_TARGET_BYTES_RANGE,
+    )
+}
+
+pub fn parse_run_block_frame_bytes(raw: Option<&str>) -> usize {
+    parse_bounded_knob(
+        "VALS_RUN_BLOCK_FRAME_BYTES",
+        raw,
+        DEFAULT_RUN_BLOCK_FRAME_BYTES,
+        RUN_BLOCK_FRAME_BYTES_RANGE,
     )
 }
 
@@ -190,6 +201,35 @@ pub fn run_block_target_bytes() -> usize {
     static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| {
         parse_run_block_target_bytes(std::env::var("VALS_RUN_BLOCK_TARGET_BYTES").ok().as_deref())
+    })
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+thread_local! {
+    static BLOCK_FRAME_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn with_run_block_frame_bytes<R>(bytes: usize, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BLOCK_FRAME_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(BLOCK_FRAME_OVERRIDE.with(|c| c.replace(Some(bytes))));
+    f()
+}
+
+/// Target encoded bytes per zstd frame inside a compressed run block (0: one frame per block).
+pub fn run_block_frame_bytes() -> usize {
+    #[cfg(any(test, feature = "test-fixtures"))]
+    if let Some(v) = BLOCK_FRAME_OVERRIDE.with(|c| c.get()) {
+        return v;
+    }
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_run_block_frame_bytes(std::env::var("VALS_RUN_BLOCK_FRAME_BYTES").ok().as_deref())
     })
 }
 

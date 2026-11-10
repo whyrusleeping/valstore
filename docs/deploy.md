@@ -708,15 +708,19 @@ The RAM admission budget defaults to 70% of `MemTotal`
 (`ram_budget_bytes`, see [`configuration.md`](configuration.md#node-resource-and-maintenance-settings)).
 
 **Read and overwrite cost of 32 KiB blocks.** A run probe reads one whole
-block, about 19–24 KiB from the device, and spends about 2 µs of CPU per
-probed block, mostly on the block CRC. Range scans decode only the entries a
-page returns, but a page still reads each overlapping run's whole block.
-Overwrite-heavy workloads pay most, because every write to a key no longer in
-the memtable resolves its old version from a run block: with 20k hot keys,
-32 KiB blocks were 15–20% slower than 4 KiB blocks. Such deployments can trade
-RAM for speed with `VALS_RUN_BLOCK_TARGET_BYTES` of 8192–16384 (default 32768,
-clamped to 4096–262144, new runs only; it is listed with the diagnostic
-controls in [`configuration.md`](configuration.md#diagnostic--a-b-controls-do-not-promote-to-public-config)).
+block (v7: about 9–11 KiB of compressed ATProto entries) and decompresses the
+zstd frame its key falls in, about 10–12 µs of CPU per 16 KiB frame; that is
+most of the cost of a capacity-profile overwrite, because every write to a key
+no longer in the memtable resolves its old version from a run block (0570: a
+one-shard node did ~700k batched fresh inserts/s but 42k overwrites/s with
+one frame per block and 71k with 16 KiB frames). Range scans decode only the
+entries a page returns, but a page still reads and decompresses each
+overlapping run's whole block. Overwrite- or point-read-heavy deployments can
+trade stored bytes for probe CPU with `VALS_RUN_BLOCK_FRAME_BYTES=8192` (116k
+overwrites/s on the same node; about 15–19% more run bytes, no RAM change) or
+RAM for both with `VALS_RUN_BLOCK_TARGET_BYTES` of 8192–16384 (default 32768,
+clamped to 4096–262144, more fence RAM per entry; new runs only for both; they
+are listed with the diagnostic controls in [`configuration.md`](configuration.md#diagnostic--a-b-controls-do-not-promote-to-public-config)).
 `vals_read_probe_bytes` and `vals_apply_probe_bytes`, divided by
 `vals_read_probe_blocks` and `vals_apply_probe_blocks`, give bytes per probed
 block.

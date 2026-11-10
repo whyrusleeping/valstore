@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use super::{
-    compress_block_body, decode_block_body, decode_block_payload, encode_block_body, BlockedBloom, Cursor, EntryKey,
-    RtLocator,
+    check_frame_index, compress_block_body_framed, decode_block_body, decode_block_payload, encode_block_body,
+    encode_block_body_framed, BlockedBloom, Cursor, EntryKey, RtLocator,
 };
 use crate::range_tombstone::{decode_rt_block, encode_rt_block, RtRecord};
 use crate::crc;
@@ -100,6 +100,7 @@ pub mod test_seams {
         static KNOCKOUTS: Cell<u8> = const { Cell::new(0) };
         static BUFFER_FLIP: Cell<Option<(usize, usize, u8)>> = const { Cell::new(None) };
         static CODED_FLIP: Cell<Option<(usize, usize, u8)>> = const { Cell::new(None) };
+        static FRAME_INDEX_FLIP: Cell<Option<(usize, usize, u8)>> = const { Cell::new(None) };
         static STREAM_FLIP: Cell<Option<(u64, usize, u8, bool)>> = const { Cell::new(None) };
         static INDEX_FLIP: Cell<Option<(usize, u8)>> = const { Cell::new(None) };
         static RT_FLIP: Cell<Option<(usize, u8)>> = const { Cell::new(None) };
@@ -149,6 +150,26 @@ pub mod test_seams {
 
     pub(crate) fn take_coded_flip(block: usize) -> Option<(usize, u8)> {
         CODED_FLIP.with(|c| match c.get() {
+            Some((b, offset, mask)) if b == block => {
+                c.set(None);
+                Some((offset, mask))
+            }
+            _ => None,
+        })
+    }
+
+    /// Flips a byte of block `block`'s frame index after it is built and re-seals the index
+    /// CRC: a framed block whose index is self-consistent but wrong for its body.
+    pub fn arm_frame_index_flip(block: usize, offset: usize, mask: u8) {
+        FRAME_INDEX_FLIP.with(|c| c.set(Some((block, offset, mask))));
+    }
+
+    pub fn frame_index_flip_armed() -> bool {
+        FRAME_INDEX_FLIP.with(|c| c.get().is_some())
+    }
+
+    pub(crate) fn take_frame_index_flip(block: usize) -> Option<(usize, u8)> {
+        FRAME_INDEX_FLIP.with(|c| match c.get() {
             Some((b, offset, mask)) if b == block => {
                 c.set(None);
                 Some((offset, mask))
@@ -210,12 +231,18 @@ pub mod test_seams {
 pub(super) struct BlockFlips {
     body: Option<(usize, u8)>,
     coded: Option<(usize, u8)>,
+    #[cfg(any(test, feature = "test-fixtures"))]
+    frame_index: Option<(usize, u8)>,
 }
 
 fn take_flips(_block: usize) -> BlockFlips {
     #[cfg(any(test, feature = "test-fixtures"))]
     {
-        BlockFlips { body: test_seams::take_buffer_flip(_block), coded: test_seams::take_coded_flip(_block) }
+        BlockFlips {
+            body: test_seams::take_buffer_flip(_block),
+            coded: test_seams::take_coded_flip(_block),
+            frame_index: test_seams::take_frame_index_flip(_block),
+        }
     }
     #[cfg(not(any(test, feature = "test-fixtures")))]
     {
@@ -264,20 +291,34 @@ fn block_facts(body: &[u8]) -> Option<BlockFacts> {
     (c.off == body.len()).then_some(BlockFacts { entries, first_key, last_key: key, max_hlc })
 }
 
-fn code_block(src: &[SnapshotEntry], compress: bool, flips: BlockFlips) -> CodedBlock {
-    let mut body = encode_block_body(src);
+fn code_block(src: &[SnapshotEntry], compress: bool, frame_bytes: usize, flips: BlockFlips) -> CodedBlock {
+    let (mut body, frames, extra) = encode_block_body_framed(src, if compress { frame_bytes } else { 0 });
     if let Some((offset, mask)) = flips.body {
         body[offset] ^= mask;
     }
-    if let Some(mut coded) = compress.then(|| compress_block_body(&body)).flatten() {
+    let limit = body.len() - extra;
+    if let Some(mut coded) = compress.then(|| compress_block_body_framed(&body, &frames, limit)).flatten() {
         drop(body);
         if let Some((offset, mask)) = flips.coded {
             coded[offset] ^= mask;
         }
+        #[cfg(any(test, feature = "test-fixtures"))]
+        if let Some((offset, mask)) = flips.frame_index {
+            super::flip_frame_index(&mut coded, offset, mask);
+        }
         let crc = crc::crc32(&coded);
-        let decoded = decode_block_payload(&coded).map(|d| Some(d.into_owned()));
+        let decoded = decode_block_payload(&coded).map(|d| d.into_owned()).and_then(|d| {
+            check_frame_index(&coded, &d)?;
+            Ok(Some(d))
+        });
         let facts = decoded.as_ref().ok().and_then(|d| block_facts(d.as_deref()?));
         return CodedBlock { stored: coded, crc, decoded, facts };
+    }
+    if !frames.is_empty() {
+        body = encode_block_body(src);
+        if let Some((offset, mask)) = flips.body {
+            body[offset] ^= mask;
+        }
     }
     let crc = crc::crc32(&body);
     let facts = block_facts(&body);
@@ -366,6 +407,7 @@ pub(super) struct EncodeCheck {
     coded_body: Option<Vec<u8>>,
     raw_data: u64,
     max_raw_block: u32,
+    frame_bytes: usize,
 }
 
 impl EncodeCheck {
@@ -388,6 +430,7 @@ impl EncodeCheck {
             coded_body: None,
             raw_data: 0,
             max_raw_block: 0,
+            frame_bytes: super::run_block_frame_bytes(),
         }
     }
 
@@ -451,7 +494,7 @@ impl EncodeCheck {
         bloom: &mut BlockedBloom,
         compress: bool,
     ) -> Result<(Vec<u8>, Vec<u8>), Box<EncodeIntegrityError>> {
-        let coded = code_block(src, compress, take_flips(self.blocks));
+        let coded = code_block(src, compress, self.frame_bytes, take_flips(self.blocks));
         self.block_coded(src, coded, expect, bloom)
     }
 
@@ -460,8 +503,9 @@ impl EncodeCheck {
     pub(super) fn code_blocks(&self, srcs: &[&[SnapshotEntry]], compress: bool) -> Vec<CodedBlock> {
         let flips: Vec<BlockFlips> = (0..srcs.len()).map(|i| take_flips(self.blocks + i)).collect();
         let threads = if compress { run_codec_threads().min(srcs.len()) } else { 1 };
+        let frame_bytes = self.frame_bytes;
         let code = |t: usize| -> Vec<(usize, CodedBlock)> {
-            (t..srcs.len()).step_by(threads).map(|i| (i, code_block(srcs[i], compress, flips[i]))).collect()
+            (t..srcs.len()).step_by(threads).map(|i| (i, code_block(srcs[i], compress, frame_bytes, flips[i]))).collect()
         };
         if threads <= 1 {
             return code(0).into_iter().map(|(_, c)| c).collect();

@@ -128,16 +128,31 @@ fn check_block(block: &[u8], probes: &[Vec<u8>]) {
 #[test]
 fn block_decoders_agree_and_never_panic_on_resealed_mutations() {
     let mut rng = Rng(0x0536_B10C_F022_0001);
-    let mut coded_rounds = 0;
+    let (mut coded_rounds, mut framed_rounds) = (0, 0);
     for round in 0..4000u32 {
-        let entries = gen_entries(&mut rng);
-        let block = encode_block(&entries);
-        let block = match compress_block_body(&block[..block.len() - 4]) {
-            Some(coded) if round % 2 == 1 => {
-                coded_rounds += 1;
-                reseal(coded)
+        let mut entries = gen_entries(&mut rng);
+        let block = if round % 4 == 3 {
+            for (i, e) in entries.iter_mut().enumerate() {
+                e.ptr = ValuePtr { segment: SegmentId(3), offset: i as u32 * 128, len: 100 };
+                (e.seq, e.version) = (i as u64, (i as u128 + 1) << 64);
             }
-            _ => block,
+            let (body, frames, extra) = encode_block_body_framed(&entries, 128 << rng.range(0, 2));
+            match compress_block_body_framed(&body, &frames, body.len() - extra) {
+                Some(coded) if !frames.is_empty() => {
+                    framed_rounds += 1;
+                    reseal(coded)
+                }
+                _ => encode_block(&entries),
+            }
+        } else {
+            let block = encode_block(&entries);
+            match compress_block_body(&block[..block.len() - 4]) {
+                Some(coded) if round % 4 == 1 => {
+                    coded_rounds += 1;
+                    reseal(coded)
+                }
+                _ => block,
+            }
         };
         let mut probes: Vec<Vec<u8>> = entries.iter().map(|e| e.key.clone()).collect();
         for _ in 0..4 {
@@ -154,7 +169,8 @@ fn block_decoders_agree_and_never_panic_on_resealed_mutations() {
             panic!("round {round}: block decoders panicked or diverged on {} bytes: {bytes:02x?}", bytes.len());
         }
     }
-    assert!(coded_rounds > 1000, "{coded_rounds} compressed blocks fuzzed");
+    assert!(coded_rounds > 500, "{coded_rounds} compressed blocks fuzzed");
+    assert!(framed_rounds > 500, "{framed_rounds} framed blocks fuzzed");
 }
 
 #[test]

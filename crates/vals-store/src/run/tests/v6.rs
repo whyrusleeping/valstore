@@ -302,7 +302,7 @@ fn rewrite_growth_covers_a_v5_input_rewritten_as_v6() {
         let input = DeviceRun::open(dev, &alloc, handle).unwrap();
         assert_eq!(v6.len(), v5.len() + rewrite_growth_bytes(&input, RUN_RT_VERSION), "n={n}");
         assert_eq!(rewrite_growth_bytes(&input, RUN_BLOCK_VERSION), 0);
-        let v7 = build_run_versioned(&entries, opts, RUN_VERSION);
+        let v7 = with_run_block_frame_bytes(0, || build_run_versioned(&entries, opts, RUN_VERSION));
         let (dev7, mut alloc7) = dev_alloc(16_384, SEG_BLOCKS);
         let handle7 = write_run(&*dev7, &mut alloc7, &v7).unwrap();
         let out = DeviceRun::open(dev7, &alloc7, handle7).unwrap();

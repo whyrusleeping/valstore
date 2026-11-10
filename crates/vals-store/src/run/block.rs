@@ -73,6 +73,275 @@ pub(super) fn compress_block_body(body: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+const FRAME_INDEX_MAGIC: u32 = 0x184D_2A5A;
+const FRAME_INDEX_AT: usize = CODED_HEADER_LEN + 12;
+const MAX_BLOCK_FRAMES: usize = 4096;
+const FRAME_BUF_KEEP: usize = 1 << 20;
+
+/// One frame of a framed block body: the body offset its entries end at, their count, and
+/// for every frame after the first the separator that routes lookups to it.
+pub(super) struct BodyFrame {
+    end: usize,
+    count: u32,
+    sep: Vec<u8>,
+}
+
+fn entry_estimate(e: &SnapshotEntry) -> usize {
+    8 + e.key.len() + ENTRY_FIELDS_LEN
+}
+
+fn separator(last: &[u8], first: &[u8]) -> Vec<u8> {
+    first[..(common_prefix_len(last, first) + 1).min(first.len())].to_vec()
+}
+
+/// `encode_block_body` cut into frames of about `frame_bytes` encoded bytes, each frame's
+/// first entry front-coded against nothing, so the whole stays a valid block body; also the
+/// bytes those restarts add over `encode_block_body`. A block that does not split has no
+/// frames and the plain encoding.
+pub(super) fn encode_block_body_framed(entries: &[SnapshotEntry], frame_bytes: usize) -> (Vec<u8>, Vec<BodyFrame>, usize) {
+    let total: usize = entries.iter().map(entry_estimate).sum();
+    if frame_bytes == 0 || total < frame_bytes + frame_bytes / 2 {
+        return (encode_block_body(entries), Vec::new(), 0);
+    }
+    let mut b = Vec::with_capacity(total + 4);
+    b.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    let mut frames = Vec::new();
+    let (mut sep, mut count, mut size, mut done, mut extra) = (Vec::new(), 0u32, 0usize, 0usize, 0usize);
+    let mut prev: &[u8] = &[];
+    for e in entries {
+        if count > 0 && size >= frame_bytes && total - done >= frame_bytes / 2 {
+            extra += common_prefix_len(prev, &e.key);
+            let next = separator(prev, &e.key);
+            frames.push(BodyFrame { end: b.len(), count, sep: std::mem::replace(&mut sep, next) });
+            (count, size, prev) = (0, 0, &[]);
+        }
+        push_entry(&mut b, prev, e);
+        prev = &e.key;
+        count += 1;
+        size += entry_estimate(e);
+        done += entry_estimate(e);
+    }
+    frames.push(BodyFrame { end: b.len(), count, sep });
+    if frames.len() < 2 {
+        frames.clear();
+    }
+    (b, frames, extra)
+}
+
+/// The compressed form of a framed block body: `[u32 body_len][u32 codec]`, a zstd skippable
+/// frame holding the CRC-checked frame index, then one zstd frame per body frame. zstd decodes
+/// the whole as one stream, so any v7 reader gets the body back. `None` unless it is shorter
+/// than `limit`, the body's length without its frame restarts.
+pub(super) fn compress_block_body_framed(body: &[u8], frames: &[BodyFrame], limit: usize) -> Option<Vec<u8>> {
+    if frames.len() < 2 {
+        return compress_block_body(body);
+    }
+    if body.len() > MAX_BLOCK_BODY || frames.len() > MAX_BLOCK_FRAMES {
+        return None;
+    }
+    let coded: Vec<Vec<u8>> = with_zstd(|z| {
+        if z.compressor.is_none() {
+            z.compressor = new_compressor().ok();
+        }
+        let c = z.compressor.as_mut()?;
+        let mut start = 0;
+        let mut out = Vec::with_capacity(frames.len());
+        for f in frames {
+            let src = &body[start..f.end];
+            let mut buf = vec![0u8; zstd::zstd_safe::compress_bound(src.len())];
+            let n = c.compress_to_buffer(src, &mut buf[..]).ok()?;
+            buf.truncate(n);
+            out.push(buf);
+            start = f.end;
+        }
+        Some(out)
+    })?;
+    let mut index = Vec::new();
+    index.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+    for (f, c) in frames.iter().zip(&coded) {
+        index.extend_from_slice(&f.count.to_le_bytes());
+        index.extend_from_slice(&(f.end as u32).to_le_bytes());
+        index.extend_from_slice(&(c.len() as u32).to_le_bytes());
+    }
+    for f in &frames[1..] {
+        index.extend_from_slice(&(f.sep.len() as u32).to_le_bytes());
+        index.extend_from_slice(&f.sep);
+    }
+    let len = FRAME_INDEX_AT + index.len() + coded.iter().map(Vec::len).sum::<usize>();
+    if len >= limit {
+        return None;
+    }
+    let mut out = Vec::with_capacity(len);
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&BLOCK_CODEC_ZSTD.to_le_bytes());
+    out.extend_from_slice(&FRAME_INDEX_MAGIC.to_le_bytes());
+    out.extend_from_slice(&(4 + index.len() as u32).to_le_bytes());
+    out.extend_from_slice(&crc::crc32(&index).to_le_bytes());
+    out.extend_from_slice(&index);
+    for c in &coded {
+        out.extend_from_slice(c);
+    }
+    Some(out)
+}
+
+struct IndexedFrame {
+    count: u32,
+    start: usize,
+    end: usize,
+    at: usize,
+    len: usize,
+}
+
+/// A framed block's parsed frame index; `seps[j]` routes keys to frame `j + 1`.
+struct FrameIndex<'a> {
+    body_len: usize,
+    frames: smallvec::SmallVec<[IndexedFrame; 4]>,
+    seps: smallvec::SmallVec<[&'a [u8]; 4]>,
+}
+
+/// The frame index of a framed compressed block payload, `None` for any other payload. The
+/// index must pass its CRC and describe frames that tile the body and the payload exactly.
+fn parse_frame_index(payload: &[u8]) -> Result<Option<FrameIndex<'_>>, FrameError> {
+    if payload.len() < CODED_HEADER_LEN || payload[4..8] == [0; 4] {
+        return Ok(None);
+    }
+    if u32::from_le_bytes(payload[4..8].try_into().unwrap()) != BLOCK_CODEC_ZSTD {
+        return Err(FrameError::Codec);
+    }
+    if payload.len() < FRAME_INDEX_AT || u32::from_le_bytes(payload[8..12].try_into().unwrap()) != FRAME_INDEX_MAGIC {
+        return Ok(None);
+    }
+    const BAD: FrameError = FrameError::FrameIndex;
+    let body_len = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+    let skippable = u32::from_le_bytes(payload[12..16].try_into().unwrap()) as usize;
+    let index = payload.get(FRAME_INDEX_AT..(CODED_HEADER_LEN + 8).checked_add(skippable).ok_or(BAD)?).ok_or(BAD)?;
+    if crc::crc32(index) != u32::from_le_bytes(payload[16..20].try_into().unwrap()) {
+        return Err(BAD);
+    }
+    let mut c = Cursor { b: index, off: 0 };
+    let n = c.u32().map_err(|_| BAD)? as usize;
+    if !(2..=MAX_BLOCK_FRAMES).contains(&n) || body_len > MAX_BLOCK_BODY {
+        return Err(BAD);
+    }
+    let mut frames = smallvec::SmallVec::new();
+    let (mut start, mut at) = (0usize, FRAME_INDEX_AT + index.len());
+    for _ in 0..n {
+        let count = c.u32().map_err(|_| BAD)?;
+        let end = c.u32().map_err(|_| BAD)? as usize;
+        let len = c.u32().map_err(|_| BAD)? as usize;
+        if end <= start.max(4) || len == 0 {
+            return Err(BAD);
+        }
+        frames.push(IndexedFrame { count, start, end, at, len });
+        (start, at) = (end, at.checked_add(len).ok_or(BAD)?);
+    }
+    if start != body_len || at != payload.len() {
+        return Err(BAD);
+    }
+    let mut seps = smallvec::SmallVec::new();
+    for _ in 1..n {
+        let len = c.u32().map_err(|_| BAD)? as usize;
+        seps.push(c.take(len).map_err(|_| BAD)?);
+    }
+    if c.off != index.len() {
+        return Err(BAD);
+    }
+    Ok(Some(FrameIndex { body_len, frames, seps }))
+}
+
+thread_local! {
+    static FRAME_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+fn framed_lookup(payload: &[u8], ix: &FrameIndex<'_>, key: &[u8]) -> Result<Option<SnapshotEntry>, &'static str> {
+    let j = ix.seps.partition_point(|sep| *sep <= key);
+    let f = &ix.frames[j];
+    let src = &payload[f.at..f.at + f.len];
+    let want = f.end - f.start;
+    let skip = if j == 0 { 4 } else { 0 };
+    let decode = |buf: &mut [u8]| -> Result<Option<SnapshotEntry>, &'static str> {
+        let n = with_zstd(|z| {
+            if z.decompressor.is_none() {
+                z.decompressor = zstd::bulk::Decompressor::new().ok();
+            }
+            z.decompressor.as_mut()?.decompress_to_buffer(src, &mut *buf).ok()
+        });
+        if n != Some(want) {
+            return Err(FrameError::Decompress.why());
+        }
+        lookup_entries(Cursor { b: buf, off: skip }, f.count, key)
+    };
+    if want > FRAME_BUF_KEEP {
+        return decode(&mut vec![0u8; want][..]);
+    }
+    FRAME_BUF.with(|b| {
+        let mut b = b.borrow_mut();
+        if b.len() < want {
+            b.resize(want, 0);
+        }
+        decode(&mut b[..want])
+    })
+}
+
+/// Checks a framed block's index against its decoded body: every frame's declared content
+/// size, entry counts and offsets, a restarted first entry per frame, and separators that
+/// lie above the previous frame's last key and at or below the frame's first key.
+pub(super) fn check_frame_index(payload: &[u8], body: &[u8]) -> Result<(), FrameError> {
+    const BAD: FrameError = FrameError::FrameIndex;
+    let Some(ix) = parse_frame_index(payload)? else { return Ok(()) };
+    if ix.body_len != body.len() {
+        return Err(BAD);
+    }
+    let mut c = Cursor { b: body, off: 4 };
+    let total = body_count(body).map_err(|_| BAD)?;
+    let (mut seen, mut key, mut last) = (0u32, Vec::new(), Vec::new());
+    for (j, f) in ix.frames.iter().enumerate() {
+        let frame = &payload[f.at..f.at + f.len];
+        if zstd::zstd_safe::find_frame_compressed_size(frame) != Ok(f.len)
+            || !matches!(zstd::zstd_safe::get_frame_content_size(frame), Ok(Some(n)) if n == (f.end - f.start) as u64)
+            || c.off != f.start.max(4)
+        {
+            return Err(BAD);
+        }
+        for k in 0..f.count {
+            let restart = j > 0 && k == 0;
+            let e = c.entry_key(if restart { 0 } else { key.len() }).map_err(|_| BAD)?;
+            c.skip_entry_fields().map_err(|_| BAD)?;
+            if restart {
+                last.clear();
+                last.extend_from_slice(&key);
+            }
+            key.truncate(e.shared);
+            key.extend_from_slice(e.suffix);
+            if restart && !(last.as_slice() < ix.seps[j - 1] && ix.seps[j - 1] <= key.as_slice()) {
+                return Err(BAD);
+            }
+        }
+        if c.off != f.end {
+            return Err(BAD);
+        }
+        seen = seen.checked_add(f.count).ok_or(BAD)?;
+    }
+    if seen != total {
+        return Err(BAD);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn block_frame_count(block: &[u8]) -> usize {
+    let payload = &block[..block.len().saturating_sub(4)];
+    parse_frame_index(payload).ok().flatten().map_or(0, |ix| ix.frames.len())
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+pub(super) fn flip_frame_index(payload: &mut [u8], offset: usize, mask: u8) {
+    let Ok(Some(end)) = parse_frame_index(payload).map(|ix| ix.map(|ix| ix.frames[0].at)) else { return };
+    payload[FRAME_INDEX_AT + offset] ^= mask;
+    let crc = crc::crc32(&payload[FRAME_INDEX_AT..end]);
+    payload[16..20].copy_from_slice(&crc.to_le_bytes());
+}
+
 /// Decodes the payload of a block (its bytes before the CRC) to the encoded entry body:
 /// a payload whose bytes 4..8 are zero, or that is shorter than a coded header, is already
 /// the body (the first entry of a block always has a zero shared-prefix length there).
@@ -81,9 +350,7 @@ pub(super) fn decode_block_payload(payload: &[u8]) -> Result<Cow<'_, [u8]>, Fram
         return Ok(Cow::Borrowed(payload));
     }
     let body_len = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
-    if u32::from_le_bytes(payload[4..8].try_into().unwrap()) != BLOCK_CODEC_ZSTD {
-        return Err(FrameError::Codec);
-    }
+    parse_frame_index(payload)?;
     if body_len > MAX_BLOCK_BODY {
         return Err(FrameError::Decompress);
     }
@@ -142,27 +409,33 @@ pub(super) fn encode_block_body(entries: &[SnapshotEntry]) -> Vec<u8> {
     b.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     let mut prev: &[u8] = &[];
     for e in entries {
-        let shared = common_prefix_len(prev, &e.key);
-        let suffix = &e.key[shared..];
-        debug_assert!(
-            (suffix.len() as u64) < SUFFIX_TOMB_BIT as u64,
-            "key suffix too long to pack the tombstone flag"
-        );
-        let mut suffix_field = suffix.len() as u32;
-        if e.tombstone {
-            suffix_field |= SUFFIX_TOMB_BIT;
-        }
-        b.extend_from_slice(&(shared as u32).to_le_bytes());
-        b.extend_from_slice(&suffix_field.to_le_bytes());
-        b.extend_from_slice(suffix);
-        b.extend_from_slice(&e.ptr.segment.0.to_le_bytes());
-        b.extend_from_slice(&e.ptr.offset.to_le_bytes());
-        b.extend_from_slice(&e.ptr.len.to_le_bytes());
-        b.extend_from_slice(&e.seq.to_le_bytes());
-        b.extend_from_slice(&e.version.to_le_bytes());
+        push_entry(&mut b, prev, e);
         prev = &e.key;
     }
     b
+}
+
+/// Appends `e` to a block body, its key front-coded against `prev`.
+#[inline]
+fn push_entry(b: &mut Vec<u8>, prev: &[u8], e: &SnapshotEntry) {
+    let shared = common_prefix_len(prev, &e.key);
+    let suffix = &e.key[shared..];
+    debug_assert!(
+        (suffix.len() as u64) < SUFFIX_TOMB_BIT as u64,
+        "key suffix too long to pack the tombstone flag"
+    );
+    let mut suffix_field = suffix.len() as u32;
+    if e.tombstone {
+        suffix_field |= SUFFIX_TOMB_BIT;
+    }
+    b.extend_from_slice(&(shared as u32).to_le_bytes());
+    b.extend_from_slice(&suffix_field.to_le_bytes());
+    b.extend_from_slice(suffix);
+    b.extend_from_slice(&e.ptr.segment.0.to_le_bytes());
+    b.extend_from_slice(&e.ptr.offset.to_le_bytes());
+    b.extend_from_slice(&e.ptr.len.to_le_bytes());
+    b.extend_from_slice(&e.seq.to_le_bytes());
+    b.extend_from_slice(&e.version.to_le_bytes());
 }
 
 pub(super) struct Cursor<'a> {
@@ -197,6 +470,7 @@ pub(super) enum FrameError {
     Crc,
     Codec,
     Decompress,
+    FrameIndex,
 }
 
 impl FrameError {
@@ -206,6 +480,7 @@ impl FrameError {
             FrameError::Crc => "crc mismatch",
             FrameError::Codec => "unknown block codec",
             FrameError::Decompress => "block decompression failed",
+            FrameError::FrameIndex => "block frame index is corrupt",
         }
     }
 
@@ -215,6 +490,7 @@ impl FrameError {
             FrameError::Crc => "run block crc mismatch",
             FrameError::Codec => "run block has an unknown codec",
             FrameError::Decompress => "run block decompression failed",
+            FrameError::FrameIndex => "run block frame index is corrupt",
         }
     }
 }
@@ -300,9 +576,22 @@ fn decode_entries(mut c: Cursor<'_>, count: u32) -> Result<Vec<SnapshotEntry>, &
 }
 
 pub fn block_lookup(bytes: &[u8], key: &[u8]) -> Result<Option<SnapshotEntry>, &'static str> {
-    let body = block_body(bytes).map_err(FrameError::why)?;
+    if bytes.len() < 8 {
+        return Err(FrameError::Truncated.why());
+    }
+    if !block_crc_ok(bytes) {
+        return Err(FrameError::Crc.why());
+    }
+    let payload = &bytes[..bytes.len() - 4];
+    if let Some(ix) = parse_frame_index(payload).map_err(FrameError::why)? {
+        return framed_lookup(payload, &ix, key);
+    }
+    let body = decode_block_payload(payload).map_err(FrameError::why)?;
     let count = body_count(&body)?;
-    let mut c = Cursor { b: &body, off: 4 };
+    lookup_entries(Cursor { b: &body, off: 4 }, count, key)
+}
+
+fn lookup_entries(mut c: Cursor<'_>, count: u32, key: &[u8]) -> Result<Option<SnapshotEntry>, &'static str> {
     let mut prev_len = 0usize;
     let mut matched = 0usize;
     for _ in 0..count {
@@ -340,7 +629,19 @@ pub struct BlockCursor {
 
 impl BlockCursor {
     pub fn new(bytes: Vec<u8>, lo: Option<&[u8]>, exclusive: bool) -> Result<Self, &'static str> {
-        let decoded = match block_body(&bytes).map_err(FrameError::why)? {
+        if bytes.len() < 8 {
+            return Err(FrameError::Truncated.why());
+        }
+        if !block_crc_ok(&bytes) {
+            return Err(FrameError::Crc.why());
+        }
+        let payload = &bytes[..bytes.len() - 4];
+        if let Some(lo) = lo {
+            if let Some(cursor) = Self::framed_from(payload, lo, exclusive)? {
+                return Ok(cursor);
+            }
+        }
+        let decoded = match decode_block_payload(payload).map_err(FrameError::why)? {
             Cow::Owned(body) => Some(body),
             Cow::Borrowed(_) => None,
         };
@@ -362,6 +663,32 @@ impl BlockCursor {
             cursor.seek(lo, exclusive)?;
         }
         Ok(cursor)
+    }
+
+    /// A cursor at `lo` in a CRC-checked framed block payload that decodes only the frames
+    /// from the one `lo` routes to onward; `None` when the block is not framed or `lo` routes
+    /// to its first frame.
+    fn framed_from(payload: &[u8], lo: &[u8], exclusive: bool) -> Result<Option<Self>, &'static str> {
+        let Some(ix) = parse_frame_index(payload).map_err(FrameError::why)? else { return Ok(None) };
+        let j = ix.seps.partition_point(|sep| *sep <= lo);
+        if j == 0 {
+            return Ok(None);
+        }
+        let first = &ix.frames[j];
+        let mut tail = vec![0u8; ix.body_len - first.start];
+        let n = with_zstd(|z| {
+            if z.decompressor.is_none() {
+                z.decompressor = zstd::bulk::Decompressor::new().ok();
+            }
+            z.decompressor.as_mut()?.decompress_to_buffer(&payload[first.at..], &mut tail[..]).ok()
+        });
+        if n != Some(tail.len()) {
+            return Err(FrameError::Decompress.why());
+        }
+        let left = ix.frames[j..].iter().try_fold(0u32, |n, f| n.checked_add(f.count)).ok_or(FrameError::FrameIndex.why())?;
+        let mut cursor = BlockCursor { body_end: tail.len(), bytes: tail, pos: 0, left, key: Vec::new(), prev_len: 0 };
+        cursor.seek(lo, exclusive)?;
+        Ok(Some(cursor))
     }
 
     fn seek(&mut self, lo: &[u8], exclusive: bool) -> Result<(), &'static str> {

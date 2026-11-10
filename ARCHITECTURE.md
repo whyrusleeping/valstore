@@ -246,6 +246,13 @@ Three layers, weakest-but-cheapest to strongest-but-slowest:
   `VALS_RUN_CODEC_THREADS` (4) threads and keep only the in-order source check on
   the building thread, since compression alone saturated the single flush lane.
   Pre-v7 binaries refuse v7 runs; `VALS_RUN_WRITE_VERSION=6` keeps a rollback window.
+  **Framed run blocks** (0570): a compressed block is split into ~16 KiB zstd
+  frames (`VALS_RUN_BLOCK_FRAME_BYTES`), each restarting front-coding, behind a
+  CRC-checked separator index in a zstd skippable frame, so a point probe
+  (reads, capacity-profile overwrites) decompresses one frame instead of the
+  whole block while the fence index stays per block. zstd decodes the whole as
+  one stream, so it is still format v7. One-shard overwrites went ~42k → ~71k/s
+  for ~5–7% more stored run bytes and ~11% more build CPU.
   **Range-tombstone engine core:** a sorted engine keeps a
   canonical fragment set (`range_tombstone::FragmentSet`), appends RTs as record kind
   2, replays unflushed ones from the tail, and moves RT records into flush and rewrite

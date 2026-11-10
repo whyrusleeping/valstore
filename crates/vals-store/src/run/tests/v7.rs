@@ -55,7 +55,8 @@ fn reads(dev: &MemBlockDevice, alloc: &Allocator, run: &DeviceRun<MemBlockDevice
 fn v7_compresses_blocks_and_every_read_path_matches_v6() {
     let entries = backlinks_with_tombstones(20_000);
     let (dev6, alloc6, v6) = open_built_versioned(&entries, RunBuildOpts::default(), RUN_RT_VERSION);
-    let (dev7, alloc7, v7) = open_built_versioned(&entries, RunBuildOpts::default(), RUN_VERSION);
+    let (dev7, alloc7, v7) =
+        with_run_block_frame_bytes(0, || open_built_versioned(&entries, RunBuildOpts::default(), RUN_VERSION));
     assert_eq!(v7.format_version(), RUN_VERSION);
     assert!(v7.handle.len * 2 < v6.handle.len, "v7 {} vs v6 {} bytes", v7.handle.len, v6.handle.len);
     assert_eq!(v7.index_len(), v6.index_len());
@@ -66,8 +67,9 @@ fn v7_compresses_blocks_and_every_read_path_matches_v6() {
     assert_eq!((v6.compression_savings(), v6.uncompressed_len()), (0, v6.handle.len));
     assert_eq!(reads(&dev7, &alloc7, &v7, &entries), reads(&dev6, &alloc6, &v6, &entries));
 
-    let (dev, alloc, streamed) =
-        with_run_write_version(RUN_VERSION, || build_streamed(&entries, RunBuildOpts::default(), entries.len(), 16_384, 64));
+    let (dev, alloc, streamed) = with_run_block_frame_bytes(0, || {
+        with_run_write_version(RUN_VERSION, || build_streamed(&entries, RunBuildOpts::default(), entries.len(), 16_384, 64))
+    });
     assert_eq!(streamed.format_version(), RUN_VERSION);
     assert_eq!((streamed.handle.len, streamed.uncompressed_len()), (v7.handle.len, v7.uncompressed_len()));
     assert_eq!(reads(&dev, &alloc, &streamed, &entries), reads(&dev6, &alloc6, &v6, &entries));
@@ -127,7 +129,7 @@ fn v7_build_fails_before_publication_on_a_flipped_compressed_frame() {
 #[test]
 fn resealed_bad_compressed_blocks_are_corrupt_not_panics() {
     let entries = backlinks_with_tombstones(2_000);
-    let bytes = build_run_versioned(&entries, RunBuildOpts::default(), RUN_VERSION);
+    let bytes = with_run_block_frame_bytes(0, || build_run_versioned(&entries, RunBuildOpts::default(), RUN_VERSION));
     let first = Run::parse(bytes.clone()).unwrap().index.block_ref(0);
     let (off, len) = (first.0 as usize, first.1 as usize);
     let reseal = |mutate: &dyn Fn(&mut [u8])| {
@@ -191,4 +193,130 @@ fn version_stream_reserves_a_compressed_block_before_decompressing_it() {
         }
     }
     assert_eq!(got, entries.iter().map(|e| (e.key.clone(), e.version)).collect::<Vec<_>>());
+}
+
+fn frame_counts(bytes: &[u8]) -> Vec<usize> {
+    let run = Run::parse(bytes.to_vec()).unwrap();
+    (0..run.index.len())
+        .map(|i| {
+            let (off, len) = run.index.block_ref(i);
+            block_frame_count(&bytes[off as usize..off as usize + len as usize])
+        })
+        .collect()
+}
+
+#[test]
+fn framed_v7_blocks_read_like_v6_on_every_path() {
+    let entries = backlinks_with_tombstones(20_000);
+    let (dev6, alloc6, v6) = open_built_versioned(&entries, RunBuildOpts::default(), RUN_RT_VERSION);
+    let (_, _, single) =
+        with_run_block_frame_bytes(0, || open_built_versioned(&entries, RunBuildOpts::default(), RUN_VERSION));
+    for frame_bytes in [DEFAULT_RUN_BLOCK_FRAME_BYTES, 4096] {
+        let bytes = with_run_block_frame_bytes(frame_bytes, || build_run_versioned(&entries, RunBuildOpts::default(), RUN_VERSION));
+        let frames = frame_counts(&bytes);
+        let want = 32_768 / frame_bytes;
+        assert!(frames[..frames.len() - 1].iter().all(|&n| n >= want), "frame_bytes={frame_bytes}: {frames:?}");
+        let run = Run::parse(bytes.clone()).unwrap();
+        for e in &entries {
+            assert_eq!(run.lookup(&e.key).unwrap().as_ref(), Some(e));
+            let mut absent = e.key.clone();
+            absent.push(0);
+            assert_eq!(run.lookup(&absent).unwrap(), None);
+            absent.truncate(e.key.len() - 1);
+            assert_eq!(run.lookup(&absent).unwrap(), None);
+        }
+        let (dev7, alloc7, v7) =
+            with_run_block_frame_bytes(frame_bytes, || open_built_versioned(&entries, RunBuildOpts::default(), RUN_VERSION));
+        assert_eq!(v7.handle.len as usize, bytes.len());
+        assert!(v7.uncompressed_len() > single.uncompressed_len(), "frame restarts lengthen the decoded bodies");
+        assert!(v7.max_uncompressed_block_bytes() >= v7.max_block_bytes());
+        assert_eq!(reads(&dev7, &alloc7, &v7, &entries), reads(&dev6, &alloc6, &v6, &entries), "frame_bytes={frame_bytes}");
+    }
+}
+
+#[test]
+fn a_framed_lookup_decompresses_only_the_frame_its_key_routes_to() {
+    let entries = backlinks_with_tombstones(4_000);
+    let bytes = with_run_block_frame_bytes(8192, || build_run_versioned(&entries, RunBuildOpts::default(), RUN_VERSION));
+    let (off, len) = Run::parse(bytes.clone()).unwrap().index.block_ref(0);
+    let (off, len) = (off as usize, len as usize);
+    assert!(block_frame_count(&bytes[off..off + len]) >= 3);
+    let block = decode_block(&bytes[off..off + len]).unwrap();
+    let (first, last) = (block.first().unwrap(), block.last().unwrap());
+    let mut bad = bytes.clone();
+    bad[off + len - 6] ^= 0x40;
+    let crc = crc::crc32(&bad[off..off + len - 4]);
+    bad[off + len - 4..off + len].copy_from_slice(&crc.to_le_bytes());
+    let run = Run::parse(bad.clone()).unwrap();
+    assert_eq!(run.lookup(&first.key).unwrap().as_ref(), Some(first), "the first frame is intact");
+    assert_eq!(run.lookup(&last.key), Err("block decompression failed"));
+    assert_eq!(decode_block(&bad[off..off + len]), Err("block decompression failed"));
+
+    let skippable = u32::from_le_bytes(bytes[off + 12..off + 16].try_into().unwrap()) as usize;
+    let mut bad = bytes[off..off + len].to_vec();
+    bad[16 + skippable + 12] ^= 0x40;
+    let crc = crc::crc32(&bad[..len - 4]);
+    bad[len - 4..].copy_from_slice(&crc.to_le_bytes());
+    assert_eq!(block_lookup(&bad, &first.key), Err("block decompression failed"));
+    let mut seek = BlockCursor::new(bad.clone(), Some(&last.key), false).unwrap();
+    assert_eq!(seek.next_entry().unwrap().as_ref(), Some(last), "a seek past the first frame skips it");
+    assert_eq!(seek.next_entry().unwrap(), None);
+    assert!(BlockCursor::new(bad, Some(&first.key), false).is_err());
+}
+
+#[test]
+fn a_framed_block_index_that_misroutes_lookups_fails_the_build() {
+    let entries = backlinks_with_tombstones(4_000);
+    let opts = RunBuildOpts::default();
+    let bytes = with_run_block_frame_bytes(8192, || build_run_versioned(&entries, opts, RUN_VERSION));
+    let (off, _) = Run::parse(bytes.clone()).unwrap().index.block_ref(1);
+    let off = off as usize;
+    let n = u32::from_le_bytes(bytes[off + 20..off + 24].try_into().unwrap()) as usize;
+    assert!(n >= 3);
+    for at in [4, 4 + 12 * n + 4, 4 + 12 * n + 5] {
+        seams::arm_frame_index_flip(1, at, 0x01);
+        let err = with_run_block_frame_bytes(8192, || {
+            build_run_checked(&entries, opts, RUN_VERSION, EncodePath::Flush, RunSource::Inline).unwrap_err()
+        });
+        assert!(!seams::frame_index_flip_armed());
+        assert_eq!((err.check, err.block), ("decode", 1), "{err}");
+    }
+}
+
+#[test]
+fn framed_block_bodies_restart_each_frame_and_otherwise_encode_like_plain_bodies() {
+    let entries = backlinks_with_tombstones(400);
+    let plain = encode_block_body(&entries);
+    let (body, frames, extra) = encode_block_body_framed(&entries, 8192);
+    assert!(frames.len() >= 6, "{} frames", frames.len());
+    assert_eq!(body.len() - extra, plain.len());
+    assert_eq!(decode_block_body(&body).unwrap(), entries);
+    let coded = compress_block_body_framed(&body, &frames, body.len() - extra).unwrap();
+    assert_eq!(check_frame_index(&coded, &body), Ok(()));
+    assert_eq!(decode_block_payload(&coded).unwrap().as_ref(), &body[..]);
+    let mut block = coded.clone();
+    block.extend_from_slice(&crc::crc32(&coded).to_le_bytes());
+    assert_eq!(block_frame_count(&block), frames.len());
+    for e in &entries {
+        assert_eq!(block_lookup(&block, &e.key), Ok(Some(e.clone())));
+        let mut absent = e.key.clone();
+        absent.push(0);
+        assert_eq!(block_lookup(&block, &absent), Ok(None));
+    }
+    assert_eq!(block_lookup(&block, b""), Ok(None));
+    assert_eq!(block_lookup(&block, &[0xff; 200]), Ok(None));
+    assert!(compress_block_body_framed(&body, &frames, coded.len()).is_none(), "no smaller than the limit");
+    for (n, frame_bytes) in [(10, 8192), (400, 0)] {
+        let (b, f, x) = encode_block_body_framed(&entries[..n], frame_bytes);
+        assert_eq!((b, f.len(), x), (encode_block_body(&entries[..n]), 0, 0));
+    }
+}
+
+#[test]
+fn block_frame_knob_parses_and_falls_back() {
+    assert_eq!(parse_run_block_frame_bytes(None), DEFAULT_RUN_BLOCK_FRAME_BYTES);
+    assert_eq!(parse_run_block_frame_bytes(Some(" 8192 ")), 8192);
+    assert_eq!(parse_run_block_frame_bytes(Some("0")), 0);
+    assert_eq!(parse_run_block_frame_bytes(Some("x")), DEFAULT_RUN_BLOCK_FRAME_BYTES);
+    assert_eq!(parse_run_block_frame_bytes(Some("9999999")), 256 * 1024);
 }

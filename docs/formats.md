@@ -686,13 +686,35 @@ data blocks | filter | [v6: RT block] | index | [v1–v4: sidecar] | footer (80 
   bytes is corrupt. The CRC covers the stored bytes. The builder compresses each
   block, decompresses it again and checks the decoded entries against its source
   before writing, and stores the plain layout when compression saves nothing.
+- **Framed compressed data block** (v7, 0570): the same header, then a zstd
+  skippable frame `[u32 magic 0x184D2A5A][u32 size][u32 crc32c(index)][index]`
+  and one zstd frame per body frame: `index = [u32 n ≥ 2] n × ([u32 count]
+  [u32 end][u32 frame_len]) (n−1) × ([u32 len][separator])`. Frame `j` holds the
+  body bytes `[end(j−1), end(j))` (frame 0 starts at 0 and includes the body's
+  `count`), `count` whole entries whose first entry has `shared = 0`, so the
+  concatenated frames are still a valid block body. `separator(j)` (for `j ≥ 1`)
+  is the shortest prefix of frame `j`'s first key that sorts above frame `j−1`'s
+  last key; a point lookup decompresses only the last frame whose separator is
+  `≤` the key. zstd skips skippable frames and decodes concatenated frames as one,
+  so a reader that ignores the index (any v7 reader) gets the body back; readers
+  that parse it reject a bad index CRC, frames that do not tile the body and the
+  stored bytes exactly, or a frame that does not decode to its span. The builder
+  splits a block's entries at about `VALS_RUN_BLOCK_FRAME_BYTES` (16 KiB) of
+  encoded bytes when at least half a frame remains, keeps the framed form only
+  when it is shorter than the block's plain (unrestarted) layout, which it stores
+  otherwise, and checks the index (counts, offsets, restarts, separators, each
+  frame's declared content size) against the decoded body before writing. No run
+  version change: a block holds one frame or several, and older v7 readers decode
+  both.
 - **Index**: `[u64 n] n × ([u32 len][first key][u64 off][u32 len][v6: u64 max_hlc])
   [v7: u64 uncompressed_data_len][v7: u32 max_uncompressed_block]
   [v6: u64 rt_seq_floor][v6: u64 rt_off][v6: u64 rt_len] [crc32c]`. `off`/`len`
   are the stored block's. `uncompressed_data_len` is the data section's length
-  with every block in the plain layout, and `max_uncompressed_block` the largest
-  such block; the merge policy sizes v7 runs by their uncompressed length, so a
-  merge's output reservation stays a hard bound. `max_hlc` is
+  with every block decoded (a framed block's body with its frame restarts, never
+  shorter than its plain layout), and `max_uncompressed_block` the largest such
+  block; the merge policy sizes v7 runs by their uncompressed length, and no
+  stored block is longer than its plain layout, so a merge's output reservation
+  stays a hard bound. `max_hlc` is
   the largest `version >> 64` (the HLC of the packed `Version`) among the block's
   entries, so `max_hlc < V.hlc` proves every entry of the block is older than V.
   It stays resident with the fence index (8 B per block).
