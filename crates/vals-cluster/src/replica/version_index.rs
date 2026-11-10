@@ -403,6 +403,15 @@ impl VersionIndex {
         vec![0u64; INDEX_BUCKETS as usize].into_boxed_slice()
     }
 
+    fn xor_group_leaf(&self, group: &[NodeId], b: usize, delta: u64) {
+        let mut groups = self.leaves.borrow_mut();
+        if let Some(leaves) = groups.get_mut(group) {
+            leaves[b] ^= delta;
+            return;
+        }
+        groups.entry(Box::from(group)).or_insert_with(Self::empty_group)[b] ^= delta;
+    }
+
     pub(super) fn journal_bytes(&self) -> u64 {
         self.journal.borrow().capacity() as u64 * std::mem::size_of::<Option<LeafOp>>() as u64
             + self.journal_key_bytes.get()
@@ -519,17 +528,14 @@ impl VersionIndex {
             return false;
         }
         let OldWinner::Exact(old) = old else { unreachable!() };
-        let mut groups = self.leaves.borrow_mut();
-        let leaves = groups
-            .entry(Box::from(group))
-            .or_insert_with(Self::empty_group);
+        let mut delta = crate::antientropy::entry_digest(key, new);
         if let Some(old) = old {
-            leaves[b] ^= crate::antientropy::entry_digest(key, old);
+            delta ^= crate::antientropy::entry_digest(key, old);
         } else {
             bucket.logical_keys += 1;
             self.live.set(self.live.get() + 1);
         }
-        leaves[b] ^= crate::antientropy::entry_digest(key, new);
+        self.xor_group_leaf(group, b, delta);
         false
     }
 
@@ -553,11 +559,7 @@ impl VersionIndex {
         if self.dirty.borrow().contains_key(&b) {
             return false;
         }
-        let mut groups = self.leaves.borrow_mut();
-        let leaves = groups
-            .entry(Box::from(group))
-            .or_insert_with(Self::empty_group);
-        leaves[b] ^= crate::antientropy::entry_digest(key, version);
+        self.xor_group_leaf(group, b, crate::antientropy::entry_digest(key, version));
         bucket.logical_keys = bucket.logical_keys.saturating_sub(1);
         debug_assert!(
             self.live.get() > 0,

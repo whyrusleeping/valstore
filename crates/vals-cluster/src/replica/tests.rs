@@ -5513,3 +5513,32 @@
             Applied::Lost(v(105, 9))
         );
     }
+
+    #[test]
+    fn range_placement_groups_match_the_per_key_oracle_across_placement_changes() {
+        let store = sorted_store(1);
+        let cfg = epoch_zone_config();
+        let keys: Vec<Vec<u8>> = (0..200u32).map(|i| format!("k{i:03}").into_bytes()).collect();
+        let mut base = RangeMap::from_splits([b"k050".to_vec(), b"k100".to_vec(), b"k150".to_vec()]);
+        base.enable_opaque_tokens();
+        let mut pending = base.clone();
+        assert!(pending.set_pending(1, crate::partition::opaque_placement_token([7; 16])));
+        assert!(pending.set_pending(3, crate::partition::opaque_placement_token([9; 16])));
+        let mut committed = pending.clone();
+        assert!(committed.commit_pending(1));
+        let mut split = base.clone();
+        assert!(split.split(b"k020"));
+        let three = crate::ring::Ring::from_members(2, 64, [1, 2, 3]);
+        let five = crate::ring::Ring::from_members(2, 64, [1, 2, 3, 4, 5]);
+        let steps = [(&three, &base), (&three, &pending), (&three, &committed), (&five, &committed), (&five, &split)];
+        for (epoch, (ring, map)) in (10u64..).zip(steps) {
+            store.prepare_zone_seed((epoch, 1, epoch), ring, 42, Some(cfg.clone()), Some(map.clone()));
+            for _ in 0..2 {
+                for key in &keys {
+                    let mut owners = map.replicas_for_key_while_rehoming(ring, 42, key, cfg.rf, None);
+                    owners.sort_unstable();
+                    assert_eq!(store.group_of(key), owners, "epoch {epoch} key {key:?}");
+                }
+            }
+        }
+    }

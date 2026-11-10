@@ -1358,16 +1358,27 @@ impl<D: BlockDevice> VersionedStore<D> {
         let mut ranges = None;
         let placement: PlacementFn = match config {
             None => std::sync::Arc::new(move |key: &[u8]| ring.replicas(key)),
-            Some(cfg) => {
-                let range_map = range_map.map(std::sync::Arc::new);
-                ranges = range_map.clone();
-                std::sync::Arc::new(move |key: &[u8]| match &range_map {
-                    Some(map) => map.replicas_for_key_while_rehoming(
-                        &ring, zone_id, key, cfg.rf, cfg.scope.as_ref(),
-                    ),
-                    None => ring.replicas_in_zone(zone_id, key, cfg.rf, cfg.scope.as_ref()),
-                })
-            }
+            Some(cfg) => match range_map {
+                Some(map) => {
+                    let map = std::sync::Arc::new(map);
+                    ranges = Some(map.clone());
+                    let memo: Box<[std::sync::OnceLock<Vec<NodeId>>]> =
+                        (0..map.num_ranges()).map(|_| std::sync::OnceLock::new()).collect();
+                    std::sync::Arc::new(move |key: &[u8]| {
+                        let index = map.range_index(key);
+                        memo[index]
+                            .get_or_init(|| {
+                                map.replicas_of_range_while_rehoming(
+                                    &ring, zone_id, index, cfg.rf, cfg.scope.as_ref(),
+                                )
+                            })
+                            .clone()
+                    })
+                }
+                None => std::sync::Arc::new(move |key: &[u8]| {
+                    ring.replicas_in_zone(zone_id, key, cfg.rf, cfg.scope.as_ref())
+                }),
+            },
         };
         self.install_placement(placement);
         *self.placement_ranges.borrow_mut() = ranges;

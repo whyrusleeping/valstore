@@ -426,7 +426,17 @@ impl RangeMap {
         rf: usize,
         scope: Option<&BTreeSet<NodeId>>,
     ) -> Vec<NodeId> {
-        let index = self.range_index(key);
+        self.replicas_of_range_while_rehoming(ring, zone_id, self.range_index(key), rf, scope)
+    }
+
+    pub fn replicas_of_range_while_rehoming(
+        &self,
+        ring: &Ring,
+        zone_id: ZoneId,
+        index: usize,
+        rf: usize,
+        scope: Option<&BTreeSet<NodeId>>,
+    ) -> Vec<NodeId> {
         let mut replicas = self.replicas_of_range(ring, zone_id, index, rf, scope);
         if let Some(pending) = self.pending_of(index) {
             for node in ring.replicas_in_zone(zone_id, pending, rf, scope) {
