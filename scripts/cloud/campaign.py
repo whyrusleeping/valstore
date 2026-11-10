@@ -59,6 +59,7 @@ class Campaign:
         self.latest = {}
         self.monitor_stop = threading.Event()
         self.hostmon_started = False
+        self.proc_started = {}
         self.results = {}
         res = os.path.join(self.dir, "results.json")
         if os.path.exists(res):
@@ -122,6 +123,8 @@ class Campaign:
                     continue
                 blind[h.name] = 0
                 down = set(self.expect_down.get(h.name, ())) | {"bench"}
+                if float(cur.get("t", 0)) < self.proc_started.get(h.name, 0) + 15:
+                    down |= {"node", "pd"}
                 if h.role == "node" and not self.cluster_running:
                     down |= {"node", "pd"}
                 for sev, msg in cl.evaluate_latest(self.latest.get(h.name), cur, down):
@@ -328,7 +331,12 @@ class Campaign:
         return pids
 
     def start_node(self, h):
+        self.proc_started[h.name] = time.time()
         self.node_job(h).start()
+
+    def start_pd(self, h):
+        self.proc_started[h.name] = time.time()
+        self.pd_job(h).start()
 
     def wait_node_up(self, h, timeout=1800):
         """Seconds until the node's first anti-entropy sweep pass (engines open and serving).
@@ -365,6 +373,9 @@ class Campaign:
         return None
 
     def step_cluster(self, step):
+        if any(self.pids(h, "node") or self.pids(h, "pd") for h in self.nodes):
+            self.log("stopping_leftover_cluster")
+            self.stop_cluster(graceful=True)
         if self.cluster["backend"] == "spdk":
             self.bind()
         self.write_configs()
@@ -372,7 +383,7 @@ class Campaign:
             self.provision()
         t0 = time.time()
         cl.parallel(self.start_node, self.nodes)
-        cl.parallel(lambda h: self.pd_job(h).start(), self.nodes)
+        cl.parallel(self.start_pd, self.nodes)
         self.cluster_running = True
         ups = cl.parallel(self.wait_node_up, self.nodes)
         deadline = time.time() + 300
@@ -614,7 +625,7 @@ class Campaign:
             while self.pids(h, "pd"):
                 time.sleep(0.5)
             self.chaos_cancel.wait(down)
-            self.pd_job(h).start()
+            self.start_pd(h)
             self.log("chaos_up", host=h.name, pd_leader=self.pd_leader())
         elif kind == "freeze":
             self.expect_down[h.name] = ()
@@ -689,7 +700,7 @@ class Campaign:
         self.stop_cluster(graceful=True)
         t0 = time.time()
         cl.parallel(self.start_node, self.nodes)
-        cl.parallel(lambda h: self.pd_job(h).start(), self.nodes)
+        cl.parallel(self.start_pd, self.nodes)
         self.cluster_running = True
         self.latest.clear()
         ups = cl.parallel(self.wait_node_up, self.nodes)
@@ -791,6 +802,11 @@ def cmd_run(args):
         steps = [s for s in steps if not s.get("cloud_only")]
     c.cluster_running = bool(c.nodes) and all(c.pids(h, "node") for h in c.nodes)
     c.hostmon_started = not any(s["kind"] == "prep" for s in steps)
+    if c.hostmon_started:
+        dead = [h for h in c.machines if not cl.RemoteJob(h, "hostmon", "true").alive()]
+        if dead:
+            c.log("hostmon_restart", hosts=[h.name for h in dead])
+            c.start_hostmon()
     status = c.run_steps(steps)
     if not args.no_collect:
         collect(c)
@@ -902,14 +918,14 @@ def cmd_report(args):
 
 def cmd_health(args):
     c = Campaign(args.run)
-    for h in c.hosts:
+    for h in c.machines:
         raw = cl.try_sh(h, "cat %s/out/mon/latest.json 2>/dev/null" % h.root, timeout=20)
         try:
             cur = json.loads(raw)
         except ValueError:
             print("%-24s no hostmon snapshot" % h.name)
             continue
-        issues = cl.evaluate_latest(None, cur, ("bench",) if h.role == "client" else ())
+        issues = cl.evaluate_latest(None, cur, ("bench",))
         procs = " ".join("%s=%s" % (k, "up" if v.get("alive") else "DOWN") for k, v in cur.get("procs", {}).items())
         print("%-24s load1=%-6s %s %s" % (h.name, cur.get("load1"), procs,
                                           "; ".join("%s: %s" % i for i in issues) or "ok"))
