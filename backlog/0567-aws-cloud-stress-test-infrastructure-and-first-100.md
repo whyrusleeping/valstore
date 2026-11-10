@@ -1,10 +1,10 @@
 ---
 id: "0567"
 title: AWS cloud stress-test infrastructure and first (~$100-150) instrumented campaign
-status: in_progress
+status: blocked
 priority: 2
 created: "2026-11-02"
-updated: "2026-11-02"
+updated: "2026-11-10"
 depends_on: []
 spec_refs: []
 ---
@@ -29,3 +29,5 @@ Owner (2026-11-02): set up an AWS account (pending) and asked for test infrastru
 ## Acceptance criteria
 
 ## Work log
+- 2026-11-10 status: tooling, unit tests, local dry runs (3-node and 1-node) and runbook are committed (aa3b318..54c927c). Within the 8-vCPU default quota the first AWS run was the single-instance profile `v1-1node-i4i2xl` (run v1-20261110, ~$0.42, all steps ok; bench/cloud/runs/v1-20261110/FINDINGS.md; spawned 0568, 0569, 0570). `fleet.py sweep`: nothing running.
+- 2026-11-10 BLOCKED: the 3-node `c1-3node-i4i` campaign (3-node sweeps, chaos, converge) needs on-demand standard vCPU quota ≥ 544 in us-east-2. The increase request `a01c32b7…` is now CASE_CLOSED and the applied quota is still 8 vCPUs (checked with `aws service-quotas`), so it cannot launch. Unblock: owner gets the `L-1216C47A` quota raised (or picks a smaller multi-node shape that fits the granted quota) and confirms the spend; then follow plans/cloud-aws-runbook.md "Running a campaign". The runbook's "Account state" line still says PENDING.
