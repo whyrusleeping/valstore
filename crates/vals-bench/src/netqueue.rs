@@ -682,26 +682,31 @@ impl Target {
     }
 }
 
+/// Parses `id@addr[,addr...][;id@addr...]`. Without a `;` the list is split on
+/// `,` and an item without `@` is another address of the node before it, so
+/// both `1@a,2@b` (two nodes) and a lone sharded node `1@a,b` work.
 pub(super) fn parse_peers(spec: &str) -> Vec<(u32, Vec<SocketAddr>)> {
-    let sep = if spec.contains(';') { ';' } else { ',' };
-    let groups: Vec<&str> = if sep == ';' {
-        spec.split(';').collect()
-    } else {
-        spec.split(',').collect()
-    };
-    groups
-        .into_iter()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| {
-            let (id, addrs) = s.split_once('@').expect("peer must be id@addr[,addr...]");
-            let addrs: Vec<SocketAddr> = addrs
-                .split(',')
-                .filter(|a| !a.trim().is_empty())
-                .map(|a| a.trim().parse().expect("peer addr (ip:port)"))
-                .collect();
-            (id.trim().parse().expect("peer id"), addrs)
-        })
-        .collect()
+    let addr = |a: &str| -> SocketAddr { a.trim().parse().expect("peer addr (ip:port)") };
+    let mut nodes: Vec<(u32, Vec<SocketAddr>)> = Vec::new();
+    if spec.contains(';') {
+        for group in spec.split(';').filter(|s| !s.trim().is_empty()) {
+            let (id, addrs) = group.split_once('@').expect("peer must be id@addr[,addr...]");
+            let addrs = addrs.split(',').filter(|a| !a.trim().is_empty()).map(addr).collect();
+            nodes.push((id.trim().parse().expect("peer id"), addrs));
+        }
+        return nodes;
+    }
+    for item in spec.split(',').filter(|s| !s.trim().is_empty()) {
+        match item.split_once('@') {
+            Some((id, a)) => nodes.push((id.trim().parse().expect("peer id"), vec![addr(a)])),
+            None => nodes
+                .last_mut()
+                .expect("peer list must start with id@addr")
+                .1
+                .push(addr(item)),
+        }
+    }
+    nodes
 }
 
 fn vals_coordinator(
@@ -2325,6 +2330,9 @@ mod tests {
         assert_eq!(p.len(), 2);
         assert_eq!(p[0].1.len(), 2);
         assert_eq!(p[1].1.len(), 1);
+        let p = parse_peers("1@10.0.0.1:7000,10.0.0.1:7001,10.0.0.1:7002");
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].1.len(), 3);
     }
 
     #[test]

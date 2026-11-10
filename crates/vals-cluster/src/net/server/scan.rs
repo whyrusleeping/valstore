@@ -1042,6 +1042,20 @@ pub(super) async fn stage_mixed_value<D: BlockDevice + AsyncRead>(
     MixedValueStage::Result(MixedReadResult::Busy)
 }
 
+const MIXED_VALUE_ATTEMPTS: usize = 8;
+
+async fn restage_mixed_value<D: BlockDevice + AsyncRead>(
+    store: &RefCell<VersionedStore<D>>,
+    dev: &D,
+    key: &[u8],
+) -> MixedValueStage {
+    let tokens = store.borrow().engine().winner_read_tokens(&[key]);
+    match tokens {
+        Some(tokens) => stage_mixed_winner(store, tokens[0]),
+        None => stage_mixed_value(store, dev, key).await,
+    }
+}
+
 fn mixed_value_wire_bound(stage: &MixedValueStage) -> usize {
     match stage {
         MixedValueStage::Found(plan, ..) => plan.read_len().saturating_add(32).max(1029),
@@ -1189,17 +1203,34 @@ pub(super) async fn serve_mixed_batch_read<D: BlockDevice + AsyncRead>(
             async move {
                 match role {
                     MixedReadRole::Value => {
-                        let stage = stage.expect("one staged result per value role");
-                        let frame_bound = mixed_value_wire_bound(&stage)
-                            .saturating_add(MIXED_REPLY_BASE)
-                            .saturating_add(8);
-                        if frame_bound > MAX_FRAME {
-                            MixedReadResult::Err(
+                        let mut stage = stage.expect("one staged result per value role");
+                        let bound = mixed_value_wire_bound(&stage);
+                        if bound.saturating_add(MIXED_REPLY_BASE).saturating_add(8) > MAX_FRAME {
+                            return MixedReadResult::Err(
                                 "value exceeds mixed-read frame maximum".into(),
-                            )
-                        } else {
-                            execute_mixed_value(store, dev, key, stage, site).await
+                            );
                         }
+                        let counters = crate::observe::counters();
+                        for _ in 1..MIXED_VALUE_ATTEMPTS {
+                            if !matches!(stage, MixedValueStage::Found(..)) {
+                                break;
+                            }
+                            match execute_mixed_value(store, dev, key, stage, site).await {
+                                MixedReadResult::Busy => {}
+                                result => return result,
+                            }
+                            counters.value_read_restarts.inc();
+                            stage = restage_mixed_value(store, dev, key).await;
+                            if mixed_value_wire_bound(&stage) > bound {
+                                counters.value_read_busy.inc();
+                                return MixedReadResult::Busy;
+                            }
+                        }
+                        let result = execute_mixed_value(store, dev, key, stage, site).await;
+                        if result == MixedReadResult::Busy {
+                            counters.value_read_busy.inc();
+                        }
+                        result
                     }
                     MixedReadRole::Digest => {
                         if let Some(tokens) = winner_tokens {

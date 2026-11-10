@@ -51,6 +51,7 @@ pub(super) async fn serve_read_into<D: BlockDevice + AsyncRead>(
                     |token| !s.engine().winner_read_token_matches(key, token),
                 );
             if changed {
+                crate::observe::counters().value_read_restarts.inc();
                 continue;
             }
             crate::integrity::corrupt_read(site, "get", key, plan.ptr(), &e);
@@ -65,6 +66,7 @@ pub(super) async fn serve_read_into<D: BlockDevice + AsyncRead>(
                 |token| !s.engine().winner_read_token_matches(key, token),
             );
         if changed {
+            crate::observe::counters().value_read_restarts.inc();
             continue;
         }
         drop(s);
@@ -75,6 +77,7 @@ pub(super) async fn serve_read_into<D: BlockDevice + AsyncRead>(
         out.push_read_reply(reqid, Some((value.0, value.1.as_deref())));
         return;
     }
+    crate::observe::counters().value_read_busy.inc();
     out.push_resp(reqid, &Response::Busy);
 }
 

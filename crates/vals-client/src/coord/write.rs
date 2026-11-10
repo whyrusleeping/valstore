@@ -418,7 +418,7 @@ impl<T: Transport> Coordinator<T> {
             || self.transport.read(node, zone_id, key),
             |result| match result {
                 Err(TransportError::Overloaded) => None,
-                _ => Some(result.is_ok()),
+                _ => Some(result.is_ok() || matches!(result, Err(TransportError::Busy))),
             },
         )
         .await
@@ -435,7 +435,7 @@ impl<T: Transport> Coordinator<T> {
             || self.transport.digest(node, zone_id, key),
             |result| match result {
                 Err(TransportError::Overloaded) => None,
-                _ => Some(result.is_ok()),
+                _ => Some(result.is_ok() || matches!(result, Err(TransportError::Busy))),
             },
         )
         .await
@@ -453,7 +453,10 @@ impl<T: Transport> Coordinator<T> {
             || Err(TransportError::Unavailable),
             || self.transport.read_mixed(node, zone_id, reads),
             |out| {
-                if out.iter().any(Result::is_ok) {
+                if out
+                    .iter()
+                    .any(|result| result.is_ok() || matches!(result, Err(TransportError::Busy)))
+                {
                     Some(true)
                 } else if out
                     .iter()

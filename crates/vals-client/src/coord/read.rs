@@ -1,6 +1,37 @@
 use super::*;
+use write::quorum_shortfall_error;
 
 type PendingNodeRead<'a> = Option<(NodeId, MixedNodeFuture<'a>)>;
+
+#[derive(Default)]
+struct Shortfall {
+    stale_epoch: Cell<u64>,
+    overloaded: Cell<bool>,
+    busy: Cell<usize>,
+}
+
+impl Shortfall {
+    fn note(&self, e: &TransportError) {
+        match e {
+            TransportError::StaleEpoch(ep) => self.stale_epoch.set(self.stale_epoch.get().max(*ep)),
+            TransportError::Overloaded => self.overloaded.set(true),
+            TransportError::Busy => self.busy.set(self.busy.get() + 1),
+            _ => {}
+        }
+    }
+
+    fn error(&self, needed: usize, got: usize) -> CoordError {
+        let stale = self.stale_epoch.get();
+        quorum_shortfall_error(
+            needed,
+            got,
+            (stale > 0).then_some(stale),
+            self.busy.get(),
+            0,
+            self.overloaded.get(),
+        )
+    }
+}
 
 impl<T: Transport> Coordinator<T> {
     /// Reads `key` from the default zone with this coordinator's read concern
@@ -37,7 +68,9 @@ impl<T: Transport> Coordinator<T> {
     /// version). Before returning, the call sends the winning version to any
     /// replica that answered with an older version or none (read repair).
     /// Fails with [`CoordError::QuorumFailed`] if fewer than `R` replicas
-    /// answer. How the replicas are asked depends on [`ReadFanout`].
+    /// answer, or with [`CoordError::Busy`] if some of the replicas that did
+    /// not answer refused retryably (retry with backoff). How the replicas are
+    /// asked depends on [`ReadFanout`].
     pub async fn read_quorum_in(
         &self,
         zone_id: ZoneId,
@@ -112,6 +145,7 @@ impl<T: Transport> Coordinator<T> {
 
         let mut oks = vec![0usize; keys.len()];
         let mut overloaded = vec![false; keys.len()];
+        let mut busy = vec![0usize; keys.len()];
         let mut best: Vec<Option<Stored>> = vec![None; keys.len()];
         for (_, positions, node_res, _) in &mut results {
             for (j, &(i, _)) in positions.iter().enumerate() {
@@ -126,6 +160,7 @@ impl<T: Transport> Coordinator<T> {
                         }
                     }
                     Some(Err(TransportError::Overloaded)) => overloaded[i] = true,
+                    Some(Err(TransportError::Busy)) => busy[i] += 1,
                     _ => {}
                 }
             }
@@ -134,14 +169,14 @@ impl<T: Transport> Coordinator<T> {
         for i in 0..keys.len() {
             let needed = self.read.required_replies(reps[i].len());
             if oks[i] < needed {
-                if overloaded[i] {
-                    out.push(Err(CoordError::Overloaded));
-                } else {
-                    out.push(Err(CoordError::QuorumFailed {
-                        needed,
-                        got: oks[i],
-                    }));
-                }
+                out.push(Err(quorum_shortfall_error(
+                    needed,
+                    oks[i],
+                    None,
+                    busy[i],
+                    0,
+                    overloaded[i],
+                )));
             } else {
                 out.push(Ok(best[i].take().filter(|s| s.value.is_some())));
             }
@@ -206,6 +241,7 @@ impl<T: Transport> Coordinator<T> {
         Vec<Vec<(NodeId, Option<Version>, Option<Stored>)>>,
         Vec<u64>,
         Vec<bool>,
+        Vec<usize>,
         Vec<Credit>,
     ) {
         enum Event {
@@ -240,6 +276,7 @@ impl<T: Transport> Coordinator<T> {
             (0..keys.len()).map(|_| Vec::new()).collect();
         let mut stale_epochs = vec![0u64; keys.len()];
         let mut overloaded = vec![false; keys.len()];
+        let mut busy = vec![0usize; keys.len()];
         let mut response_credits = Vec::new();
         let mut hedge_wait: Option<Pin<Box<dyn Future<Output = ()>>>> = None;
 
@@ -315,6 +352,10 @@ impl<T: Transport> Coordinator<T> {
                                     stale_epochs[i] = stale_epochs[i].max(epoch);
                                     activate[i] += 1;
                                 }
+                                (_, Some(Err(TransportError::Busy))) => {
+                                    busy[i] += 1;
+                                    activate[i] += 1;
+                                }
                                 _ => activate[i] += 1,
                             }
                         }
@@ -368,7 +409,7 @@ impl<T: Transport> Coordinator<T> {
         self.fd_note_overtaken(
             pending.iter().flatten().map(|(node, _)| *node).filter(|n| overtaken.contains(n)),
         );
-        (responses, stale_epochs, overloaded, response_credits)
+        (responses, stale_epochs, overloaded, busy, response_credits)
     }
 
     async fn read_many_digest_once(
@@ -387,7 +428,7 @@ impl<T: Transport> Coordinator<T> {
             active.push(start);
             replicas.push(order);
         }
-        let (responses, mut stale_epochs, mut overloaded, mut response_credits) = self
+        let (responses, mut stale_epochs, mut overloaded, mut busy, mut response_credits) = self
             .read_many_digest_probes(zone_id, keys, &replicas, &needed, &active)
             .await;
 
@@ -488,6 +529,7 @@ impl<T: Transport> Coordinator<T> {
                         Some(Err(TransportError::StaleEpoch(epoch))) => {
                             stale_epochs[i] = stale_epochs[i].max(epoch);
                         }
+                        Some(Err(TransportError::Busy)) => busy[i] += 1,
                         _ => {}
                     }
                 }
@@ -519,34 +561,27 @@ impl<T: Transport> Coordinator<T> {
 
         let mut out = Vec::with_capacity(keys.len());
         for i in 0..keys.len() {
+            let stale = (stale_epochs[i] > 0).then_some(stale_epochs[i]);
             if responses[i].len() < needed[i] {
-                if overloaded[i] {
-                    out.push(Err(CoordError::Overloaded));
-                } else if stale_epochs[i] > 0 {
-                    out.push(Err(CoordError::StaleRing {
-                        epoch: stale_epochs[i],
-                    }));
-                } else {
-                    out.push(Err(CoordError::QuorumFailed {
-                        needed: needed[i],
-                        got: responses[i].len(),
-                    }));
-                }
+                out.push(Err(quorum_shortfall_error(
+                    needed[i],
+                    responses[i].len(),
+                    stale,
+                    busy[i],
+                    0,
+                    overloaded[i],
+                )));
             } else if responses[i].iter().any(|(_, version, _)| version.is_some())
                 && winners[i].is_none()
             {
-                if overloaded[i] {
-                    out.push(Err(CoordError::Overloaded));
-                } else if stale_epochs[i] > 0 {
-                    out.push(Err(CoordError::StaleRing {
-                        epoch: stale_epochs[i],
-                    }));
-                } else {
-                    out.push(Err(CoordError::QuorumFailed {
-                        needed: needed[i],
-                        got: 0,
-                    }));
-                }
+                out.push(Err(quorum_shortfall_error(
+                    needed[i],
+                    0,
+                    stale,
+                    busy[i],
+                    0,
+                    overloaded[i],
+                )));
             } else {
                 out.push(Ok(winners[i].take().filter(|s| s.value.is_some())));
             }
@@ -603,34 +638,17 @@ impl<T: Transport> Coordinator<T> {
         needed: usize,
         active: usize,
     ) -> Result<Option<Stored>, CoordError> {
-        let stale_epoch = Cell::new(0u64);
-        let overloaded = Cell::new(false);
+        let shortfall = Shortfall::default();
         let read_one = |node: NodeId| {
-            let stale_epoch = &stale_epoch;
-            let overloaded = &overloaded;
+            let shortfall = &shortfall;
             async move {
-                match self.fd_read(node, zone_id, key).await {
-                    Ok(entry) => {
-                        let bytes = entry.as_ref().map_or(0, stored_response_bytes);
-                        match self.transport.retain_response(node, bytes) {
-                            Ok(credit) => Ok((node, entry, credit)),
-                            Err(e) => {
-                                if matches!(e, TransportError::Overloaded) {
-                                    overloaded.set(true);
-                                }
-                                Err(e)
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if let TransportError::StaleEpoch(ep) = e {
-                            stale_epoch.set(stale_epoch.get().max(ep));
-                        } else if matches!(e, TransportError::Overloaded) {
-                            overloaded.set(true);
-                        }
-                        Err(e)
-                    }
-                }
+                let entry = self.fd_read(node, zone_id, key).await.inspect_err(|e| shortfall.note(e))?;
+                let bytes = entry.as_ref().map_or(0, stored_response_bytes);
+                let credit = self
+                    .transport
+                    .retain_response(node, bytes)
+                    .inspect_err(|e| shortfall.note(e))?;
+                Ok::<_, TransportError>((node, entry, credit))
             }
         };
         let fanout = match self.read_fanout {
@@ -658,18 +676,7 @@ impl<T: Transport> Coordinator<T> {
         }
 
         if responses.len() < needed {
-            if overloaded.get() {
-                return Err(CoordError::Overloaded);
-            }
-            if stale_epoch.get() > 0 {
-                return Err(CoordError::StaleRing {
-                    epoch: stale_epoch.get(),
-                });
-            }
-            return Err(CoordError::QuorumFailed {
-                needed,
-                got: responses.len(),
-            });
+            return Err(shortfall.error(needed, responses.len()));
         }
 
         let winner_source = responses
@@ -703,18 +710,16 @@ impl<T: Transport> Coordinator<T> {
         needed: usize,
         active: usize,
     ) -> Result<Option<Stored>, CoordError> {
-        let stale_epoch = Cell::new(0u64);
-        let overloaded = Cell::new(false);
+        let shortfall = Shortfall::default();
         let started = RefCell::new(Vec::new());
         let answered = RefCell::new(Vec::new());
         let overtaken = RefCell::new(Vec::new());
         let probe = |node: NodeId, want_value: bool| {
-            let stale_epoch = &stale_epoch;
-            let overloaded = &overloaded;
+            let shortfall = &shortfall;
             let (started, answered) = (&started, &answered);
             async move {
                 started.borrow_mut().push(node);
-                let result = self.digest_probe(node, zone_id, key, want_value, stale_epoch, overloaded).await;
+                let result = self.digest_probe(node, zone_id, key, want_value, shortfall).await;
                 answered.borrow_mut().push(node);
                 result
             }
@@ -751,18 +756,7 @@ impl<T: Transport> Coordinator<T> {
             response_credits.extend(credit);
         }
         if responses.len() < needed {
-            if overloaded.get() {
-                return Err(CoordError::Overloaded);
-            }
-            if stale_epoch.get() > 0 {
-                return Err(CoordError::StaleRing {
-                    epoch: stale_epoch.get(),
-                });
-            }
-            return Err(CoordError::QuorumFailed {
-                needed,
-                got: responses.len(),
-            });
+            return Err(shortfall.error(needed, responses.len()));
         }
 
         let Some(winner_ver) = responses.iter().filter_map(|(_, v, _)| *v).max() else {
@@ -787,7 +781,11 @@ impl<T: Transport> Coordinator<T> {
         if winner.is_none() {
             for &(node, ver, _) in responses.iter() {
                 if ver == Some(winner_ver) {
-                    if let Ok(Some(stored)) = self.fd_read(node, zone_id, key).await {
+                    let fetched = self.fd_read(node, zone_id, key).await;
+                    if let Err(e) = &fetched {
+                        shortfall.note(e);
+                    }
+                    if let Ok(Some(stored)) = fetched {
                         let credit = self
                             .transport
                             .retain_response(node, stored_response_bytes(&stored))
@@ -805,7 +803,7 @@ impl<T: Transport> Coordinator<T> {
             }
         }
         let Some(winner) = winner else {
-            return Err(CoordError::QuorumFailed { needed, got: 0 });
+            return Err(shortfall.error(needed, 0));
         };
 
         let repair_view: Vec<(NodeId, Option<Stored>)> = responses
@@ -831,16 +829,9 @@ impl<T: Transport> Coordinator<T> {
         zone_id: ZoneId,
         key: &[u8],
         want_value: bool,
-        stale_epoch: &Cell<u64>,
-        overloaded: &Cell<bool>,
+        shortfall: &Shortfall,
     ) -> Result<(NodeId, Option<Version>, Option<Stored>, Option<Credit>), TransportError> {
-        let note = |e: &TransportError| {
-            if let TransportError::StaleEpoch(ep) = e {
-                stale_epoch.set(stale_epoch.get().max(*ep));
-            } else if matches!(e, TransportError::Overloaded) {
-                overloaded.set(true);
-            }
-        };
+        let note = |e: &TransportError| shortfall.note(e);
         if !want_value {
             return match self.fd_digest(node, zone_id, key).await {
                 Ok(version) => Ok((node, version, None, None)),

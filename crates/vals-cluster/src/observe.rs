@@ -626,6 +626,10 @@ counters! {
     point_value_device_reads,
     /// Device blocks requested by `point_value_device_reads`, including alignment/framing blocks around each value-log record.
     point_value_device_blocks,
+    /// `Read` and `MixedBatchRead` value reads planned again because the key's storage changed (a flush, merge or reclaim commit, or a newer write) while the value's device read was in flight.
+    value_read_restarts,
+    /// `Read` and `MixedBatchRead` value reads answered retryable `Busy` because the key's storage kept changing for 8 attempts (per key for `MixedBatchRead`).
+    value_read_busy,
     /// `BatchApply` requests shed with retryable Busy instead of waiting behind a full staged-apply gate long enough to hit the caller's RPC deadline.
     batch_apply_gate_busy,
     /// Transient `accept(2)` errors a shard's accept loop shrugged off and retried: resource-exhaustion / interrupted accepts (`EMFILE`/`ENFILE`/`ENOMEM`/`ENOBUFS`/`ECONNABORTED`/`EINTR`) that used to permanently kill the listener.

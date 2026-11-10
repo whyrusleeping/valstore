@@ -256,7 +256,7 @@
     }
 
     #[test]
-    fn mixed_batch_storage_generation_change_returns_busy_after_read() {
+    fn mixed_batch_storage_generation_change_rereads_the_key() {
         let (mut store, state) = build_async_only_store(true);
         state.panic_sync.store(false, Ordering::Release);
         store.engine_mut().rebuild_winner_directory().unwrap();
@@ -266,6 +266,7 @@
         let gate = ReadGate::new();
         let reads = vec![(b"cold".to_vec(), MixedReadRole::Value)];
         let fired = std::cell::Cell::new(false);
+        let restarts = crate::observe::counters().value_read_restarts.get();
         let response = vals_rt::block_on(
             serve_mixed_batch_read(&store, &*dev, &gate, 0, &reads, false, Default::default()),
             || {
@@ -279,6 +280,50 @@
                 }
             },
         );
+        assert!(fired.get());
+        assert!(crate::observe::counters().value_read_restarts.get() > restarts);
+        assert_eq!(
+            response,
+            Response::MixedBatchRead {
+                start: 0,
+                results: vec![MixedReadResult::Reply(MixedReadReply::Value(Some(
+                    crate::replica::Stored {
+                        version: v(3, 1),
+                        value: Some(b"replacement".to_vec()),
+                    }
+                )))],
+                more: false,
+            }
+        );
+    }
+
+    #[test]
+    fn mixed_batch_reread_beyond_the_reserved_reply_bytes_answers_busy() {
+        let (mut store, state) = build_async_only_store(true);
+        state.panic_sync.store(false, Ordering::Release);
+        store.engine_mut().rebuild_winner_directory().unwrap();
+        state.panic_sync.store(true, Ordering::Release);
+        let store = RefCell::new(store);
+        let dev = store.borrow().device_handle();
+        let gate = ReadGate::new();
+        let reads = vec![(b"cold".to_vec(), MixedReadRole::Value)];
+        let fired = std::cell::Cell::new(false);
+        let busy = crate::observe::counters().value_read_busy.get();
+        let response = vals_rt::block_on(
+            serve_mixed_batch_read(&store, &*dev, &gate, 0, &reads, false, Default::default()),
+            || {
+                if state.started.load(Ordering::Acquire) != 0 && !fired.replace(true) {
+                    state.panic_sync.store(false, Ordering::Release);
+                    let mut store = store.borrow_mut();
+                    store.clear().unwrap();
+                    store.apply(b"cold", Some(&[9u8; 2000]), v(3, 1)).unwrap();
+                    state.panic_sync.store(true, Ordering::Release);
+                    state.release();
+                }
+            },
+        );
+        assert!(fired.get());
+        assert!(crate::observe::counters().value_read_busy.get() > busy);
         assert_eq!(
             response,
             Response::MixedBatchRead {

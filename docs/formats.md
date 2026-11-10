@@ -296,7 +296,11 @@ Payload = `[u8 kind]` then fields (`wire.rs:979`). Kinds (`wire.rs:54`):
 A `MixedBatchRead` reply count cannot exceed 4096 or the unserved request tail.
 `StaleEpoch` and connection-level `Busy` replace the whole mixed reply; ordinary
 read failures use the per-key result tags so successful keys still contribute to
-their quorums.
+their quorums. Like a point `Read`, a value read whose key's storage changed
+while its device read was in flight (a flush, merge or reclaim commit, or a newer
+write) is re-planned and re-read, up to 8 attempts, before it answers per-key
+`Busy`; a re-plan that would exceed the reply bytes the page reserved for the key
+answers `Busy` at once.
 
 A legacy `range-stat` is `[u32 zone][bytes lower][u64 entries][opt<bytes> midpoint]`
 then `[u32 shard_index][u32 shard_count]` and five `u64` re-home fields (mirror

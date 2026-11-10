@@ -1582,6 +1582,67 @@ fn digest_read_many_keeps_partial_failures_per_key() {
     ));
 }
 
+struct BusyWinnerFetch {
+    primary: NodeId,
+}
+
+impl Transport for BusyWinnerFetch {
+    async fn apply(
+        &self,
+        _node: NodeId,
+        _zone_id: ZoneId,
+        _key: &[u8],
+        _value: Option<&[u8]>,
+        _version: Version,
+    ) -> Result<Applied, TransportError> {
+        Ok(Applied::Won)
+    }
+
+    async fn read(
+        &self,
+        node: NodeId,
+        _zone_id: ZoneId,
+        _key: &[u8],
+    ) -> Result<Option<Stored>, TransportError> {
+        if node != self.primary {
+            return Err(TransportError::Busy);
+        }
+        Ok(Some(Stored {
+            version: Version { hlc: 1, node: 1 },
+            value: Some(b"old".to_vec()),
+        }))
+    }
+
+    async fn digest(
+        &self,
+        _node: NodeId,
+        _zone_id: ZoneId,
+        _key: &[u8],
+    ) -> Result<Option<Version>, TransportError> {
+        Ok(Some(Version { hlc: 2, node: 1 }))
+    }
+
+    async fn members(&self, _node: NodeId) -> Result<RingView, TransportError> {
+        Ok(RingView::default())
+    }
+
+    async fn zones(&self, _node: NodeId) -> Result<Catalog, TransportError> {
+        Ok(Catalog::new())
+    }
+}
+
+#[test]
+fn digest_reads_whose_newer_winner_fetch_is_busy_fail_busy() {
+    let mut ring = Ring::new(3);
+    ring.set_members([1, 2, 3]);
+    let primary = ring.replicas(b"k")[0];
+    let c = Coordinator::new(9, ring, 2, BusyWinnerFetch { primary }).with_manual_refresh();
+    let batch = run(c.read_many(&[b"k".to_vec()])).unwrap();
+    assert!(matches!(batch[0], Err(CoordError::Busy { .. })), "{:?}", batch[0]);
+    let point = run(c.read(b"k"));
+    assert!(matches!(point, Err(CoordError::Busy { .. })), "{point:?}");
+}
+
 struct EqualWinnerFallbacks {
     primary: NodeId,
     failed: NodeId,
@@ -2197,6 +2258,7 @@ fn an_epoch_zero_stale_refusal_still_surfaces_stale_ring() {
 struct BusyCluster {
     inner: LocalCluster<MemBlockDevice>,
     busy_left: RefCell<u32>,
+    reads_busy: Cell<bool>,
 }
 
 impl Transport for BusyCluster {
@@ -2225,6 +2287,9 @@ impl Transport for BusyCluster {
         zone_id: ZoneId,
         key: &[u8],
     ) -> Result<Option<Stored>, TransportError> {
+        if self.reads_busy.get() {
+            return Err(TransportError::Busy);
+        }
         self.inner.read(node, zone_id, key).await
     }
     async fn members(&self, node: NodeId) -> Result<RingView, TransportError> {
@@ -2249,6 +2314,7 @@ fn busy_coord(busy_left: u32, threshold: u32) -> Coordinator<BusyCluster> {
         BusyCluster {
             inner: lc,
             busy_left: RefCell::new(busy_left),
+            reads_busy: Cell::new(false),
         },
     )
     .with_failure_detector(crate::failure::FdConfig {
@@ -2279,6 +2345,32 @@ fn reserve_floor_busy_fails_with_coorderror_busy_no_hints_no_fd_trip() {
             !c.is_node_down(n),
             "a healthy backpressure refusal must NOT trip the failure detector"
         );
+    }
+}
+
+#[test]
+fn reads_refused_busy_fail_with_coorderror_busy_not_quorum_failed() {
+    for fanout in [ReadFanout::Digest, ReadFanout::Quorum, ReadFanout::All] {
+        let c = busy_coord(0, 1).with_read_fanout(fanout);
+        run(c.write_with(b"k", b"v", WriteConcern::Quorum(2))).unwrap();
+        c.transport().reads_busy.set(true);
+        let keys = vec![b"k".to_vec(), b"missing".to_vec()];
+        for result in run(c.read_many(&keys)).unwrap() {
+            assert!(
+                matches!(result, Err(CoordError::Busy { needed: 2, got: 0, .. })),
+                "{fanout:?} read_many: {result:?}"
+            );
+        }
+        let point = run(c.read(b"k"));
+        assert!(
+            matches!(point, Err(CoordError::Busy { needed: 2, got: 0, .. })),
+            "{fanout:?} read: {point:?}"
+        );
+        for &n in &c.ring().replicas(b"k") {
+            assert!(!c.is_node_down(n), "{fanout:?}: a Busy read must not trip the failure detector");
+        }
+        c.transport().reads_busy.set(false);
+        assert_eq!(run(c.read(b"k")).unwrap().unwrap().value.as_deref(), Some(b"v".as_slice()));
     }
 }
 
