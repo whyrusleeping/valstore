@@ -1,7 +1,7 @@
 ---
 id: "0568"
 title: 'Point reads on v7 run blocks are bound by zstd decompression (cloud v1: ~60% of node CPU, 72k reads/s vs 204k engine ceiling)'
-status: proposed
+status: todo
 priority: 3
 created: "2026-11-10"
 updated: "2026-11-10"

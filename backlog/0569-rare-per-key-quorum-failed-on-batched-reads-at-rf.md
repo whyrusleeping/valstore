@@ -1,7 +1,7 @@
 ---
 id: "0569"
 title: Rare per-key quorum_failed on batched reads at RF 1 with no faults (netprogress multiread, cloud v1)
-status: proposed
+status: todo
 priority: 3
 created: "2026-11-10"
 updated: "2026-11-10"
