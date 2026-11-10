@@ -1,0 +1,109 @@
+{
+ "description": "Local dry run of the single-instance (colocated client, RF 1, one PD) shape of v1-1node-i4i2xl on the file backend.",
+ "hours": 0.5,
+ "hostmon_interval": 1.0,
+ "colocate_clients": 1,
+ "local_nodes": 1,
+ "fleet": {},
+ "cluster": {
+  "backend": "file",
+  "rf": 1,
+  "region_mib": 1024,
+  "sweep": "2s",
+  "gc_grace": "0s"
+ },
+ "steps": [
+  {
+   "name": "prep",
+   "kind": "prep"
+  },
+  {
+   "name": "net",
+   "kind": "net",
+   "required": false
+  },
+  {
+   "name": "cluster",
+   "kind": "cluster"
+  },
+  {
+   "name": "w-small",
+   "kind": "netload",
+   "workload": "netload",
+   "n": 20000,
+   "vsize": 100,
+   "coords": 2,
+   "conc": 16,
+   "secs": 4
+  },
+  {
+   "name": "prefill",
+   "kind": "netload",
+   "workload": "netbatchwrite",
+   "strict": true,
+   "prefix": "pf",
+   "n": 20000,
+   "vsize": 100,
+   "coords": 2,
+   "conc": 32,
+   "env": {
+    "VALS_NETBATCHWRITE_WIDTH": 8
+   }
+  },
+  {
+   "name": "verify-prefill",
+   "kind": "netload",
+   "workload": "netmultiread",
+   "strict": true,
+   "prefix": "pf",
+   "n": 20000,
+   "vsize": 100,
+   "coords": 2,
+   "conc": 2,
+   "env": {
+    "VALS_NETMULTIREAD_BATCH": 64
+   }
+  },
+  {
+   "name": "m1-closed",
+   "kind": "np",
+   "secs": 8,
+   "threads": 2,
+   "slots": 4,
+   "keys": 256,
+   "rate": 0
+  },
+  {
+   "name": "m2-open50",
+   "kind": "np",
+   "secs": 6,
+   "threads": 2,
+   "slots": 4,
+   "keys": 256,
+   "rate_from": "m1-closed",
+   "rate_frac": 0.5
+  },
+  {
+   "name": "restart",
+   "kind": "restart"
+  },
+  {
+   "name": "verify-after-restart",
+   "kind": "netload",
+   "workload": "netmultiread",
+   "strict": true,
+   "prefix": "pf",
+   "n": 20000,
+   "vsize": 100,
+   "coords": 2,
+   "conc": 2,
+   "env": {
+    "VALS_NETMULTIREAD_BATCH": 64
+   }
+  },
+  {
+   "name": "stop",
+   "kind": "stop"
+  }
+ ]
+}

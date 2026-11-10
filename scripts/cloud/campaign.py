@@ -48,6 +48,7 @@ class Campaign:
         self.cluster = self.profile["cluster"]
         self.local = bool(self.fleet.get("local"))
         self.nodes = [h for h in self.hosts if h.role == "node"]
+        self.machines = [h for h in self.hosts if not h.colocated_with]
         self.clients = [h for h in self.hosts if h.role == "client"]
         self.artifact = artifact
         self.log = cl.EventLog(os.path.join(self.dir, "events.jsonl"))
@@ -101,7 +102,7 @@ class Campaign:
         while not self.monitor_stop.wait(15):
             if not self.hostmon_started:
                 continue
-            for h in self.hosts:
+            for h in self.machines:
                 raw = cl.try_sh(h, "cat %s/out/mon/latest.json 2>/dev/null; echo; date +%%s" % h.root, timeout=20)
                 lines = raw.strip().splitlines()
                 cur = None
@@ -146,9 +147,13 @@ class Campaign:
         def deploy(h):
             cl.sh(h, "mkdir -p %s/bin %s/cloud %s/run %s/out/cores %s/out/jobs" % ((h.root,) * 5))
             cl.push(h, os.path.join(HERE, "remote") + "/", "%s/cloud/remote/" % h.root, delete=True)
-            if self.local:
-                for b in ("valsd", "vals-bench"):
-                    cl.push(h, os.path.join(cl.REPO, "target", "release", b), "%s/bin/%s" % (h.root, b))
+            if self.local or h.colocated_with:
+                if self.local:
+                    for b in ("valsd", "vals-bench"):
+                        cl.push(h, os.path.join(cl.REPO, "target", "release", b), "%s/bin/%s" % (h.root, b))
+                else:
+                    cl.push(h, self.artifact, "%s/artifact.tar.gz" % h.root)
+                    cl.sh(h, "cd %s && tar --strip-components=1 -xzf artifact.tar.gz && rm artifact.tar.gz" % h.root)
                 cl.sh(h, "bash %s/cloud/remote/hostprep.sh --inventory-only --root %s" % (h.root, h.root), timeout=600)
                 return
             cl.push(h, self.artifact, "%s/artifact.tar.gz" % h.root)
@@ -165,7 +170,8 @@ class Campaign:
             if out.strip():
                 raise RuntimeError("%s: unresolved libraries: %s" % (h.name, out))
 
-        cl.parallel(deploy, self.hosts)
+        cl.parallel(deploy, self.machines)
+        cl.parallel(deploy, [h for h in self.hosts if h.colocated_with])
         for h in self.hosts:
             self.inventory(h)
         self.start_hostmon()
@@ -180,12 +186,12 @@ class Campaign:
                          "--metrics", "pd=http://127.0.0.1:%d/metrics" % h.pd_metrics_port,
                          "--proc", "node=^%s" % re.escape("%s/bin/valsd node" % h.root),
                          "--proc", "pd=^%s" % re.escape("%s/bin/valsd pd" % h.root)]
-            args += ["--proc", "bench=^%s" % re.escape("%s/bin/vals-bench" % h.root)]
+            args += ["--proc", "bench=^[^ ]*/bin/vals-bench "]
             job = cl.RemoteJob(h, "hostmon", "python3 %s/cloud/remote/hostmon.py %s"
                                % (h.root, " ".join(shlex.quote(a) for a in args)), sudo=True)
             job.kill()
             job.start()
-        cl.parallel(start, self.hosts)
+        cl.parallel(start, self.machines)
         self.hostmon_started = True
         self.log("hostmon", hosts=len(self.hosts))
 
@@ -193,6 +199,9 @@ class Campaign:
         """Network ceilings: iperf3 client->node, node mesh, fan-in; TCP_RR latency."""
         secs = step.get("secs", 10)
         streams = step.get("streams", 16)
+        if len(self.machines) < 2:
+            self.log("skipped", step=step["name"], reason="one machine: no network to measure")
+            return
         cl.parallel(lambda h: cl.sh(h, "bash %s/cloud/remote/netbench.sh server" % h.root), self.hosts)
         try:
             pairs = [(c, n) for c in self.clients for n in self.nodes[:1]]
@@ -475,7 +484,7 @@ class Campaign:
             cl.try_sh(h, "sudo -E env VALS_CLOUD_ROOT=%s bash %s/cloud/remote/profile.sh %s %d %s"
                       % (h.root, h.root, step["name"], step.get("profile_secs", 10),
                          shlex.quote("%s/bin/valsd node" % h.root)), timeout=900)
-            if self.clients:
+            if self.clients and not self.clients[0].colocated_with:
                 c = self.clients[0]
                 cl.try_sh(c, "sudo -E env VALS_CLOUD_ROOT=%s bash %s/cloud/remote/profile.sh %s-client %d --system"
                           % (c.root, c.root, step["name"], step.get("profile_secs", 10)), timeout=900)
@@ -813,7 +822,7 @@ def report(c):
         if t1 is None:
             continue
         row = {"step": name, "status": status, "secs": round(t1 - t0, 1), "hosts": {}}
-        for h in c.hosts:
+        for h in c.machines:
             mon = os.path.join(c.dir, "hosts", h.name, "mon")
             if not os.path.isdir(mon):
                 continue
@@ -908,7 +917,7 @@ def cmd_health(args):
 
 def stop_all(c):
     c.stop_cluster(graceful=True)
-    cl.parallel(lambda h: cl.RemoteJob(h, "hostmon", "true", sudo=True).kill(), c.hosts)
+    cl.parallel(lambda h: cl.RemoteJob(h, "hostmon", "true", sudo=True).kill(), c.machines)
 
 
 def cmd_stop(args):

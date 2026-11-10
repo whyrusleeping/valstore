@@ -1,0 +1,256 @@
+{
+ "description": "Single-instance AWS trial within the 8-vCPU default quota: one i4i.2xlarge (Ice Lake, 8 vCPU, 64 GiB, one 1875 GB Nitro NVMe) running a valsd node (4 SPDK partitions, RF 1, one PD) and the load client on the same machine. Answers: does SPDK drive Nitro instance store from a VM (uio/vfio-noiommu), raw drive vs engine ceilings, and colocated single-node valsd throughput/latency. Client and server share 8 vCPUs, so cluster numbers are a floor, not a ceiling.",
+ "hours": 2.0,
+ "hostmon_interval": 1.0,
+ "colocate_clients": 1,
+ "fleet": {
+  "node": {
+   "type": "i4i.2xlarge",
+   "count": 1,
+   "market": "on-demand",
+   "root_gb": 60
+  }
+ },
+ "cluster": {
+  "backend": "spdk",
+  "drives_per_node": 1,
+  "parts_per_drive": 4,
+  "rf": 1,
+  "vals_profile": "capacity",
+  "sweep": "5s",
+  "gc_grace": "0s",
+  "hugemem_mib": 8192,
+  "default_zone_fraction": 0.6,
+  "named_zone_fraction": 0.05
+ },
+ "steps": [
+  {
+   "name": "prep",
+   "kind": "prep"
+  },
+  {
+   "name": "rawdisk",
+   "kind": "rawdisk",
+   "secs": 30,
+   "size": "32G",
+   "required": false
+  },
+  {
+   "name": "spdkbench",
+   "kind": "spdkbench",
+   "ppd": 4,
+   "required": false,
+   "timeout": 900,
+   "runs": [
+    [
+     "mdwrite",
+     20000000,
+     100
+    ],
+    [
+     "mdwrite",
+     2000000,
+     4096
+    ],
+    [
+     "mdread",
+     10000000,
+     100
+    ],
+    [
+     "mdread",
+     1000000,
+     4096
+    ]
+   ]
+  },
+  {
+   "name": "cluster",
+   "kind": "cluster"
+  },
+  {
+   "name": "w-100b-c2",
+   "kind": "netload",
+   "workload": "netload",
+   "n": 8000000,
+   "vsize": 100,
+   "coords": 2,
+   "conc": 64,
+   "secs": 45
+  },
+  {
+   "name": "w-100b-c4",
+   "kind": "netload",
+   "workload": "netload",
+   "n": 8000000,
+   "vsize": 100,
+   "coords": 4,
+   "conc": 64,
+   "secs": 45,
+   "profile": true
+  },
+  {
+   "name": "wb-100b-b32",
+   "kind": "netload",
+   "workload": "netbatchwrite",
+   "n": 8000000,
+   "vsize": 100,
+   "coords": 4,
+   "conc": 256,
+   "secs": 45,
+   "env": {
+    "VALS_NETBATCHWRITE_WIDTH": 32
+   },
+   "profile": true
+  },
+  {
+   "name": "w-4k-c4",
+   "kind": "netload",
+   "workload": "netload",
+   "n": 2000000,
+   "vsize": 4096,
+   "coords": 4,
+   "conc": 64,
+   "secs": 45
+  },
+  {
+   "name": "wb-100b-device",
+   "kind": "netload",
+   "workload": "netbatchwrite",
+   "n": 8000000,
+   "vsize": 100,
+   "coords": 4,
+   "conc": 256,
+   "secs": 45,
+   "env": {
+    "VALS_NETBATCHWRITE_WIDTH": 32,
+    "VALS_NETBATCHWRITE_PERSISTENCE": "device"
+   }
+  },
+  {
+   "name": "prefill",
+   "kind": "netload",
+   "workload": "netbatchwrite",
+   "strict": true,
+   "prefix": "pf",
+   "n": 16000000,
+   "vsize": 100,
+   "coords": 4,
+   "conc": 256,
+   "env": {
+    "VALS_NETBATCHWRITE_WIDTH": 32
+   },
+   "timeout": 1200
+  },
+  {
+   "name": "r-strong-c4",
+   "kind": "netload",
+   "workload": "netread",
+   "prefix": "pf",
+   "n": 16000000,
+   "vsize": 100,
+   "coords": 4,
+   "conc": 64,
+   "secs": 45,
+   "profile": true
+  },
+  {
+   "name": "r-multi256",
+   "kind": "netload",
+   "workload": "netmultiread",
+   "prefix": "pf",
+   "n": 16000000,
+   "vsize": 100,
+   "coords": 4,
+   "conc": 2,
+   "secs": 45,
+   "env": {
+    "VALS_NETMULTIREAD_BATCH": 256
+   }
+  },
+  {
+   "name": "verify-prefill",
+   "kind": "netload",
+   "workload": "netmultiread",
+   "strict": true,
+   "prefix": "pf",
+   "n": 16000000,
+   "vsize": 100,
+   "coords": 4,
+   "conc": 2,
+   "timeout": 1200,
+   "env": {
+    "VALS_NETMULTIREAD_BATCH": 256
+   }
+  },
+  {
+   "name": "m1-closed",
+   "kind": "np",
+   "secs": 180,
+   "threads": 4,
+   "slots": 32,
+   "keys": 8192,
+   "vsize": 256,
+   "read_pct": 65,
+   "multi_pct": 10,
+   "rate": 0,
+   "profile": true,
+   "profile_at": 60
+  },
+  {
+   "name": "m2-open50",
+   "kind": "np",
+   "secs": 120,
+   "threads": 4,
+   "slots": 32,
+   "keys": 8192,
+   "vsize": 256,
+   "read_pct": 65,
+   "multi_pct": 10,
+   "rate_from": "m1-closed",
+   "rate_frac": 0.5
+  },
+  {
+   "name": "m3-device",
+   "kind": "np",
+   "secs": 90,
+   "threads": 4,
+   "slots": 32,
+   "keys": 8192,
+   "vsize": 256,
+   "read_pct": 65,
+   "multi_pct": 10,
+   "persistence": "device",
+   "rate_from": "m1-closed",
+   "rate_frac": 0.25
+  },
+  {
+   "name": "restart",
+   "kind": "restart"
+  },
+  {
+   "name": "verify-after-restart",
+   "kind": "netload",
+   "workload": "netmultiread",
+   "strict": true,
+   "prefix": "pf",
+   "n": 16000000,
+   "vsize": 100,
+   "coords": 4,
+   "conc": 2,
+   "timeout": 1200,
+   "env": {
+    "VALS_NETMULTIREAD_BATCH": 256
+   }
+  },
+  {
+   "name": "stop",
+   "kind": "stop"
+  },
+  {
+   "name": "nvme-post",
+   "kind": "nvme_post",
+   "required": false
+  }
+ ]
+}

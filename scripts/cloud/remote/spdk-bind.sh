@@ -269,6 +269,26 @@ if [ "$MODE" = bind ]; then
     d="$(pci_driver "$p")"
     [ "$d" = "$driver_path" ] || bad+=("$p=$d")
   done
+  if [ ${#bad[@]} -gt 0 ] && [ "$driver_path" = uio_pci_generic ]; then
+    # Some virtual NVMe functions refuse uio_pci_generic (no INTx). DPDK also
+    # supports vfio-pci in no-IOMMU mode (IOVA=PA, root only, no DMA isolation):
+    # acceptable on a disposable benchmark host whose only users are vals.
+    warn "uio_pci_generic did not bind (${bad[*]}); retrying with vfio-pci in no-IOMMU mode"
+    modprobe vfio enable_unsafe_noiommu_mode=1 2>/dev/null || true
+    [ -w /sys/module/vfio/parameters/enable_unsafe_noiommu_mode ] && echo Y > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode
+    modprobe vfio-pci 2>/dev/null || die "modprobe vfio-pci failed"
+    env PCI_ALLOWED="$ALLOWED" bash "$SETUP" reset >> "$LOG" 2>&1 || true
+    driver_path="vfio-pci"; override="vfio-pci"
+    why="$why; uio_pci_generic failed for ${bad[*]}, fell back to vfio-pci no-IOMMU mode"
+    rc=0
+    env PCI_ALLOWED="$ALLOWED" HUGEMEM="$HUGEMEM" DRIVER_OVERRIDE=vfio-pci bash "$SETUP" config >> "$LOG" 2>&1 || rc=$?
+    sed 's/^/[setup.sh] /' "$LOG" | tail -20
+    bad=()
+    for p in "${PCIS[@]}"; do
+      d="$(pci_driver "$p")"
+      [ "$d" = "$driver_path" ] || bad+=("$p=$d")
+    done
+  fi
   total="$(hugepages_total)"
   ok=true
   [ ${#bad[@]} -eq 0 ] || { ok=false; warn "not bound to $driver_path: ${bad[*]}"; }

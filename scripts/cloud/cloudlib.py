@@ -27,6 +27,7 @@ PRICES = {
     "c6in.16xlarge": (3.629, 0.992),
     "c6in.32xlarge": (7.258, 1.984),
     "c6i.2xlarge": (0.340, 0.150),
+    "i4i.2xlarge": (0.686, 0.200),
     "c6i.8xlarge": (1.360, 0.600),
     "c7i.8xlarge": (1.428, 0.800),
     "c7i.large": (0.0893, 0.040),
@@ -34,7 +35,7 @@ PRICES = {
 PRICES_DATE = "2026-11-02"
 VCPUS = {
     "i4i.metal": 128, "i3en.metal": 96, "i7ie.metal-24xl": 96, "i7ie.metal-48xl": 192,
-    "c6in.16xlarge": 64, "c6in.32xlarge": 128, "c6i.2xlarge": 8, "c6i.8xlarge": 32, "c7i.8xlarge": 32,
+    "c6in.16xlarge": 64, "c6in.32xlarge": 128, "c6i.2xlarge": 8, "i4i.2xlarge": 8, "c6i.8xlarge": 32, "c7i.8xlarge": 32,
     "c7i.large": 2,
 }
 
@@ -88,7 +89,8 @@ class Host:
     """One fleet machine. `ssh` is user@address, or LOCAL for the dry-run fleet."""
 
     def __init__(self, name, role, ssh, private_ip, root, port_base=7000, node_id=None,
-                 instance_type=None, key=None, known_hosts=None):
+                 instance_type=None, key=None, known_hosts=None, colocated_with=None):
+        self.colocated_with = colocated_with
         self.name, self.role, self.ssh = name, role, ssh
         self.private_ip, self.root, self.port_base = private_ip, root, port_base
         self.node_id, self.instance_type = node_id, instance_type
@@ -98,7 +100,7 @@ class Host:
     def from_json(cls, d, key=None, known_hosts=None):
         return cls(d["name"], d["role"], d["ssh"], d["private_ip"], d["root"],
                    d.get("port_base", 7000), d.get("node_id"), d.get("instance_type"),
-                   key, known_hosts)
+                   key, known_hosts, d.get("colocated_with"))
 
     def ports(self, shards):
         return [self.port_base + 1 + i for i in range(shards)]

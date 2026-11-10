@@ -325,6 +325,17 @@ def fleet_hosts_json(insts, price_of):
     return hosts
 
 
+def colocated_clients(hosts, count):
+    """Client entries that run on node1's machine under their own root (single-instance profiles)."""
+    nodes = [h for h in hosts if h["role"] == "node"]
+    if not count or not nodes:
+        return []
+    n = nodes[0]
+    return [dict(n, name="%s-client%d" % (n["name"].rsplit("-", 1)[0], i + 1), role="client",
+                 root="%sc%d" % (n["root"], i + 1), port_base=n["port_base"] + 2000 * (i + 1),
+                 price_per_hour=0.0, colocated_with=n["name"], node_id=None) for i in range(count)]
+
+
 def save_fleet(run_dir, fleet):
     os.makedirs(run_dir, exist_ok=True)
     tmp = os.path.join(run_dir, ".fleet.json.tmp")
@@ -375,6 +386,7 @@ def cmd_up(args):
     print("launched %s; waiting for running state" % " ".join(ids))
     insts = wait_running(ids)
     fleet["hosts"] = fleet_hosts_json(insts, lambda h: cl.hourly(h["instance_type"], h["market"]))
+    fleet["hosts"] += colocated_clients(fleet["hosts"], p.get("colocate_clients", 0))
     save_fleet(run_dir, fleet)
     _, hosts = cl.load_fleet(run_dir)
     wait_ssh(hosts)
@@ -519,10 +531,16 @@ def cmd_local(args):
         hosts.append({"name": "%s-node%d" % (args.run, i + 1), "role": "node", "node_id": i + 1,
                       "ssh": cl.LOCAL, "private_ip": "127.0.0.1", "root": "%s/node%d" % (base, i + 1),
                       "port_base": 27000 + 1000 * i, "instance_type": "local", "price_per_hour": 0.0})
-    hosts.append({"name": "%s-client1" % args.run, "role": "client", "ssh": cl.LOCAL,
-                  "private_ip": "127.0.0.1", "root": "%s/client1" % base, "port_base": 31000,
-                  "instance_type": "local", "price_per_hour": 0.0})
-    save_fleet(run_dir, {"run": args.run, "profile": args.profile, "profile_body": load_profile(args.profile),
+    profile = load_profile(args.profile)
+    nnodes = profile.get("local_nodes", 3)
+    hosts = hosts[:nnodes]
+    client = {"name": "%s-client1" % args.run, "role": "client", "ssh": cl.LOCAL,
+              "private_ip": "127.0.0.1", "root": "%s/client1" % base, "port_base": 31000,
+              "instance_type": "local", "price_per_hour": 0.0}
+    if profile.get("colocate_clients"):
+        client["colocated_with"] = hosts[0]["name"]
+    hosts.append(client)
+    save_fleet(run_dir, {"run": args.run, "profile": args.profile, "profile_body": profile,
                          "local": True, "deadline": None, "created": cl.utcnow().isoformat(), "hosts": hosts})
     print("local fleet in %s (roots under %s)" % (run_dir, base))
 
