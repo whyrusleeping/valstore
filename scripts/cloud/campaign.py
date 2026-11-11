@@ -312,9 +312,13 @@ class Campaign:
 
         cl.parallel(prov, self.nodes)
 
+    node_env = {}
+
     def node_job(self, h):
+        env = {"LD_LIBRARY_PATH": "%s/lib" % h.root}
+        env.update(self.node_env)
         return cl.RemoteJob(h, "node-%s" % cl.stamp(), "%s node -c %s/run/node.conf" % (self.bin(h, "valsd"), h.root),
-                            env={"LD_LIBRARY_PATH": "%s/lib" % h.root}, sudo=True, cwd="%s/run" % h.root)
+                            env=env, sudo=True, cwd="%s/run" % h.root)
 
     def pd_job(self, h):
         return cl.RemoteJob(h, "pd-%s" % cl.stamp(), "%s pd -c %s/run/pd.conf" % (self.bin(h, "valsd"), h.root),
@@ -376,8 +380,11 @@ class Campaign:
         if any(self.pids(h, "node") or self.pids(h, "pd") for h in self.nodes):
             self.log("stopping_leftover_cluster")
             self.stop_cluster(graceful=True)
+        self.node_env = {k: str(v) for k, v in step.get("node_env", self.cluster.get("node_env", {})).items()}
         if self.cluster["backend"] == "spdk":
             self.bind()
+        elif step.get("fresh"):
+            cl.parallel(lambda h: cl.sh(h, "rm -rf %s/run/data %s/run/pd" % (h.root, h.root)), self.nodes)
         self.write_configs()
         if self.cluster["backend"] == "spdk":
             self.provision()
@@ -395,7 +402,7 @@ class Campaign:
             time.sleep(2)
         else:
             raise RuntimeError("PD never reported %d members" % len(self.nodes))
-        self.log("cluster_up", secs=round(time.time() - t0, 1), node_up_secs=[round(u, 1) for u in ups],
+        self.log("cluster_up", secs=round(time.time() - t0, 1), node_up_secs=[round(u, 1) for u in ups], node_env=self.node_env,
                  leader=self.pd_leader(), peers=self.peers())
         self.results["cluster"] = {"up_secs": time.time() - t0, "peers": self.peers(), "shards": self.shards}
 

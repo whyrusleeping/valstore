@@ -1,0 +1,153 @@
+{
+ "description": "Local dry run of the 0573 zstd-level arm sequence (file backend).",
+ "hours": 0.5,
+ "hostmon_interval": 1.0,
+ "colocate_clients": 1,
+ "local_nodes": 1,
+ "fleet": {},
+ "cluster": {
+  "backend": "file",
+  "rf": 1,
+  "region_mib": 16384,
+  "sweep": "2s",
+  "gc_grace": "0s"
+ },
+ "steps": [
+  {
+   "name": "prep",
+   "kind": "prep"
+  },
+  {
+   "name": "cluster-a",
+   "kind": "cluster",
+   "node_env": {},
+   "fresh": true
+  },
+  {
+   "name": "ingest-a",
+   "kind": "netload",
+   "workload": "netbatchwrite",
+   "prefix": "za",
+   "n": 400000000,
+   "vsize": 130,
+   "coords": 4,
+   "conc": 256,
+   "secs": 10,
+   "profile": false,
+   "profile_at": 5,
+   "timeout": 910,
+   "env": {
+    "VALS_NETBATCHWRITE_WIDTH": 32,
+    "VALS_NETLOAD_KEY_SHAPE": "atproto"
+   }
+  },
+  {
+   "name": "cluster-b",
+   "kind": "cluster",
+   "node_env": {
+    "VALS_RUN_FLUSH_ZSTD_LEVEL": "off"
+   },
+   "fresh": true
+  },
+  {
+   "name": "ingest-b",
+   "kind": "netload",
+   "workload": "netbatchwrite",
+   "prefix": "zb",
+   "n": 400000000,
+   "vsize": 130,
+   "coords": 4,
+   "conc": 256,
+   "secs": 10,
+   "profile": false,
+   "profile_at": 5,
+   "timeout": 910,
+   "env": {
+    "VALS_NETBATCHWRITE_WIDTH": 32,
+    "VALS_NETLOAD_KEY_SHAPE": "atproto"
+   }
+  },
+  {
+   "name": "cluster-c",
+   "kind": "cluster",
+   "node_env": {
+    "VALS_RUN_FLUSH_ZSTD_LEVEL": "-1",
+    "VALS_RUN_MERGE_ZSTD_LEVEL": "-1"
+   },
+   "fresh": true
+  },
+  {
+   "name": "ingest-c",
+   "kind": "netload",
+   "workload": "netbatchwrite",
+   "prefix": "zc",
+   "n": 400000000,
+   "vsize": 130,
+   "coords": 4,
+   "conc": 256,
+   "secs": 10,
+   "profile": false,
+   "profile_at": 5,
+   "timeout": 910,
+   "env": {
+    "VALS_NETBATCHWRITE_WIDTH": 32,
+    "VALS_NETLOAD_KEY_SHAPE": "atproto"
+   }
+  },
+  {
+   "name": "cluster-d",
+   "kind": "cluster",
+   "node_env": {
+    "VALS_RUN_FLUSH_ZSTD_LEVEL": "off",
+    "VALS_RUN_MERGE_ZSTD_LEVEL": "-1"
+   },
+   "fresh": true
+  },
+  {
+   "name": "ingest-d",
+   "kind": "netload",
+   "workload": "netbatchwrite",
+   "prefix": "zd",
+   "n": 400000000,
+   "vsize": 130,
+   "coords": 4,
+   "conc": 256,
+   "secs": 10,
+   "profile": false,
+   "profile_at": 5,
+   "timeout": 910,
+   "env": {
+    "VALS_NETBATCHWRITE_WIDTH": 32,
+    "VALS_NETLOAD_KEY_SHAPE": "atproto"
+   }
+  },
+  {
+   "name": "cluster-a2",
+   "kind": "cluster",
+   "node_env": {},
+   "fresh": true
+  },
+  {
+   "name": "ingest-a2",
+   "kind": "netload",
+   "workload": "netbatchwrite",
+   "prefix": "za2",
+   "n": 400000000,
+   "vsize": 130,
+   "coords": 4,
+   "conc": 256,
+   "secs": 10,
+   "profile": false,
+   "profile_at": 5,
+   "timeout": 910,
+   "env": {
+    "VALS_NETBATCHWRITE_WIDTH": 32,
+    "VALS_NETLOAD_KEY_SHAPE": "atproto"
+   }
+  },
+  {
+   "name": "stop",
+   "kind": "stop"
+  }
+ ]
+}

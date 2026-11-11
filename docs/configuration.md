@@ -394,7 +394,9 @@ sources, and they will not become daemon keys.
   `VALS_NETMULTIREAD_BATCH` (32), `VALS_NETBATCHWRITE_WIDTH` (1),
   `VALS_NETBATCHWRITE_PERSISTENCE` (buffered; device changes benchmark requests),
   `VALS_NETREAD_SECS` / `VALS_NETWRITE_SECS` / `VALS_NETWRITE_RATE` (0),
-  `VALS_NETLOAD_KEY_PREFIX` (nl), `VALS_NETLOAD_SKIP_READ_PHASE` (absent),
+  `VALS_NETLOAD_KEY_PREFIX` (nl), `VALS_NETLOAD_KEY_SHAPE` (seq: `{prefix}-{i:012}`;
+  atproto: `{prefix}at://did:plc:…/app.bsky.feed.like/…`, eight keys per pseudo-random
+  DID, so run blocks compress like replay keys), `VALS_NETLOAD_SKIP_READ_PHASE` (absent),
   `VALS_NETREAD_LAT_SAMPLE_EVERY` / `VALS_NETWRITE_LAT_SAMPLE_EVERY` (0),
   `VALS_NETREAD_LAT_SAMPLES_FILE` / `VALS_NETWRITE_LAT_SAMPLES_FILE` (absent),
   `VALS_NET_TRANSPORT_STATS` (absent).

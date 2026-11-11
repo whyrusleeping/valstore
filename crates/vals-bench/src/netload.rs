@@ -212,7 +212,7 @@ pub(super) fn workload_netload(
         std::iter::once(0..n).collect()
     };
     for i in netwrite_verify_indexes(&verify_ranges, 1000) {
-        let key = format!("{key_prefix}-{i:012}").into_bytes();
+        let key = netload_key(&key_prefix, i);
         match vals_rt::block_on(coord.read(&key), vals_cluster::reactor::poll_io) {
             Ok(Some(s)) if s.value.as_deref() == Some(val.as_slice()) => ok += 1,
             _ => bad += 1,
@@ -532,6 +532,59 @@ pub(super) fn netmultiread_batch_width(value: Option<&str>) -> usize {
         .unwrap_or(32)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum KeyShape {
+    Seq,
+    Atproto,
+}
+
+pub(super) fn netload_key_shape(value: Option<&str>) -> KeyShape {
+    match value.map(str::trim) {
+        None | Some("") | Some("seq") => KeyShape::Seq,
+        Some("atproto") => KeyShape::Atproto,
+        Some(other) => panic!("VALS_NETLOAD_KEY_SHAPE must be seq or atproto, got {other}"),
+    }
+}
+
+fn splitmix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+fn push_base32(key: &mut Vec<u8>, mut v: u128, chars: usize) {
+    for _ in 0..chars {
+        key.push(b"234567abcdefghijklmnopqrstuvwxyz"[(v & 31) as usize]);
+        v >>= 5;
+    }
+}
+
+/// Key `i` of a netload run: `{prefix}-{i:012}` (`seq`, the default), or with
+/// `VALS_NETLOAD_KEY_SHAPE=atproto` an ATProto-record-like key: eight records per
+/// pseudo-random `did:plc` (24 base32 chars) and a 13-char base32 record key, so
+/// run blocks see the replay's prefix sharing and entropy instead of a counter.
+pub(super) fn netload_key_shaped(shape: KeyShape, prefix: &str, i: usize) -> Vec<u8> {
+    match shape {
+        KeyShape::Seq => format!("{prefix}-{i:012}").into_bytes(),
+        KeyShape::Atproto => {
+            let did = splitmix64(i as u64 / 8);
+            let did = (did as u128) << 64 | splitmix64(did) as u128;
+            let mut key = format!("{prefix}at://did:plc:").into_bytes();
+            push_base32(&mut key, did, 24);
+            key.extend_from_slice(b"/app.bsky.feed.like/3l");
+            push_base32(&mut key, splitmix64(i as u64 ^ 0x0573) as u128, 11);
+            key
+        }
+    }
+}
+
+fn netload_key(prefix: &str, i: usize) -> Vec<u8> {
+    static SHAPE: std::sync::OnceLock<KeyShape> = std::sync::OnceLock::new();
+    let shape = *SHAPE.get_or_init(|| netload_key_shape(std::env::var("VALS_NETLOAD_KEY_SHAPE").ok().as_deref()));
+    netload_key_shaped(shape, prefix, i)
+}
+
 pub(super) fn netbatchwrite_width(value: Option<&str>) -> usize {
     value
         .and_then(|s| s.parse::<usize>().ok())
@@ -722,7 +775,7 @@ fn netload_thread(
                         worker_calls,
                     );
                     let keys: Vec<Vec<u8>> = range
-                        .map(|i| format!("{key_prefix}-{:012}", base + i).into_bytes())
+                        .map(|i| netload_key(&key_prefix, base + i))
                         .collect();
                     wops.set(wops.get() + keys.len());
                     if write_rate > 0.0 {
@@ -871,7 +924,7 @@ fn netload_thread(
                         netread_should_sample(lat_sample_every, worker_ops)
                             .then(std::time::Instant::now)
                     };
-                    let key = format!("{key_prefix}-{:012}", base + i).into_bytes();
+                    let key = netload_key(&key_prefix, base + i);
                     let result = coord.read(&key).await;
                     if let Some(started) = sample_started {
                         let elapsed_ns =
@@ -912,7 +965,7 @@ fn netload_thread(
                     worker_round_trips += 1;
                     let keys: Vec<Vec<u8>> = indexes
                         .into_iter()
-                        .map(|i| format!("{key_prefix}-{:012}", base + i).into_bytes())
+                        .map(|i| netload_key(&key_prefix, base + i))
                         .collect();
                     let sample_started = netread_should_sample(
                         lat_sample_every,
@@ -1073,6 +1126,21 @@ mod tests {
     #[should_panic(expected = "must be buffered or device")]
     fn netbatchwrite_rejects_unknown_persistence() {
         netbatchwrite_persistence(Some("syncish"));
+    }
+
+    #[test]
+    fn atproto_key_shape_is_deterministic_unique_and_groups_eight_records_per_did() {
+        assert_eq!(netload_key_shape(None), KeyShape::Seq);
+        assert_eq!(netload_key_shape(Some("atproto")), KeyShape::Atproto);
+        assert_eq!(netload_key_shaped(KeyShape::Seq, "nl", 7), b"nl-000000000007".to_vec());
+        let keys: Vec<Vec<u8>> = (0..4096).map(|i| netload_key_shaped(KeyShape::Atproto, "", i)).collect();
+        assert_eq!(keys[5], netload_key_shaped(KeyShape::Atproto, "", 5));
+        assert!(keys.iter().all(|k| k.starts_with(b"at://did:plc:") && k.len() == 13 + 24 + 22 + 11));
+        let did = |k: &Vec<u8>| k[..37].to_vec();
+        assert_eq!(did(&keys[8]), did(&keys[15]));
+        assert_ne!(did(&keys[7]), did(&keys[8]));
+        let unique: std::collections::HashSet<&Vec<u8>> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len());
     }
 
     #[test]
