@@ -131,13 +131,14 @@ fn block_decoders_agree_and_never_panic_on_resealed_mutations() {
     let (mut coded_rounds, mut framed_rounds) = (0, 0);
     for round in 0..4000u32 {
         let mut entries = gen_entries(&mut rng);
+        let level = [DEFAULT_RUN_ZSTD_LEVEL, -1, -5, 3][(round / 4 % 4) as usize];
         let block = if round % 4 == 3 {
             for (i, e) in entries.iter_mut().enumerate() {
                 e.ptr = ValuePtr { segment: SegmentId(3), offset: i as u32 * 128, len: 100 };
                 (e.seq, e.version) = (i as u64, (i as u128 + 1) << 64);
             }
             let (body, frames, extra) = encode_block_body_framed(&entries, 128 << rng.range(0, 2));
-            match compress_block_body_framed(&body, &frames, body.len() - extra) {
+            match compress_block_body_framed(&body, &frames, body.len() - extra, level) {
                 Some(coded) if !frames.is_empty() => {
                     framed_rounds += 1;
                     reseal(coded)
@@ -146,7 +147,7 @@ fn block_decoders_agree_and_never_panic_on_resealed_mutations() {
             }
         } else {
             let block = encode_block(&entries);
-            match compress_block_body(&block[..block.len() - 4]) {
+            match compress_block_body(&block[..block.len() - 4], level) {
                 Some(coded) if round % 4 == 1 => {
                     coded_rounds += 1;
                     reseal(coded)

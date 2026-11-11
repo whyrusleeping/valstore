@@ -177,6 +177,39 @@ fn mixed_v2_v4_v7_v6_runs_serve_reads_digests_cover_scans_and_merge_to_v7() {
 }
 
 #[test]
+fn per_path_zstd_levels_flush_and_merge_off_and_compressed_runs_into_each_other() {
+    for (flush, merge) in [(None, Some(-1)), (Some(3), None)] {
+        let mut e = Engine::create_prewiped(MemBlockDevice::new(BS, 1 << 16), fmt_cfg());
+        let mut model = Model::new();
+        run::with_run_zstd_levels(flush, merge, || {
+            for round in 0..3u64 {
+                for i in round * 80..round * 80 + 120 {
+                    let (key, version) = (fmt_key(i), 100 * round as u128 + i as u128 + 1);
+                    let value = format!("r{round}-{i}").into_bytes();
+                    e.put(&key, &value, version).unwrap();
+                    model.insert(key, (version, Some(value)));
+                }
+                e.flush(fmt_opts()).unwrap();
+            }
+            assert!(e.runs.iter().all(|or| or.run.format_version() == run::RUN_VERSION));
+            assert!(e.runs.iter().all(|or| (or.run.compression_savings() > 0) == flush.is_some()), "{flush:?}");
+            assert_serves_model(&e, &model, "flushed");
+            e.compact_runs(fmt_opts(), None).unwrap();
+        });
+        assert_eq!(e.runs.len(), 1);
+        assert_eq!(e.runs[0].run.format_version(), run::RUN_VERSION);
+        assert_eq!(e.runs[0].run.compression_savings() > 0, merge.is_some(), "merge {merge:?}");
+        assert_eq!(e.runs[0].meta.entry_count, model.len() as u64);
+        assert_serves_model(&e, &model, "merged");
+        let dev = e.device().share();
+        drop(e);
+        let mut reopened = Engine::open(dev, fmt_cfg()).unwrap();
+        assert_serves_model(&reopened, &model, "reopened");
+        assert_eq!(cover_every_run(&mut reopened), 1);
+    }
+}
+
+#[test]
 fn rollback_write_version_keeps_sidecars_until_a_v5_input_exists() {
     let mut e = Engine::create_prewiped(MemBlockDevice::new(BS, 1 << 16), fmt_cfg());
     let round = |e: &mut Engine<MemBlockDevice>, base: u64| {

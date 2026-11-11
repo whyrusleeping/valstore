@@ -291,7 +291,7 @@ fn framed_block_bodies_restart_each_frame_and_otherwise_encode_like_plain_bodies
     assert!(frames.len() >= 6, "{} frames", frames.len());
     assert_eq!(body.len() - extra, plain.len());
     assert_eq!(decode_block_body(&body).unwrap(), entries);
-    let coded = compress_block_body_framed(&body, &frames, body.len() - extra).unwrap();
+    let coded = compress_block_body_framed(&body, &frames, body.len() - extra, DEFAULT_RUN_ZSTD_LEVEL).unwrap();
     assert_eq!(check_frame_index(&coded, &body), Ok(()));
     assert_eq!(decode_block_payload(&coded).unwrap().as_ref(), &body[..]);
     let mut block = coded.clone();
@@ -305,7 +305,7 @@ fn framed_block_bodies_restart_each_frame_and_otherwise_encode_like_plain_bodies
     }
     assert_eq!(block_lookup(&block, b""), Ok(None));
     assert_eq!(block_lookup(&block, &[0xff; 200]), Ok(None));
-    assert!(compress_block_body_framed(&body, &frames, coded.len()).is_none(), "no smaller than the limit");
+    assert!(compress_block_body_framed(&body, &frames, coded.len(), DEFAULT_RUN_ZSTD_LEVEL).is_none(), "no smaller than the limit");
     for (n, frame_bytes) in [(10, 8192), (400, 0)] {
         let (b, f, x) = encode_block_body_framed(&entries[..n], frame_bytes);
         assert_eq!((b, f.len(), x), (encode_block_body(&entries[..n]), 0, 0));
@@ -319,4 +319,79 @@ fn block_frame_knob_parses_and_falls_back() {
     assert_eq!(parse_run_block_frame_bytes(Some("0")), 0);
     assert_eq!(parse_run_block_frame_bytes(Some("x")), DEFAULT_RUN_BLOCK_FRAME_BYTES);
     assert_eq!(parse_run_block_frame_bytes(Some("9999999")), 256 * 1024);
+}
+
+#[test]
+fn zstd_level_knob_parses_off_and_falls_back() {
+    let parse = |raw| parse_run_zstd_level("VALS_RUN_FLUSH_ZSTD_LEVEL", raw);
+    assert_eq!(parse(None), Some(DEFAULT_RUN_ZSTD_LEVEL));
+    assert_eq!(parse(Some("")), Some(DEFAULT_RUN_ZSTD_LEVEL));
+    assert_eq!(parse(Some(" -3 ")), Some(-3));
+    assert_eq!(parse(Some("3")), Some(3));
+    assert_eq!(parse(Some("off")), None);
+    for zero in ["0", "-0", "+0", "00"] {
+        assert_eq!(parse(Some(zero)), None, "{zero} is off, not zstd's default level");
+    }
+    assert_eq!(parse(Some("fast")), Some(DEFAULT_RUN_ZSTD_LEVEL));
+    assert_eq!(parse(Some("99")), Some(zstd::zstd_safe::max_c_level()));
+    assert_eq!(parse(Some("-9999999")), Some(zstd::zstd_safe::min_c_level()));
+}
+
+fn open_flush_built(entries: &[SnapshotEntry]) -> (Arc<MemBlockDevice>, Allocator, DeviceRun<MemBlockDevice>) {
+    let (bytes, _) =
+        build_run_checked(entries, RunBuildOpts::default(), RUN_VERSION, EncodePath::Flush, RunSource::Inline).unwrap();
+    let (dev, mut alloc) = dev_alloc((bytes.len() / BS) as u64 * 2 + 64, 256);
+    let handle = write_run(&*dev, &mut alloc, &bytes).unwrap();
+    let run = DeviceRun::open(dev.clone(), &alloc, handle).unwrap();
+    (dev, alloc, run)
+}
+
+#[test]
+fn per_path_zstd_levels_change_only_stored_bytes() {
+    let entries = backlinks_with_tombstones(20_000);
+    let (dev6, alloc6, v6) = open_built_versioned(&entries, RunBuildOpts::default(), RUN_RT_VERSION);
+    let want = reads(&dev6, &alloc6, &v6, &entries);
+    let mut sizes = Vec::new();
+    for level in [Some(3), Some(DEFAULT_RUN_ZSTD_LEVEL), Some(-5), None] {
+        let (dev, alloc, flushed) = with_run_zstd_levels(level, Some(DEFAULT_RUN_ZSTD_LEVEL), || open_flush_built(&entries));
+        let (mdev, malloc, merged) =
+            with_run_zstd_levels(Some(DEFAULT_RUN_ZSTD_LEVEL), level, || open_built_versioned(&entries, RunBuildOpts::default(), RUN_VERSION));
+        let (sdev, salloc, streamed) = with_run_zstd_levels(Some(DEFAULT_RUN_ZSTD_LEVEL), level, || {
+            with_run_write_version(RUN_VERSION, || build_streamed(&entries, RunBuildOpts::default(), entries.len(), 16_384, 64))
+        });
+        for (name, run) in [("flush", &flushed), ("merge", &merged), ("stream", &streamed)] {
+            assert_eq!(run.format_version(), RUN_VERSION, "{name} {level:?}");
+            assert_eq!(run.uncompressed_len(), merged.uncompressed_len(), "{name} {level:?}");
+        }
+        assert_eq!((flushed.handle.len, streamed.handle.len), (merged.handle.len, merged.handle.len), "{level:?}");
+        assert_eq!(reads(&dev, &alloc, &flushed, &entries), want, "flush {level:?}");
+        assert_eq!(reads(&mdev, &malloc, &merged, &entries), want, "merge {level:?}");
+        assert_eq!(reads(&sdev, &salloc, &streamed, &entries), want, "stream {level:?}");
+        sizes.push(merged.handle.len);
+    }
+    assert!(sizes[1] < sizes[2] && sizes[2] < sizes[3], "level 1 < level -5 < off: {sizes:?}");
+    assert!(sizes[0] <= sizes[1] + sizes[1] / 50, "level 3 is no worse than level 1: {sizes:?}");
+    let (_, _, off) = with_run_zstd_levels(None, None, || open_flush_built(&entries));
+    assert_eq!(off.handle.len, v6.handle.len + INDEX_RAW_TRAILER_LEN as u64);
+    assert_eq!((off.compression_savings(), off.uncompressed_len()), (0, off.handle.len));
+}
+
+#[test]
+fn an_off_path_writes_v6_layout_blocks_and_the_other_path_still_compresses() {
+    let entries = backlinks_with_tombstones(4_000);
+    let opts = RunBuildOpts::default();
+    let v6 = build_run_versioned(&entries, opts, RUN_RT_VERSION);
+    let ft = decode_footer(&v6[v6.len() - FOOTER_LEN..]).unwrap();
+    let (flushed, merged) = with_run_zstd_levels(None, Some(-1), || {
+        let (flushed, _) = build_run_checked(&entries, opts, RUN_VERSION, EncodePath::Flush, RunSource::Inline).unwrap();
+        (flushed, build_run_versioned(&entries, opts, RUN_VERSION))
+    });
+    assert_eq!(flushed[..ft.bloom_off as usize], v6[..ft.bloom_off as usize], "flush blocks are stored uncompressed");
+    assert!(merged.len() * 3 < flushed.len() * 2, "merge {} vs flush {}", merged.len(), flushed.len());
+    let (flushed, merged) = with_run_zstd_levels(Some(-1), None, || {
+        let (flushed, _) = build_run_checked(&entries, opts, RUN_VERSION, EncodePath::Flush, RunSource::Inline).unwrap();
+        (flushed, build_run_versioned(&entries, opts, RUN_VERSION))
+    });
+    assert_eq!(merged[..ft.bloom_off as usize], v6[..ft.bloom_off as usize], "merge blocks are stored uncompressed");
+    assert!(flushed.len() * 3 < merged.len() * 2, "flush {} vs merge {}", flushed.len(), merged.len());
 }

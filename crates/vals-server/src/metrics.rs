@@ -307,6 +307,12 @@ fn render() -> String {
         vals_store::run::run_block_target_bytes(),
         vals_store::run::run_bloom_bits_per_key()
     ));
+    let level = |p| vals_store::run::run_zstd_level(p).unwrap_or(0);
+    out.push_str(&format!(
+        "# HELP vals_run_zstd_level zstd level new compressed (v7) run blocks are written at, per build path (0 = stored uncompressed; VALS_RUN_FLUSH_ZSTD_LEVEL, VALS_RUN_MERGE_ZSTD_LEVEL).\n# TYPE vals_run_zstd_level gauge\nvals_run_zstd_level{{path=\"flush\"}} {}\nvals_run_zstd_level{{path=\"merge\"}} {}\n",
+        level(vals_store::run::EncodePath::Flush),
+        level(vals_store::run::EncodePath::Merge)
+    ));
     for (name, help, value) in [
         ("run_build_verify_bytes_total", "Bytes of new v5 merge-output runs read back from the device after their last write and checked before publication: data-block CRCs plus footer, filter and index CRCs and byte compare (VALS_RUN_BUILD_VERIFY, process-wide).", verify_bytes),
         ("run_build_verify_failures_total", "New v5 merge-output runs whose pre-publication device readback failed a data-block, footer, filter or index check (process-wide). Must stay 0.", verify_failures),
@@ -502,6 +508,9 @@ mod tests {
         assert!(reply.contains("\nvals_vlog_write_version 2\n"), "{reply}");
         assert!(reply.contains("\nvals_run_block_target_bytes 32768\n"), "{reply}");
         assert!(reply.contains("\nvals_run_bloom_bits_per_key 10\n"), "{reply}");
+        for path in ["flush", "merge"] {
+            assert!(reply.contains(&format!("\nvals_run_zstd_level{{path=\"{path}\"}} 1\n")), "{reply}");
+        }
         for kind in vals_store::vlog::CORRUPT_READ_KINDS {
             assert!(reply.contains(&format!("\nvals_store_corrupt_reads_total{{kind=\"{kind}\"}} ")), "{reply}");
         }

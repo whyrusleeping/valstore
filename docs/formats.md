@@ -683,13 +683,15 @@ data blocks | filter | [v6: RT block] | index | [v1–v4: sidecar] | footer (80 
   [u64 segment][u32 offset][u32 len][u64 seq][u128 version]) [crc32c]`, keys
   front-coded against the previous entry (the first entry's `shared` is 0).
 - **Compressed data block** (v7): `[u32 body_len][u32 codec = 1][zstd frame]
-  [crc32c]`, where the zstd frame (level 1, with its content checksum) decodes to
-  the `body_len`-byte block body above without its CRC. Readers tell the two
-  layouts apart by bytes 4..8: zero is a plain block's first `shared`, anything
-  else a codec; an unknown codec or a frame that does not decode to `body_len`
-  bytes is corrupt. The CRC covers the stored bytes. The builder compresses each
-  block, decompresses it again and checks the decoded entries against its source
-  before writing, and stores the plain layout when compression saves nothing.
+  [crc32c]`, where the zstd frame (any level, level 1 by default, with its
+  content checksum) decodes to the `body_len`-byte block body above without its
+  CRC. Readers tell the two layouts apart by bytes 4..8: zero is a plain block's
+  first `shared`, anything else a codec; an unknown codec or a frame that does
+  not decode to `body_len` bytes is corrupt. The CRC covers the stored bytes.
+  The builder compresses each block, decompresses it again and checks the
+  decoded entries against its source before writing, and stores the plain
+  layout when compression saves nothing or the build path's zstd level is off.
+  A v7 run may mix plain and compressed blocks written at any levels.
 - **Framed compressed data block** (v7, 0570): the same header, then a zstd
   skippable frame `[u32 magic 0x184D2A5A][u32 size][u32 crc32c(index)][index]`
   and one zstd frame per body frame: `index = [u32 n ≥ 2] n × ([u32 count]

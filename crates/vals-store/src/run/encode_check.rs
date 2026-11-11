@@ -291,13 +291,13 @@ fn block_facts(body: &[u8]) -> Option<BlockFacts> {
     (c.off == body.len()).then_some(BlockFacts { entries, first_key, last_key: key, max_hlc })
 }
 
-fn code_block(src: &[SnapshotEntry], compress: bool, frame_bytes: usize, flips: BlockFlips) -> CodedBlock {
-    let (mut body, frames, extra) = encode_block_body_framed(src, if compress { frame_bytes } else { 0 });
+fn code_block(src: &[SnapshotEntry], level: Option<i32>, frame_bytes: usize, flips: BlockFlips) -> CodedBlock {
+    let (mut body, frames, extra) = encode_block_body_framed(src, if level.is_some() { frame_bytes } else { 0 });
     if let Some((offset, mask)) = flips.body {
         body[offset] ^= mask;
     }
     let limit = body.len() - extra;
-    if let Some(mut coded) = compress.then(|| compress_block_body_framed(&body, &frames, limit)).flatten() {
+    if let Some(mut coded) = level.and_then(|level| compress_block_body_framed(&body, &frames, limit, level)) {
         drop(body);
         if let Some((offset, mask)) = flips.coded {
             coded[offset] ^= mask;
@@ -408,6 +408,7 @@ pub(super) struct EncodeCheck {
     raw_data: u64,
     max_raw_block: u32,
     frame_bytes: usize,
+    level: Option<i32>,
 }
 
 impl EncodeCheck {
@@ -431,6 +432,7 @@ impl EncodeCheck {
             raw_data: 0,
             max_raw_block: 0,
             frame_bytes: super::run_block_frame_bytes(),
+            level: super::run_zstd_level(path),
         }
     }
 
@@ -494,18 +496,26 @@ impl EncodeCheck {
         bloom: &mut BlockedBloom,
         compress: bool,
     ) -> Result<(Vec<u8>, Vec<u8>), Box<EncodeIntegrityError>> {
-        let coded = code_block(src, compress, self.frame_bytes, take_flips(self.blocks));
+        let coded = code_block(src, self.level.filter(|_| compress), self.frame_bytes, take_flips(self.blocks));
         self.block_coded(src, coded, expect, bloom)
     }
 
-    /// Encodes (and for v7 compresses and decompresses) the next `srcs.len()` blocks, on up to
-    /// `run_codec_threads()` threads when compressing; `block_coded` then checks each in order.
+    /// Whether blocks of a `version` run built by this check are compressed: the version
+    /// compresses blocks and this path's zstd level is not off.
+    pub(super) fn compresses(&self, version: u16) -> bool {
+        super::version_compresses_blocks(version) && self.level.is_some()
+    }
+
+    /// Encodes (and when `compress`, at this path's zstd level, compresses and decompresses) the
+    /// next `srcs.len()` blocks, on up to `run_codec_threads()` threads when compressing;
+    /// `block_coded` then checks each in order.
     pub(super) fn code_blocks(&self, srcs: &[&[SnapshotEntry]], compress: bool) -> Vec<CodedBlock> {
         let flips: Vec<BlockFlips> = (0..srcs.len()).map(|i| take_flips(self.blocks + i)).collect();
-        let threads = if compress { run_codec_threads().min(srcs.len()) } else { 1 };
+        let level = self.level.filter(|_| compress);
+        let threads = if level.is_some() { run_codec_threads().min(srcs.len()) } else { 1 };
         let frame_bytes = self.frame_bytes;
         let code = |t: usize| -> Vec<(usize, CodedBlock)> {
-            (t..srcs.len()).step_by(threads).map(|i| (i, code_block(srcs[i], compress, frame_bytes, flips[i]))).collect()
+            (t..srcs.len()).step_by(threads).map(|i| (i, code_block(srcs[i], level, frame_bytes, flips[i]))).collect()
         };
         if threads <= 1 {
             return code(0).into_iter().map(|(_, c)| c).collect();

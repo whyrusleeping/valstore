@@ -240,6 +240,64 @@ pub fn run_bloom_bits_per_key() -> usize {
     })
 }
 
+pub const DEFAULT_RUN_ZSTD_LEVEL: i32 = 1;
+
+/// A run-block zstd level knob: `Some(level)`, or `None` ("off" or "0") to store new blocks
+/// uncompressed in the v6 block layout.
+pub fn parse_run_zstd_level(name: &str, raw: Option<&str>) -> Option<i32> {
+    let range = zstd::zstd_safe::min_c_level()..=zstd::zstd_safe::max_c_level();
+    match raw.map(str::trim) {
+        None | Some("") => Some(DEFAULT_RUN_ZSTD_LEVEL),
+        Some("off") => None,
+        Some(s) => match s.parse::<i32>() {
+            Ok(0) => None,
+            Ok(v) if range.contains(&v) => Some(v),
+            Ok(v) => {
+                let clamped = v.clamp(*range.start(), *range.end());
+                log::error!("{name}={v} is outside {}..={}; using {clamped}", range.start(), range.end());
+                Some(clamped)
+            }
+            Err(_) => {
+                log::error!("{name}={s:?} is not a zstd level or \"off\"; using {DEFAULT_RUN_ZSTD_LEVEL}");
+                Some(DEFAULT_RUN_ZSTD_LEVEL)
+            }
+        },
+    }
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+thread_local! {
+    static ZSTD_LEVEL_OVERRIDE: std::cell::Cell<Option<[Option<i32>; 2]>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn with_run_zstd_levels<R>(flush: Option<i32>, merge: Option<i32>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<[Option<i32>; 2]>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ZSTD_LEVEL_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(ZSTD_LEVEL_OVERRIDE.with(|c| c.replace(Some([flush, merge]))));
+    f()
+}
+
+/// The zstd level new compressed (v7) run blocks are written at on `path`
+/// (`VALS_RUN_FLUSH_ZSTD_LEVEL`, `VALS_RUN_MERGE_ZSTD_LEVEL`); `None` writes them uncompressed.
+pub fn run_zstd_level(path: EncodePath) -> Option<i32> {
+    #[cfg(any(test, feature = "test-fixtures"))]
+    if let Some(levels) = ZSTD_LEVEL_OVERRIDE.with(|c| c.get()) {
+        return levels[matches!(path, EncodePath::Merge) as usize];
+    }
+    static FLUSH: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    static MERGE: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    let (cell, name) = match path {
+        EncodePath::Flush => (&FLUSH, "VALS_RUN_FLUSH_ZSTD_LEVEL"),
+        EncodePath::Merge => (&MERGE, "VALS_RUN_MERGE_ZSTD_LEVEL"),
+    };
+    *cell.get_or_init(|| parse_run_zstd_level(name, std::env::var(name).ok().as_deref()))
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RunBuildOpts {
     pub block_target_bytes: usize,
@@ -364,7 +422,7 @@ pub fn build_run_into_checked_rts<S: RunSink>(
     let data_start = sink.position();
     let mut hashes: Vec<u64> = Vec::new();
 
-    let compress = version_compresses_blocks(version);
+    let compress = check.compresses(version);
     let mut i = 0;
     while i < entries.len() {
         let mut batch: Vec<&[SnapshotEntry]> = Vec::new();
@@ -598,7 +656,7 @@ impl<'a, D: BlockDevice> RunStreamBuilder<'a, D> {
 
     fn close_block(&mut self) {
         if self.failed.is_none() {
-            let compress = version_compresses_blocks(self.version);
+            let compress = self.check.compresses(self.version);
             let (cur, hashes) = (std::mem::take(&mut self.cur), std::mem::take(&mut self.cur_hashes));
             self.pending.push((cur, hashes));
             if !compress || self.pending.len() >= STREAM_CODEC_BATCH_BLOCKS {
@@ -615,7 +673,7 @@ impl<'a, D: BlockDevice> RunStreamBuilder<'a, D> {
         if self.failed.is_some() || pending.is_empty() {
             return;
         }
-        let compress = version_compresses_blocks(self.version);
+        let compress = self.check.compresses(self.version);
         let srcs: Vec<&[SnapshotEntry]> = pending.iter().map(|(cur, _)| cur.as_slice()).collect();
         let coded = self.check.code_blocks(&srcs, compress);
         for ((cur, hashes), coded) in pending.iter().zip(coded) {

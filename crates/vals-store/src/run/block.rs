@@ -6,7 +6,6 @@ const SUFFIX_TOMB_BIT: u32 = 1 << 31;
 const BLOCK_CODEC_ZSTD: u32 = 1;
 const CODED_HEADER_LEN: usize = 8;
 pub(super) const MAX_BLOCK_BODY: usize = 64 << 20;
-const ZSTD_LEVEL: i32 = 1;
 
 const ZSTD_CONTEXT_POOL_MAX: usize = 64;
 
@@ -45,14 +44,23 @@ fn with_zstd<R>(f: impl FnOnce(&mut ZstdContexts) -> R) -> R {
 }
 
 fn new_compressor() -> std::io::Result<zstd::bulk::Compressor<'static>> {
-    let mut c = zstd::bulk::Compressor::new(ZSTD_LEVEL)?;
+    let mut c = zstd::bulk::Compressor::new(DEFAULT_RUN_ZSTD_LEVEL)?;
     c.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
     Ok(c)
 }
 
+fn level_compressor(z: &mut ZstdContexts, level: i32) -> Option<&mut zstd::bulk::Compressor<'static>> {
+    if z.compressor.is_none() {
+        z.compressor = new_compressor().ok();
+    }
+    let c = z.compressor.as_mut()?;
+    c.set_parameter(zstd::zstd_safe::CParameter::CompressionLevel(level)).ok()?;
+    Some(c)
+}
+
 /// The compressed v7 form of an encoded block body, `[u32 body_len][u32 codec][zstd frame]`
-/// without the CRC, or `None` when compression does not make it shorter.
-pub(super) fn compress_block_body(body: &[u8]) -> Option<Vec<u8>> {
+/// at zstd `level`, without the CRC, or `None` when compression does not make it shorter.
+pub(super) fn compress_block_body(body: &[u8], level: i32) -> Option<Vec<u8>> {
     if body.len() > MAX_BLOCK_BODY {
         return None;
     }
@@ -60,12 +68,7 @@ pub(super) fn compress_block_body(body: &[u8]) -> Option<Vec<u8>> {
     let mut out = vec![0u8; CODED_HEADER_LEN + bound];
     out[..4].copy_from_slice(&(body.len() as u32).to_le_bytes());
     out[4..8].copy_from_slice(&BLOCK_CODEC_ZSTD.to_le_bytes());
-    let n = with_zstd(|z| {
-        if z.compressor.is_none() {
-            z.compressor = new_compressor().ok();
-        }
-        z.compressor.as_mut()?.compress_to_buffer(body, &mut out[CODED_HEADER_LEN..]).ok()
-    })?;
+    let n = with_zstd(|z| level_compressor(z, level)?.compress_to_buffer(body, &mut out[CODED_HEADER_LEN..]).ok())?;
     if CODED_HEADER_LEN + n >= body.len() {
         return None;
     }
@@ -132,18 +135,15 @@ pub(super) fn encode_block_body_framed(entries: &[SnapshotEntry], frame_bytes: u
 /// frame holding the CRC-checked frame index, then one zstd frame per body frame. zstd decodes
 /// the whole as one stream, so any v7 reader gets the body back. `None` unless it is shorter
 /// than `limit`, the body's length without its frame restarts.
-pub(super) fn compress_block_body_framed(body: &[u8], frames: &[BodyFrame], limit: usize) -> Option<Vec<u8>> {
+pub(super) fn compress_block_body_framed(body: &[u8], frames: &[BodyFrame], limit: usize, level: i32) -> Option<Vec<u8>> {
     if frames.len() < 2 {
-        return compress_block_body(body);
+        return compress_block_body(body, level);
     }
     if body.len() > MAX_BLOCK_BODY || frames.len() > MAX_BLOCK_FRAMES {
         return None;
     }
     let coded: Vec<Vec<u8>> = with_zstd(|z| {
-        if z.compressor.is_none() {
-            z.compressor = new_compressor().ok();
-        }
-        let c = z.compressor.as_mut()?;
+        let c = level_compressor(z, level)?;
         let mut start = 0;
         let mut out = Vec::with_capacity(frames.len());
         for f in frames {

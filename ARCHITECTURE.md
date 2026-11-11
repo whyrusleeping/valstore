@@ -253,6 +253,11 @@ Three layers, weakest-but-cheapest to strongest-but-slowest:
   whole block while the fence index stays per block. zstd decodes the whole as
   one stream, so it is still format v7. One-shard overwrites went ~42k → ~71k/s
   for ~5–7% more stored run bytes and ~11% more build CPU.
+  **Per-path compression level** (0573): `VALS_RUN_FLUSH_ZSTD_LEVEL` and
+  `VALS_RUN_MERGE_ZSTD_LEVEL` (default 1) set the zstd level of flush and merge
+  outputs separately, or `off` for plain blocks; the level is fixed when a build
+  starts and handed to its codec threads. Readers decode any level and plain blocks,
+  so a node can trade run bytes for codec CPU on any restart without a format change.
   **Range-tombstone engine core:** a sorted engine keeps a
   canonical fragment set (`range_tombstone::FragmentSet`), appends RTs as record kind
   2, replays unflushed ones from the tail, and moves RT records into flush and rewrite
