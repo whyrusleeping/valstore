@@ -4,18 +4,20 @@ title: 'LSM compaction follow-ups: vlog co-compaction, tombstone GC over runs, c
 status: done
 priority: 2
 created: "2026-07-02"
-updated: "2026-07-04"
+updated: "2026-11-11"
 depends_on: []
 spec_refs: []
 ---
 
 ## Description
+**Outcome (done 2026-07-04):** `compact_and_write` now streams the merged run through `run::SegmentStreamSink`, byte-identical to the old path. The other two grouped items went to task 0028 (key-ordered vlog co-compaction, done) and task 0038 (tombstone GC over runs, done).
+
 Tracked follow-ups from the completed Stage C LSM (`docs/out-of-core-index.md` §C.5/C.6 status).
 
 **Re-scoped at plan time (2026-07-04)** — the original three grouped items were split, per the task's own note:
 1. **Vlog co-compaction** (space reclaim) → covered by **task 0028** (key-ordered vlog co-compaction), which explicitly subsumes it ("This also *is* the vlog space reclaim follow-up (task 0004's 'vlog co-compaction')"). The "space actually reclaimed (measured)" criterion moves there.
-2. **Tombstone GC over runs** (kind-promotion; unblocks F2 forget/cleanup) → split to **task 0038**, with the resurrection-vector / kill-the-fix criteria.
-3. **Cooperative-chunked run-merge compaction** — the off-core half already landed before this task started (commit `21da291` moved flush + run-merge compaction onto the maintenance worker thread, off the serving core; `c7a1516` streamed the flush write). The box measurement of maintenance stalls under sustained load rides with the blocked box-validation tasks (0012/0014/0027) when hardware is available. **The remaining code scope — this task — is the symmetric follow-on**: `compact_and_write` still materializes the merged run whole via `build_run` + `write_run_segs`; adopt the streaming `run::SegmentStreamSink` like the flush did (BACKLOG.md "Stream `compact_and_write` to the device", 2026-06-26).
+2. **Tombstone GC over runs** (kind-promotion; unblocks the "F2 gap": `forget`/`compact_filtered` no-op while runs exist, so over-replication cleanup over flushed keys stalls) → split to **task 0038**, with the resurrection-vector / kill-the-fix criteria.
+3. **Cooperative-chunked run-merge compaction** — the off-core half already landed before this task started (commit `21da291` moved flush + run-merge compaction onto the maintenance worker thread, off the serving core; `c7a1516` streamed the flush write). The box measurement of maintenance stalls under sustained load rides with the box-validation tasks (0012 live-Node distributed bench, 0014 multi-machine real-NIC bench, 0027 B1 box A/B; all since done) when hardware is available. **The remaining code scope — this task — is the symmetric follow-on**: `compact_and_write` still materializes the merged run whole via `build_run` + `write_run_segs`; adopt the streaming `run::SegmentStreamSink` like the flush did (BACKLOG.md (the free-form backlog that preceded `backlog/`; its open items became tasks on 2026-07-02 and it was deleted 2026-08-01, so it is not in the public history) "Stream `compact_and_write` to the device", 2026-06-26).
 
 ## Acceptance criteria
 - `compact_and_write` streams the merged run to its pre-reserved segments via `run::SegmentStreamSink` (no full `run_bytes` materialization; run copy bounded to ~one segment + sidecar, same as flush).
@@ -48,19 +50,14 @@ Tracked follow-ups from the completed Stage C LSM (`docs/out-of-core-index.md` �
 - rust-toolchain.toml pins 1.96; keep clippy/fmt clean per commit f1d946a
 
 ## Work log
-- 2026-07-04 plan: **Re-scope (recorded in the task description):** the original three grouped items were split per the task's own note. Item 1 (vlog co-compaction) is subsumed by task 0028; item 2 (tombstone GC over ru
-…[truncated]
+- 2026-07-04 plan: recorded in the Plan section above.
 - 2026-07-04 context hints: 6 recorded with plan
-- 2026-07-04 context hints: crates/vals-store/src/engine.rs:398-474 — compact_and_write; the build_run+write_run_segs block to replace is ~lines 432-463; crates/vals-store/src/engine.rs:212-260 — build_and_write_flush: the e
-…[truncated]
-- 2026-07-04 implementer report: ## Summary  Streamed `compact_and_write`'s merged-run device write through `run::SegmentStreamSink`, symmetric to the flush path — the remaining code scope of task 0004 (items 1 & 2 were re-scoped t
-…[truncated]
+- 2026-07-04 implementer report: Streamed `compact_and_write`'s merged-run device write through `run::SegmentStreamSink`, symmetric to the flush path — the remaining code scope of task 0004 (items 1 & 2 were re-scoped to tasks 0028 and 0038).
 - 2026-07-04 review tier: single-opus — reviewers: Claude
-- 2026-07-04 review (Claude): accept — The change streams `compact_and_write`'s merged-run write through `run::SegmentStreamSink`, symmetric to the already-landed flush path, satisfying all acceptance criteria. The whole run is no longer m
-…[truncated]
-- 2026-07-04 decision: accept — commit: perf(store): stream compact_and_write merged run to device via SegmentStreamSink (task 0004)  Off-core run-merge compaction no longer materializes the merged run as a whole run_bytes Vec — it stream
-…[truncated]
+- 2026-07-04 review (Claude): accept — The change streams `compact_and_write`'s merged-run write through `run::SegmentStreamSink`, symmetric to the already-landed flush path, satisfying all acceptance criteria.
+- 2026-07-04 decision: accept — commit: perf(store): stream compact_and_write merged run to device via SegmentStreamSink (task 0004). Per the commit message: the worker's run copy is bounded to ~one segment + the sidecar; the error contract is preserved; byte-for-byte identity vs the old build_run+write_run_segs path is regression-tested with a multi-segment merged run and partial final segment.
 - 2026-07-04 usage: 34,140 tok (in 124, out 34,016, cache_r 2,069,501, cache_w 154,754) · cost n/a (unpriced)
   implementer: 22,242 tok (in 68, out 22,174, cache_r 1,102,513, cache_w 56,673) · cost n/a (unpriced)
   coordinator: 8,225 tok (in 30, out 8,195, cache_r 816,821, cache_w 79,179) · cost n/a (unpriced)
   reviewer:Claude: 3,673 tok (in 26, out 3,647, cache_r 150,167, cache_w 18,902) · cost n/a (unpriced)
+- 2026-11-11 groom: added an outcome summary; glossed F2, BACKLOG.md and the box-validation task ids (dropped "blocked": 0012/0014/0027 are done); removed a duplicate empty Acceptance criteria heading; replaced cut-off work-log entries (plan and context hints are in the sections above; implementer/review lines trimmed to complete text; decision line restored from the pre-release commit message).

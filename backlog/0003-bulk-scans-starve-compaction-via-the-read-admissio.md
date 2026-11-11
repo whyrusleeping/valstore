@@ -4,21 +4,21 @@ title: Bulk scans starve compaction via the read-admission quiesce gate
 status: done
 priority: 2
 created: "2026-07-02"
-updated: "2026-07-04"
+updated: "2026-11-11"
 depends_on: []
 spec_refs: []
 ---
 
 ## Description
-Sub-bug of the bulk-export finding (BACKLOG.md §Efficiency/healing): compaction waits for in-flight reads to drain (100 ms, `COMPACT_QUIESCE_WAIT`); a sustained bulk scan keeps a read in flight continuously, so the node spams `compaction skipped — 1 in-flight read did not drain within 100ms` and the LSM never compacts down while being scanned → read-amp stays high exactly when compaction would help. A bulk reader must not be able to indefinitely block compaction.
+**Outcome (done 2026-07-04):** the compactor's quiesce drain bound now doubles per consecutive timeout (`quiesce_wait`), capped at 2 s, with a kill-the-fix integration test.
+
+Sub-bug of the bulk-export finding (task 0002's problem; BACKLOG.md (the free-form backlog that preceded `backlog/`; its open items became tasks on 2026-07-02 and it was deleted 2026-08-01, so it is not in the public history) §Efficiency/healing): compaction waits for in-flight reads to drain (100 ms, `COMPACT_QUIESCE_WAIT`); a sustained bulk scan keeps a read in flight continuously, so the node spams `compaction skipped — 1 in-flight read did not drain within 100ms` and the LSM never compacts down while being scanned → read-amp stays high exactly when compaction would help. A bulk reader must not be able to indefinitely block compaction.
 
 Candidate fixes: a low-priority / yielding bulk-read admission class, or a periodic forced-compaction tick the gate can't starve.
 
 ## Acceptance criteria
 - Kill-the-fix test: under a sustained scan load that holds a read in flight at every gate check, compaction still runs within a bounded number of ticks.
 - No correctness regression: the gate's original invariant (no read mid device-await against a segment the pass frees) still holds, pinned by existing tests.
-
-## Acceptance criteria
 
 ## Plan
 
@@ -66,19 +66,14 @@ Every `InflightGuard` holder (`serve_read_into`, `serve_digest`, `serve_bucket_d
 - BACKLOG.md lines ~745-775 — the bulk-export finding, sub-bug 1 is this task
 
 ## Work log
-- 2026-07-04 plan: ## Problem  The background compactor (`compact_loop`, crates/vals-cluster/src/node.rs) quiesces reads before a pass: it pauses new read admission via the `ReadGate` and waits a fixed `COMPACT_QUIESCE_
-…[truncated]
+- 2026-07-04 plan: recorded in the Plan section above.
 - 2026-07-04 context hints: 5 recorded with plan
-- 2026-07-04 context hints: crates/vals-cluster/src/node.rs:640-860 — compact_loop + COMPACT_QUIESCE_WAIT; drain_reads at ~1152-1201; crates/vals-cluster/src/net/server.rs:2032-2155 — ReadGate / InflightGuard / ReadPause; cr
-…[truncated]
-- 2026-07-04 implementer report: Implemented Task 0003: bulk scans no longer starve compaction via the read-admission quiesce gate. The fix escalates the compactor's drain bound after consecutive quiesce timeouts (the "forced tick th
-…[truncated]
+- 2026-07-04 implementer report: Implemented Task 0003: bulk scans no longer starve compaction via the read-admission quiesce gate. The fix escalates the compactor's drain bound after consecutive quiesce timeouts.
 - 2026-07-04 review tier: single-opus — reviewers: Claude
-- 2026-07-04 review (Claude): accept — The change implements the "escalating quiesce drain bound" fix exactly as planned: a pure `quiesce_wait(consecutive_timeouts)` helper doubles the 100ms base per consecutive timeout, clamped to a 2s ca
-…[truncated]
-- 2026-07-04 decision: accept — commit: Fix compaction starvation under sustained bulk scans: escalate the quiesce drain bound (task 0003)  The compactor's read-quiesce waited a fixed 100ms for in-flight reads to drain; a bulk scan page's d
-…[truncated]
+- 2026-07-04 review (Claude): accept — The change implements the "escalating quiesce drain bound" fix exactly as planned: a pure `quiesce_wait(consecutive_timeouts)` helper doubles the 100ms base per consecutive timeout, clamped to a 2s cap.
+- 2026-07-04 decision: accept — commit: Fix compaction starvation under sustained bulk scans: escalate the quiesce drain bound (task 0003). Per the commit message: capped at 2 s because no InflightGuard is held across a network send and the pause blocks new admissions (a longer wait is guaranteed to drain), while a wedged device read can't pause admission unboundedly; adds a kill-the-fix integration test plus doubling/clamp/overflow unit tests; existing gate invariant tests unchanged.
 - 2026-07-04 usage: 66,765 tok (in 202, out 66,563, cache_r 3,989,852, cache_w 219,879) · cost n/a (unpriced)
   implementer: 44,029 tok (in 112, out 43,917, cache_r 2,576,946, cache_w 75,245) · cost n/a (unpriced)
   coordinator: 17,253 tok (in 58, out 17,195, cache_r 1,161,297, cache_w 120,596) · cost n/a (unpriced)
   reviewer:Claude: 5,483 tok (in 32, out 5,451, cache_r 251,609, cache_w 24,038) · cost n/a (unpriced)
+- 2026-11-11 groom: added an outcome summary; glossed BACKLOG.md and the bulk-export finding; removed a duplicate empty Acceptance criteria heading; replaced cut-off work-log entries (plan and context hints are in the sections above; implementer/review lines trimmed to complete text; decision line restored from the pre-release commit message).

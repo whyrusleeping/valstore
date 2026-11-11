@@ -1,24 +1,24 @@
 ---
 id: "0015"
-title: 'Anti-entropy: scope leaf comparison to the shared keyspace under RF&lt;N'
+title: 'Anti-entropy: scope leaf comparison to the shared keyspace under RF<N'
 status: done
 priority: 3
 created: "2026-07-02"
-updated: "2026-07-04"
+updated: "2026-11-11"
 depends_on: []
 spec_refs: []
 ---
 
 ## Description
-Measured residual from the hierarchical-Merkle work (BACKLOG.md, 2026-06-19): with RF&lt;N each node holds a different subset of the keyspace, so peers' full-leaf roots **permanently differ on the non-shared keysets** — ~68k digests/s examined-then-discarded at steady state with zero churn (RF=2, 3 nodes). Dense divergence, so the hierarchical descent doesn't reduce it. Candidate fix: scope the compared leaves/digests to the keys both peers replicate (placement-intersection-aware leaf accumulators or filtered digest pages).
+**Outcome (done 2026-07-04):** both sides of a reconcile now fold their Merkle tree over only the keys both peers replicate (leaf accumulators grouped by each key's replica set, a requester node id on `SyncTree`, and a re-seed on placement change). Per the pre-release commit message, a converged RF<N pair now matches at the root round (~68k digests/s examined-then-discarded → 0, asserted in-process by `converged_rf_lt_n_pair_examines_zero_digests`); no box measurement is recorded.
+
+Measured residual from the hierarchical-Merkle work (BACKLOG.md, 2026-06-19 entry; BACKLOG.md was the free-form backlog that preceded `backlog/`; its open items became tasks on 2026-07-02 and it was deleted 2026-08-01, so it is not in the public history): with RF<N each node holds a different subset of the keyspace, so peers' full-leaf roots **permanently differ on the non-shared keysets** — ~68k digests/s examined-then-discarded at steady state with zero churn (RF=2, 3 nodes). Dense divergence, so the hierarchical descent doesn't reduce it. Candidate fix: scope the compared leaves/digests to the keys both peers replicate (placement-intersection-aware leaf accumulators or filtered digest pages).
 
 Note: re-baseline against post-LSM AE (leaf accumulators now maintained across flush/compact) before designing.
 
 ## Acceptance criteria
-- Steady-state converged RF&lt;N cluster examines ~0 digests/s (vs ~68k) with no loss of healing coverage.
+- Steady-state converged RF<N cluster examines ~0 digests/s (vs ~68k) with no loss of healing coverage. *(Met in-process only, by the converged-pair test; no box measurement is recorded.)*
 - Sparse-divergence heal behavior unchanged (the 13× hierarchical win preserved); suite green.
-
-## Acceptance criteria
 
 ## Plan
 
@@ -66,25 +66,18 @@ Design (placement-intersection-aware leaf accumulators):
 - Ring::replicas / Ring::replicas_in_zone in crates/vals-cluster/src/ring.rs — placement predicates that must agree with the grouping fn
 
 ## Work log
-- 2026-07-04 plan: Goal: eliminate the permanent RF<N anti-entropy residual (~68k digests/s examined-then-discarded at converged steady state) by scoping the Merkle comparison to the keyspace both peers replicate, witho
-…[truncated]
+- 2026-07-04 plan: recorded in the Plan section above.
 - 2026-07-04 context hints: 8 recorded with plan
-- 2026-07-04 context hints: crates/vals-cluster/src/antientropy.rs — reconcile_with (tree descent + keep()), reconcile_scoped/_zone, LocalPeer, tests incl. CountingPeer; crates/vals-cluster/src/replica.rs — VersionIndex (lea
-…[truncated]
 - 2026-07-05 implemented: replica-set-grouped leaf accumulators (`VersionIndex.leaves: HashMap<Box<[NodeId]>, Box<[u64]>>`) + optional placement fn on `VersionedStore` (`PlacementFn = Arc<dyn Fn + Send+Sync>`, `set_placement`/`invalidate_leaf_seed`/`node_id`). `scoped_leaf_digests` gained a `counterpart: Option<NodeId>` (folds only groups holding both own node and the counterpart when placement wired; unscoped otherwise). Threaded a `requester` node id through `AePeer::tree`, `Request/OwnedRequest::SyncTree` (wire + roundtrip test + wire_fuzz), net server (serves `Some(requester)`) and net client, and `reconcile_with`/`reconcile_scoped`/`reconcile_scoped_zone`/`sweep`. `sweep_loop` wires the per-zone placement (default → `ring.replicas`; named → `ring.replicas_in_zone` with sorted range token) from a per-pass ring snapshot and re-seeds (`invalidate_leaf_seed`) on a placement-fingerprint change (`cleanup_cfg`) tracked by a new `last_placement_cfg`.
 - 2026-07-05 verified (no SPDK hardware — in-process stand-ins per the plan): new tests — `converged_rf_lt_n_pair_examines_zero_digests` (CountingPeer `digest_entries == 0` and `applied == 0` for a converged RF=2/3-node pair; also asserts the unscoped roots *differ* so it kills the fix if reverted), `scoped_reconcile_still_heals_shared_divergence` (one shared-key divergence heals; ≤32 digests examined ⇒ hierarchical localization preserved), `placement_change_reseeds_without_stale_group_residue` (post-ring-change reseed: unscoped fold matches from-scratch recompute and a peer-scoped fold matches a scoped recompute). Full suite green: `cargo test --workspace` (0 failures), `cargo build --workspace --tests`, existing AE/replica/wire/wire_fuzz/net tests unchanged. Clippy: no new warnings (added `PlacementFn`/`LeafGroups` type aliases to avoid complex-type lint). Docs: updated `antientropy.rs`/`replica.rs` module docs and `docs/algorithms.md` §5 with the intersection-scoping + reseed story. Box measurement of the ~68k→0 digests/s deferred to a hardware-validation task.
-- 2026-07-04 implementer report: Implemented task 0015: anti-entropy now scopes its Merkle leaf comparison to the keyspace both peers replicate under RF<N, via placement-intersection-aware (replica-set-grouped) leaf accumulators.  ##
-…[truncated]
+- 2026-07-04 implementer report: Implemented task 0015: anti-entropy now scopes its Merkle leaf comparison to the keyspace both peers replicate under RF<N, via placement-intersection-aware (replica-set-grouped) leaf accumulators (details in the 2026-07-05 implemented/verified entries above).
 - 2026-07-04 review tier: high-powered — reviewers: Claude
-- 2026-07-04 review (Claude): accept — The change implements placement-intersection-aware (replica-set-grouped) Merkle leaf accumulators and scopes the anti-entropy tree exchange to the keyspace both peers replicate under RF<N. It threads 
-…[truncated]
-- 2026-07-04 revision: Brought docs/formats.md §1 (Wire protocol) current with wire.rs — targeted edits only, no rewrite. Every touched row was cross-checked against the actual encoders/decoders and the roundtrip tests. 
-…[truncated]
-- 2026-07-04 review (Claude): accept — The only substantive change since the prior (accepted) review is a docs/formats.md §1 update: it documents the in-scope SyncTree `opt<u32> requester` wire field for task 0015 and brings the surroundi
-…[truncated]
-- 2026-07-04 decision: accept — commit: ae: scope Merkle comparison to the shared keyspace under RF<N (task 0015)  Replica-set-grouped leaf accumulators (VersionIndex.leaves keyed by the key's sorted replica set) + an optional per-zone plac
-…[truncated]
+- 2026-07-04 review (Claude): accept — The change implements placement-intersection-aware (replica-set-grouped) Merkle leaf accumulators and scopes the anti-entropy tree exchange to the keyspace both peers replicate under RF<N.
+- 2026-07-04 revision: Brought docs/formats.md §1 (Wire protocol) current with wire.rs — targeted edits only, no rewrite. Every touched row was cross-checked against the actual encoders/decoders and the roundtrip tests.
+- 2026-07-04 review (Claude): accept — The only substantive change since the prior (accepted) review is a docs/formats.md §1 update documenting the in-scope SyncTree `opt<u32> requester` wire field for task 0015.
+- 2026-07-04 decision: accept — commit: ae: scope Merkle comparison to the shared keyspace under RF<N (task 0015). Per the commit message: no wire back-compat for the `SyncTree` requester field (preproduction); `sweep_loop` wires placement per zone (default ring / salted zone / sorted range-token); sparse-divergence localization and healing coverage preserved (heal + reseed tests, full suite green); docs/formats.md §1 and docs/algorithms.md §5 updated.
 - 2026-07-04 usage: 163,966 tok (in 534, out 163,432, cache_r 39,654,882, cache_w 766,783) · cost n/a (unpriced)
   implementer: 137,989 tok (in 434, out 137,555, cache_r 36,207,852, cache_w 519,925) · cost n/a (unpriced)
   coordinator: 13,649 tok (in 46, out 13,603, cache_r 2,396,577, cache_w 130,035) · cost n/a (unpriced)
   reviewer:Claude: 12,328 tok (in 54, out 12,274, cache_r 1,050,453, cache_w 116,823) · cost n/a (unpriced)
+- 2026-11-11 groom: added an outcome summary (recovered from the pre-release commit message); fixed HTML-escaped `RF&lt;N` in the title and body; glossed BACKLOG.md; annotated the ~0 digests/s criterion as met in-process only; removed a duplicate empty Acceptance criteria heading; replaced cut-off work-log entries (plan and context hints are in the sections above; implementer/review/revision lines trimmed to complete text; decision line restored from the pre-release commit message).

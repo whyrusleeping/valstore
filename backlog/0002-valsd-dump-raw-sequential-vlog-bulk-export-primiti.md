@@ -4,25 +4,25 @@ title: 'valsd dump: raw sequential vlog bulk-export primitive'
 status: done
 priority: 1
 created: "2026-07-02"
-updated: "2026-07-04"
+updated: "2026-11-11"
 depends_on: []
 spec_refs:
     - Current focus areas
 ---
 
 ## Description
-Reading a dataset back via the scan path is ~merge-bound and lossy under load: 2.12B records wrote in ~3h but export ran at ~76k rec/s (~9h projected), all serving cores pegged, 9/103 ranges abandoned on `quorum failed`. Full diagnosis in BACKLOG.md §Efficiency/healing (2026-06-26 entry).
+**Outcome (done 2026-07-04):** the single-threaded `valsd dump` landed with an in-repo write→dump→replay round-trip test. The two box-bound criteria (live node, multi-GB rates) were not met here: they moved to task 0035 (dump follow-ons), which split them into 0043 (live in-daemon dump) and 0044 (on-box rate and non-disturbance validation); all three are done.
 
-**Fix direction (designed)**: a `valsd dump --zone <name> --out <path>` mode reusing the boot-recovery sequential vlog iterator (`scan_log_segments` → `decode_record`) but emitting records to a file instead of building the index. Device-sequential, no merge/RPC/quorum, no quiesce-gate interaction; can read via a sibling device handle (`BlockDevice::sibling()`, 2nd qpair) on a live node. Raw (not deduped) is the decided format: replaying in vlog order reproduces exact final state and real write volume.
+Reading a dataset back via the scan path is ~merge-bound and lossy under load: 2.12B records wrote in ~3h but export ran at ~76k rec/s (~9h projected), all serving cores pegged, 9/103 ranges abandoned on `quorum failed`. Full diagnosis in BACKLOG.md (the free-form backlog that preceded `backlog/`; its open items became tasks on 2026-07-02 and it was deleted 2026-08-01, so it is not in the public history) §Efficiency/healing (2026-06-26 entry).
+
+**Fix direction (designed)**: a `valsd dump --zone <name> --out <path>` mode reusing the boot-recovery sequential vlog iterator (`scan_log_segments` → `decode_record`) but emitting records to a file instead of building the index. Device-sequential, no merge/RPC/quorum, no quiesce-gate interaction; can read via a sibling device handle (`BlockDevice::sibling()`, 2nd qpair) on a live node. Raw (not deduped) is the decided format (who decided is not recorded, and it predates the session logs; treat it as the authoring agent's statement): replaying in vlog order reproduces exact final state and real write volume.
 
 **Smallest first cut**: single-threaded `valsd dump` that round-trips against `valsdump replay` (sibling repo `vals-examples/valsdump`); then per-segment and per-node parallelism.
 
 ## Acceptance criteria
 - `valsd dump` produces a file that `valsdump replay` round-trips to the exact final state (overwrites/tombstones handled by vlog-order replay).
-- Runs against a live node without disturbing serving (sibling handle), verified on the box.
-- Export of a multi-GB zone completes at device-sequential rates (orders of magnitude over the ~76k rec/s scan path).
-
-## Acceptance criteria
+- Runs against a live node without disturbing serving (sibling handle), verified on the box. *(Moved to 0035 → 0043/0044, done; not met in this task.)*
+- Export of a multi-GB zone completes at device-sequential rates (orders of magnitude over the ~76k rec/s scan path). *(Moved to 0035 → 0044, done; not met in this task.)*
 
 ## Plan
 
@@ -81,21 +81,15 @@ New `crates/vals-server/tests/dump.rs`, modeled on `daemon.rs` harness (spawn re
 - DEFAULT_ZONE = ZoneId 0 (crates/vals-cluster/src/zone.rs)
 
 ## Work log
-- 2026-07-04 plan: ## Goal Smallest first cut of `valsd dump`: a single-threaded, device-sequential raw vlog export of one zone to a flat file that a vlog-order replay round-trips to the exact final state. Verified in-r
-…[truncated]
+- 2026-07-04 plan: recorded in the Plan section above.
 - 2026-07-04 context hints: 9 recorded with plan
-- 2026-07-04 context hints: crates/vals-store/src/engine.rs: Engine::scan_log_segments (~line 1120), replay_winners, open_inner; crates/vals-store/src/vlog.rs: pub fn replay_segment (~line 1125), decode_record, Record/RecordKind
-…[truncated]
-- 2026-07-04 implementer report: Implemented `valsd dump` — a single-threaded, device-sequential raw vlog export of one zone to a flat `.vdump` file, verified end-to-end by a write→dump→replay→compare round-trip.  ## What cha
-…[truncated]
+- 2026-07-04 implementer report: Implemented `valsd dump` — a single-threaded, device-sequential raw vlog export of one zone to a flat `.vdump` file, verified end-to-end by a write→dump→replay→compare round-trip.
 - 2026-07-04 review tier: single-opus — reviewers: Claude
-- 2026-07-04 review (Claude): accept — Correct, well-tested implementation of the smallest first cut of `valsd dump`. It adds a read-only public vlog scan (`scan_vlog_records`) that reuses the boot-recovery segment scan (refactored to a sh
-…[truncated]
-- 2026-07-04 review (Claude): accept — The revision addresses both actionable findings from the prior review: the added replica.rs test is now rustfmt-clean, and a well-scoped follow-on backlog task (0035) was created capturing the deferre
-…[truncated]
-- 2026-07-04 decision: accept — commit: Add `valsd dump`: raw sequential vlog bulk-export primitive (task 0002)  - vals-store: new `dump` module — `scan_vlog_records` streams every vlog   record device-sequentially in (epoch, offset) orde
-…[truncated]
+- 2026-07-04 review (Claude): accept — Correct, well-tested implementation of the smallest first cut of `valsd dump`. It adds a read-only public vlog scan (`scan_vlog_records`) that reuses the boot-recovery segment scan.
+- 2026-07-04 review (Claude): accept — The revision addresses both actionable findings from the prior review: the added replica.rs test is now rustfmt-clean, and a well-scoped follow-on backlog task (0035) was created for the deferred box-bound scope.
+- 2026-07-04 decision: accept — commit: Add `valsd dump`: raw sequential vlog bulk-export primitive (task 0002). Per the commit message: vals-store `dump` module (`scan_vlog_records`, device-sequential in (epoch, offset) order, no index build); pub `split_stored_blob` in vals-cluster; `valsd dump -c <cfg> (--zone <name>|--zone-id <id>) --out <path> [--skip-tombstones]` writing valsdump-compatible `.vdump` (tombstones as a 0xFFFFFFFF val-len sentinel); e2e round-trip test; docs/deploy.md section; follow-on task 0035.
 - 2026-07-04 usage: 83,215 tok (in 388, out 82,827, cache_r 18,500,388, cache_w 377,042) · cost n/a (unpriced)
   implementer: 55,860 tok (in 250, out 55,610, cache_r 13,294,621, cache_w 163,486) · cost n/a (unpriced)
   coordinator: 14,170 tok (in 52, out 14,118, cache_r 3,156,289, cache_w 144,937) · cost n/a (unpriced)
   reviewer:Claude: 13,185 tok (in 86, out 13,099, cache_r 2,049,478, cache_w 68,619) · cost n/a (unpriced)
+- 2026-11-11 groom: added an outcome summary; marked the two box-bound criteria as moved to 0035 (→ 0043/0044, all done); glossed BACKLOG.md; flagged the unsourced "decided format" claim as the authoring agent's statement; removed a duplicate empty Acceptance criteria heading; replaced cut-off work-log entries (plan and context hints are in the sections above; implementer/review lines trimmed to complete text; decision line restored from the pre-release commit message).

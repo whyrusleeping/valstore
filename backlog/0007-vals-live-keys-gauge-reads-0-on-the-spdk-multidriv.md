@@ -4,19 +4,19 @@ title: vals_live_keys gauge reads 0 on the SPDK/multidrive serve path
 status: done
 priority: 2
 created: "2026-07-02"
-updated: "2026-07-04"
+updated: "2026-11-11"
 depends_on: []
 spec_refs: []
 ---
 
 ## Description
-BACKLOG.md §Productization: the gauge isn't wired through `serve_multidrive`, so per-node key-count / per-key-RAM tracking — the metric the scaling work needs most — is blind exactly on the production backend (`records_written`/`records_read` are accurate). Small, contained observability fix.
+**Outcome (done 2026-07-04):** `vals_live_keys` now comes from an exact resident-key count kept with the Merkle leaf accumulator, and each shard publishes deltas so multi-shard nodes sum instead of overwriting.
+
+BACKLOG.md (the free-form backlog that preceded `backlog/`; its open items became tasks on 2026-07-02 and it was deleted 2026-08-01, so it is not in the public history) §Productization: the gauge isn't wired through `serve_multidrive`, so per-node key-count / per-key-RAM tracking — the metric the scaling work needs most — is blind exactly on the production backend (`records_written`/`records_read` are accurate). Small, contained observability fix.
 
 ## Acceptance criteria
 - `vals_live_keys` reflects the real live key count on the SPDK/multidrive path (and stays correct across flush/compaction with the LSM — keys in runs count).
 - Covered by a test on the software backend equivalent of the multidrive path; scrape-endpoint exposition verified.
-
-## Acceptance criteria
 
 ## Plan
 
@@ -51,18 +51,14 @@ Verification: `cargo test -p vals-cluster -p vals-server` (plus targeted new tes
 - BACKLOG.md line ~628: the checkbox to mark fixed
 
 ## Work log
-- 2026-07-04 plan: Root causes (two, both in the shared serve path — `sample_gauges` IS already called on the multidrive path via `periodic_loop`, but its inputs/publishing are wrong):  1. **LSM blindness**: `sample_g
-…[truncated]
+- 2026-07-04 plan: recorded in the Plan section above.
 - 2026-07-04 context hints: 8 recorded with plan
-- 2026-07-04 context hints: crates/vals-cluster/src/net/server.rs: sample_gauges ~807, finalize_shutdown ~395, ServerShared constructors ~194 (single_zone_on) and the zoned one ~768; crates/vals-cluster/src/replica.rs: VersionIn
-…[truncated]
-- 2026-07-04 implementer report: Fixed task 0007: `vals_live_keys` reads 0 on the SPDK/multidrive serve path.  ## Root causes (both in the shared serve path; `sample_gauges` was already called per shard) 1. **LSM blindness**: `Server
-…[truncated]
+- 2026-07-04 implementer report: Fixed task 0007: `vals_live_keys` reads 0 on the SPDK/multidrive serve path. Two root causes, both in the shared serve path (`sample_gauges` was already called per shard); see the Plan.
 - 2026-07-04 review tier: single-opus — reviewers: Claude
-- 2026-07-04 review (Claude): accept — The change correctly fixes both root causes of the `vals_live_keys` gauge reading 0 on the SPDK/multidrive path. (1) LSM blindness: a new exact resident-key counter `VersionIndex.live` is maintained i
-…[truncated]
+- 2026-07-04 review (Claude): accept — The change correctly fixes both root causes of the `vals_live_keys` gauge reading 0 on the SPDK/multidrive path, starting with LSM blindness: a new exact resident-key counter `VersionIndex.live`.
 - 2026-07-04 decision: accept — commit: Fix vals_live_keys reading 0 on the SPDK/multidrive path: exact resident-key count + per-shard delta gauges (task 0007)
 - 2026-07-04 usage: 46,242 tok (in 278, out 45,964, cache_r 6,593,619, cache_w 236,579) · cost n/a (unpriced)
   implementer: 28,353 tok (in 178, out 28,175, cache_r 4,350,846, cache_w 80,136) · cost n/a (unpriced)
   reviewer:Claude: 11,851 tok (in 74, out 11,777, cache_r 1,011,832, cache_w 46,072) · cost n/a (unpriced)
   coordinator: 6,038 tok (in 26, out 6,012, cache_r 1,230,941, cache_w 110,371) · cost n/a (unpriced)
+- 2026-11-11 groom: added an outcome summary; glossed BACKLOG.md; removed a duplicate empty Acceptance criteria heading; replaced cut-off work-log entries (plan and context hints are in the sections above; implementer/review lines trimmed to complete text).

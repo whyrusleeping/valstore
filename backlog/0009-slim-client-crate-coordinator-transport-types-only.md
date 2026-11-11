@@ -4,22 +4,22 @@ title: Slim client crate (coordinator + transport + types only)
 status: done
 priority: 3
 created: "2026-07-02"
-updated: "2026-07-04"
+updated: "2026-11-11"
 depends_on: []
 spec_refs: []
 ---
 
 ## Description
-BACKLOG.md §Productization: a client embeds all of `vals-cluster` (server included) today. Extract a client-facing crate cutting the surface to coordinator + transport + wire types. 
+**Outcome (done 2026-07-04):** `crates/vals-client` exists (deps: vals-rt, libc, socket2, log); `vals-cluster` depends on it and re-exports it, so existing `vals_cluster::…` paths still work.
 
-Note the original prerequisite is largely met: `freeze-contracts` (merged) landed the versioned wire hello (`PROTO_VERSION 1`), on-disk version envelopes, and a sealed public API; `formats.md` remains "snapshot, not frozen" but changes are now gateable on the negotiated version. Non-Rust clients are proven viable (`vals-examples/valsgo` written from the spec alone).
+BACKLOG.md (the free-form backlog that preceded `backlog/`; its open items became tasks on 2026-07-02 and it was deleted 2026-08-01, so it is not in the public history) §Productization: a client embeds all of `vals-cluster` (server included) today. Extract a client-facing crate cutting the surface to coordinator + transport + wire types. 
+
+Note the original prerequisite is largely met: the `freeze-contracts` work (merged before this backlog began; it has no task file) landed the versioned wire hello (`PROTO_VERSION 1`), on-disk version envelopes, and a sealed public API; `formats.md` remains "snapshot, not frozen" but changes are now gateable on the negotiated version. Non-Rust clients are proven viable (`valsgo` in the private sibling repo vals-examples, written from the spec alone).
 
 ## Acceptance criteria
 - A `vals-client` (name TBD) crate a client can depend on without compiling server/PD/store code; `vals-cluster` re-exports or depends on it to avoid duplication.
 - Existing examples/getting-started compile against the slim crate.
 - Public API surface documented (`#![warn(missing_docs)]` kept).
-
-## Acceptance criteria
 
 ## Plan
 
@@ -75,19 +75,15 @@ Extract a client-facing crate `vals-client` from `vals-cluster` so an applicatio
 - vals-rt is std-only (no deps) — safe dependency for vals-client
 
 ## Work log
-- 2026-07-04 plan: Extract a client-facing crate `vals-client` from `vals-cluster` so an application can embed coordinator + transport + wire types without compiling server/PD/store code (no vals-store, vals-spdk, vals-
-…[truncated]
+- 2026-07-04 plan: recorded in the Plan section above.
 - 2026-07-04 context hints: 9 recorded with plan
-- 2026-07-04 context hints: crates/vals-cluster/src/lib.rs — current module map + curated root re-exports to preserve; coord/mod.rs:36-87 — TransportError::Engine(EngineError) is the only vals-store type in coord; constructe
-…[truncated]
-- 2026-07-04 implementer report: Extracted a new slim `vals-client` crate (coordinator + transport + wire types) from `vals-cluster`, which now depends on and re-exports it so every `vals_cluster::…` path stays stable.  ## New crat
-…[truncated]
+- 2026-07-04 implementer report: Extracted a new slim `vals-client` crate (coordinator + transport + wire types) from `vals-cluster`, which now depends on and re-exports it so every `vals_cluster::…` path stays stable.
 - 2026-07-04 review tier: high-powered — reviewers: Claude
-- 2026-07-04 review (Claude): accept — The change extracts a slim `vals-client` crate (coordinator + transport + wire types) from `vals-cluster` exactly as planned. Verified: `cargo tree -p vals-client -e normal` shows only vals-rt/libc/so
-…[truncated]
-- 2026-07-04 decision: accept — commit: feat: extract slim vals-client crate (coordinator + transport + wire types) (task 0009)  A client app can now depend on vals-client alone — coordinator (W/R quorum, durability tiers, CAS, batches, s
-…[truncated]
+- 2026-07-04 review (Claude): accept — The change extracts a slim `vals-client` crate (coordinator + transport + wire types) from `vals-cluster` exactly as planned, verified with `cargo tree -p vals-client -e normal`.
+- 2026-07-04 decision: accept — commit: feat: extract slim vals-client crate (coordinator + transport + wire types) (task 0009). Per the commit message: deps are vals-rt, libc, socket2 and log only; TransportError::Engine now carries the engine error's Display (String); zone::Ordering is a native client enum (engine_ordering() converts at the vals-store boundary); verified with workspace build/test, clippy, fmt, `cargo doc -p vals-client` under missing_docs, and a cargo tree free of store/spdk/raft.
 - 2026-07-04 usage: 181,037 tok (in 580, out 180,457, cache_r 40,885,333, cache_w 431,328) · cost n/a (unpriced)
   implementer: 147,078 tok (in 486, out 146,592, cache_r 39,327,604, cache_w 263,486) · cost n/a (unpriced)
   coordinator: 27,566 tok (in 58, out 27,508, cache_r 1,203,461, cache_w 131,529) · cost n/a (unpriced)
   reviewer:Claude: 6,393 tok (in 36, out 6,357, cache_r 354,268, cache_w 36,313) · cost n/a (unpriced)
+
+- 2026-11-11 groom: added an outcome summary; glossed BACKLOG.md, `freeze-contracts` and valsgo (private sibling repo); removed a duplicate empty Acceptance criteria heading; replaced cut-off work-log entries (plan and context hints are in the sections above; implementer/review/revision lines trimmed to complete text; decision line restored from the pre-release commit message).

@@ -4,20 +4,20 @@ title: 'Multi-drive relocate: crash journal + streaming (data-loss risk at RF=1)
 status: done
 priority: 2
 created: "2026-07-02"
-updated: "2026-07-04"
+updated: "2026-11-11"
 depends_on: []
 spec_refs: []
 ---
 
 ## Description
-BACKLOG.md §Deferred (multi-drive) — but this one is a **data-loss risk**, not a nicety: `relocate` (the offline multi-drive rebalance step) buffers each moved partition fully in RAM and has **no crash journal — a crash mid-relocate can destroy a not-yet-copied source region; real loss at RF=1**. Also slow (offline per-key copy).
+**Outcome (done 2026-07-04):** `relocate` streams one key at a time and follows a per-move crash journal with copy-then-commit ordering, persisted through the `DriveSet` seam. **Open gap (groom 2026-11-11):** only `MemDriveSet` (and test wrappers) persist that journal. `SpdkDriveSet` keeps the seam's no-op defaults (`crates/vals-cluster/src/drive.rs`), and `docs/multi-drive.md` lists the SPDK on-device fingerprint and durable relocate journal as a follow-on. The Plan's "already tracked with task 0006's ride-alongs" did not hold: 0006 filed 0039/0040/0041 only, and no task tracks the SPDK journal. So the RF=1 crash guarantee is not yet durable on the SPDK backend. Exposure today is limited: no `valsd` path calls `relocate` or `NodeHandle::rebalance_drives` (the callers are tests and `crates/vals-bench/src/cluster_passive.rs`). Whether to file the SPDK persistence is flagged in task 0574 ("Backlog groom: decisions needed").
+
+BACKLOG.md (the free-form backlog that preceded `backlog/`; its open items became tasks on 2026-07-02 and it was deleted 2026-08-01, so it is not in the public history) §Deferred (multi-drive) — but this one is a **data-loss risk**, not a nicety: `relocate` (the offline multi-drive rebalance step) buffers each moved partition fully in RAM and has **no crash journal — a crash mid-relocate can destroy a not-yet-copied source region; real loss at RF=1**. Also slow (offline per-key copy).
 
 ## Acceptance criteria
-- A crash at any point during `relocate` leaves the source recoverable (journal or copy-then-commit ordering); kill-the-fix crash tests.
+- A crash at any point during `relocate` leaves the source recoverable (journal or copy-then-commit ordering); kill-the-fix crash tests. *(Met for DriveSets that persist the journal; not durable on SPDK, see the Outcome note.)*
 - Moved partitions stream instead of buffering fully in RAM.
 - (Stretch) live drive hot-swap remains a separate item; don't scope-creep into it.
-
-## Acceptance criteria
 
 ## Plan
 
@@ -58,18 +58,14 @@ Out of scope (per task): live hot-swap; durable SPDK journal/fingerprint block (
 - caller to keep compiling: crates/vals-bench/src/main.rs:1193 drive::relocate(&ds, &before, &after, geom, 1)
 
 ## Work log
-- 2026-07-04 plan: Rewrite `relocate` in crates/vals-cluster/src/drive.rs to be crash-safe and streaming.  Problems today: (1) it reads EVERY moving partition's entries fully into RAM before writing any destination (bec
-…[truncated]
+- 2026-07-04 plan: recorded in the Plan section above.
 - 2026-07-04 context hints: 4 recorded with plan
-- 2026-07-04 context hints: crates/vals-cluster/src/drive.rs — relocate() ~line 435; DriveSet trait ~294 with the fingerprint seam to mimic; verify_layout ~344; Layout::encode/decode ~665; MemDriveSet ~493; tests' NoFpDriveSet
-…[truncated]
-- 2026-07-04 implementer report: Rewrote `relocate` in crates/vals-cluster/src/drive.rs to be crash-safe and streaming (Task 0013 — the RF=1 data-loss risk).  ## What changed  **crates/vals-cluster/src/drive.rs** - **Streaming copy
-…[truncated]
+- 2026-07-04 implementer report: Rewrote `relocate` in crates/vals-cluster/src/drive.rs to be crash-safe and streaming (Task 0013 — the RF=1 data-loss risk).
 - 2026-07-04 review tier: single-opus — reviewers: Claude
-- 2026-07-04 review (Claude): accept — The change fully satisfies the task: relocate now streams per-key (no full-partition RAM buffering) and is crash-safe via a per-move journal persisted before destructive writes and advanced only after
-…[truncated]
+- 2026-07-04 review (Claude): accept — The change fully satisfies the task: relocate now streams per-key (no full-partition RAM buffering) and is crash-safe via a per-move journal persisted before destructive writes.
 - 2026-07-04 decision: accept — commit: Multi-drive relocate: crash journal + streaming copy (fixes data-loss risk at RF=1) (task 0013)
 - 2026-07-04 usage: 64,429 tok (in 158, out 64,271, cache_r 4,372,213, cache_w 210,561) · cost n/a (unpriced)
   implementer: 45,545 tok (in 96, out 45,449, cache_r 2,973,013, cache_w 86,970) · cost n/a (unpriced)
   reviewer:Claude: 10,617 tok (in 30, out 10,587, cache_r 310,758, cache_w 38,151) · cost n/a (unpriced)
   coordinator: 8,267 tok (in 32, out 8,235, cache_r 1,088,442, cache_w 85,440) · cost n/a (unpriced)
+- 2026-11-11 groom: added an outcome summary; flagged that the SPDK DriveSet does not persist the relocate journal or layout fingerprint and that no task tracks it (the "tracked with 0006's ride-alongs" claim did not hold; noted that no valsd path calls relocate; flag filed in task 0574); glossed BACKLOG.md; removed a duplicate empty Acceptance criteria heading; replaced cut-off work-log entries (plan and context hints are in the sections above; implementer/review lines trimmed to complete text).

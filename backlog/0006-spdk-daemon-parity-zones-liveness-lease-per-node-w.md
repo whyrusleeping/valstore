@@ -4,22 +4,22 @@ title: 'SPDK daemon parity: zones + liveness lease + per-node weight on backend=
 status: done
 priority: 2
 created: "2026-07-02"
-updated: "2026-07-04"
+updated: "2026-11-11"
 depends_on: []
 spec_refs: []
 ---
 
 ## Description
-BACKLOG.md §Productization: the `backend = spdk` daemon path serves the **default zone only** and **without the liveness lease** (`serve_multidrive` has neither zones nor a `_with_liveness` variant), and the PD's `data_node` config has no per-node `weight` (weight-1 today; SPDK nodes go through `admin add-node`). This is the headline productization gap — the production backend lacks the features the file backend has.
+**Outcome (done 2026-07-04):** `backend = spdk` honors `gc_grace > 0` (liveness lease) on the single-drive zoned and multi-drive paths, and PD `data_node` entries take `<id>[*<weight>]`. The single-drive SPDK path already served named zones. Follow-ons: task 0039 (named zones on the multi-drive path), 0040 (liveness watermark on the SPDK superblock) and 0041 (box verification); all done.
+
+BACKLOG.md (the free-form backlog that preceded `backlog/`; its open items became tasks on 2026-07-02 and it was deleted 2026-08-01, so it is not in the public history) §Productization: the `backend = spdk` daemon path serves the **default zone only** and **without the liveness lease** (`serve_multidrive` has neither zones nor a `_with_liveness` variant), and the PD's `data_node` config has no per-node `weight` (weight-1 today; SPDK nodes go through `admin add-node`). This is the headline productization gap — the production backend lacks the features the file backend has.
 
 Related deferred follow-ons that naturally ride along (BACKLOG.md §Deferred): persist the liveness watermark on the SPDK superblock; sharded/multidrive `serve_with_liveness` variants; durable drive-layout fingerprint on the SPDK backend (needs a reserved block).
 
 ## Acceptance criteria
 - `valsd node` with `backend = spdk` serves named zones (catalog-pushed and boot-reopened) and honors `gc_grace > 0` → liveness lease, matching the file backend's semantics.
 - Per-node `weight` accepted in PD config `data_node` entries.
-- Daemon e2e test extended (off-hardware where possible) + box verification for the SPDK path.
-
-## Acceptance criteria
+- Daemon e2e test extended (off-hardware where possible) + box verification for the SPDK path. *(Box verification moved to 0041, done; named zones on the multi-drive path moved to 0039, done.)*
 
 ## Plan
 
@@ -54,19 +54,14 @@ Out of scope (split into follow-on tasks after implementation): named zones on t
 - docs/deploy.md lines ~57, ~91-100, ~213 (weight + gc_grace notes)
 
 ## Work log
-- 2026-07-04 plan: Scope assessment: the single-drive SPDK path ALREADY serves the full named-zone catalog (run_node.rs `serve_spdk_zoned`, catalog-pushed + boot-reopened via the region table's persisted per-zone orderi
-…[truncated]
+- 2026-07-04 plan: recorded in the Plan section above.
 - 2026-07-04 context hints: 8 recorded with plan
-- 2026-07-04 context hints: crates/vals-server/src/run_node.rs — serve_spdk (gc_grace rejection l.161, multidrive branch l.190-225) + serve_spdk_zoned (l.234); crates/vals-server/src/config.rs — parse_node_addrs (l.154), Nod
-…[truncated]
-- 2026-07-04 implementer report: Closed the `backend = spdk` daemon-parity gaps that don't need hardware or a new on-device format.  ## What changed  **1. Liveness lease on `backend = spdk`** (was a hard boot error): - `crates/vals-c
-…[truncated]
+- 2026-07-04 implementer report: Closed the `backend = spdk` daemon-parity gaps that don't need hardware or a new on-device format.
 - 2026-07-04 review tier: single-opus — reviewers: Claude
-- 2026-07-04 review (Claude): accept — The change correctly closes the in-scope SPDK daemon-parity gaps. It (1) adds the wipe-before-rejoin liveness lease to both SPDK paths — single-drive per-zone via serve_zoned_with_liveness and multi
-…[truncated]
-- 2026-07-04 decision: accept — commit: feat(server,cluster): SPDK daemon liveness lease + per-node weight in PD data_node config (task 0006)  - backend=spdk now honors gc_grace > 0: single-drive zoned path via   serve_zoned_with_liveness, 
-…[truncated]
+- 2026-07-04 review (Claude): accept — The change correctly closes the in-scope SPDK daemon-parity gaps, adding the wipe-before-rejoin liveness lease to both SPDK paths (single-drive per-zone via serve_zoned_with_liveness, and multi-drive).
+- 2026-07-04 decision: accept — commit: feat(server,cluster): SPDK daemon liveness lease + per-node weight in PD data_node config (task 0006). Per the commit message: new Node::serve_sharded_with_liveness / serve_multidrive_with_liveness with per-shard FileLivenessLog watermarks; spdk requires data_dir when the lease is on; `data_node = <id>[*<weight>] @ addrs` (default 1); follow-ons 0039, 0040, 0041 filed.
 - 2026-07-04 usage: 48,944 tok (in 218, out 48,726, cache_r 7,751,394, cache_w 269,261) · cost n/a (unpriced)
   implementer: 34,084 tok (in 142, out 33,942, cache_r 5,332,239, cache_w 103,630) · cost n/a (unpriced)
   coordinator: 9,657 tok (in 36, out 9,621, cache_r 2,052,129, cache_w 134,830) · cost n/a (unpriced)
   reviewer:Claude: 5,203 tok (in 40, out 5,163, cache_r 367,026, cache_w 30,801) · cost n/a (unpriced)
+- 2026-11-11 groom: added an outcome summary; marked the box-verification criterion as moved to 0041 (and multi-drive named zones to 0039), both done; glossed BACKLOG.md; removed a duplicate empty Acceptance criteria heading; replaced cut-off work-log entries (plan and context hints are in the sections above; implementer/review lines trimmed to complete text; decision line restored from the pre-release commit message).

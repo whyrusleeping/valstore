@@ -4,19 +4,19 @@ title: Lazy/audited boot Merkle leaf-rebuild (today O(dataset) run-sidecar reads
 status: done
 priority: 3
 created: "2026-07-02"
-updated: "2026-07-04"
+updated: "2026-11-11"
 depends_on: []
 spec_refs: []
 ---
 
 ## Description
-From `docs/out-of-core-index.md` C.6 follow-ups: boot leaf-rebuild reads all run sidecars — O(dataset) — partially undoing the Stage A recovery win at very large run counts. Make it lazy (rebuild leaves on first AE touch) or audited/persisted alongside the manifest.
+**Outcome (done 2026-07-04):** boot no longer rebuilds the Merkle leaves; the anti-entropy (AE) leaf accumulator is seeded once, fail-closed, on the first AE leaf touch. Measured locally (release, file-backed, per the pre-release commit message): open stays ~6–8 ms from 80k to 1.28M keys (4 to 64 runs) while the deferred seed carries the dataset-scaled cost (8 → 61 → 385 ms). The one-time serving-core stall at first AE touch went to task 0045 (budgeted/off-core seed, done).
+
+From `docs/out-of-core-index.md` C.6 follow-ups (C.6 = the follow-up list of the LSM stage): boot leaf-rebuild reads all run sidecars — O(dataset) — partially undoing the Stage A (durable index snapshot) recovery win at very large run counts. Make it lazy (rebuild leaves on first AE touch) or audited/persisted alongside the manifest.
 
 ## Acceptance criteria
-- Boot time no longer scales with total run/sidecar volume for the leaf rebuild (measured on a large dataset).
+- Boot time no longer scales with total run/sidecar volume for the leaf rebuild (measured on a large dataset). *(Met locally up to 1.28M keys / 64 runs on the file backend, see Outcome; no box-scale boot measurement is recorded in this task.)*
 - Merkle leaf accumulators remain exact vs `recovered_versions` (the invariant the C.5/C.6 holistic review pinned); tests cover the lazy/persisted path incl. crash between manifest and leaf state.
-
-## Acceptance criteria
 
 ## Plan
 
@@ -61,19 +61,14 @@ Non-goals / follow-on: the O(dataset) pass still happens once, synchronously, on
 - docs/out-of-core-index.md:822 follow-up note to update
 
 ## Work log
-- 2026-07-04 plan: Goal: boot must not pay the O(dataset) run-sidecar pass that today rebuilds the cluster Merkle leaf accumulator. Take the task's first suggested option: **lazy leaf-rebuild on first AE touch** (no new
-…[truncated]
+- 2026-07-04 plan: recorded in the Plan section above.
 - 2026-07-04 context hints: 6 recorded with plan
-- 2026-07-04 context hints: crates/vals-cluster/src/replica.rs: VersionIndex (~line 191), seed/new/open/from_recovered (~369-437), version_leaf_digests/scoped_leaf_digests (~991-1008), retire_leaf call sites (650/691/766/811/834
-…[truncated]
-- 2026-07-04 implementer report: Implemented task 0005: lazy boot Merkle leaf-rebuild — boot no longer pays the O(dataset) run-sidecar pass to rebuild the cluster Merkle leaf accumulator. Took the task's first option (lazy seed on 
-…[truncated]
+- 2026-07-04 implementer report: Implemented task 0005: lazy boot Merkle leaf-rebuild — boot no longer pays the O(dataset) run-sidecar pass to rebuild the cluster Merkle leaf accumulator. Took the task's first option (lazy seed on first AE touch).
 - 2026-07-04 review tier: single-opus — reviewers: Claude
-- 2026-07-04 review (Claude): accept — The change implements the task's first option — lazy Merkle leaf-rebuild on first anti-entropy touch — cleanly and correctly. `VersionedStore::open`/`new` now use plain `Engine::open` (want_versio
-…[truncated]
-- 2026-07-04 decision: accept — commit: perf: lazy boot Merkle leaf-rebuild — seed on first AE touch, not O(dataset) at boot (task 0005)  VersionedStore::open/new no longer run the O(dataset) run-sidecar recovered_versions pass at boot; t
-…[truncated]
+- 2026-07-04 review (Claude): accept — The change implements the task's first option — lazy Merkle leaf-rebuild on first anti-entropy touch — cleanly and correctly. `VersionedStore::open`/`new` now use plain `Engine::open`.
+- 2026-07-04 decision: accept — commit: perf: lazy boot Merkle leaf-rebuild — seed on first AE touch, not O(dataset) at boot (task 0005). Per the commit message: measured open ~6–8 ms flat from 80k to 1.28M keys (4 to 64 runs) vs deferred seed 8 → 61 → 385 ms; tests cover counting-device boot deferral, unseeded-window mutations recomputing exactly, and fail-closed seed error with retry; follow-on 0045 filed.
 - 2026-07-04 usage: 88,179 tok (in 320, out 87,859, cache_r 12,357,459, cache_w 304,070) · cost n/a (unpriced)
   implementer: 67,973 tok (in 216, out 67,757, cache_r 8,629,617, cache_w 132,834) · cost n/a (unpriced)
   coordinator: 10,836 tok (in 52, out 10,784, cache_r 2,947,554, cache_w 126,767) · cost n/a (unpriced)
   reviewer:Claude: 9,370 tok (in 52, out 9,318, cache_r 780,288, cache_w 44,469) · cost n/a (unpriced)
+- 2026-11-11 groom: added an outcome summary with the measurement (recovered from the pre-release commit message; the work log never recorded it); annotated the measured-on-a-large-dataset criterion as met only at local scale; glossed C.6, Stage A and AE; removed a duplicate empty Acceptance criteria heading; replaced cut-off work-log entries (plan and context hints are in the sections above; implementer/review lines trimmed to complete text; decision line restored from the pre-release commit message).

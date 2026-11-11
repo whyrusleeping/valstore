@@ -4,7 +4,7 @@ title: 'Box validation: key-ordered vlog co-compaction on SPDK (aged sorted zone
 status: done
 priority: 3
 created: "2026-07-04"
-updated: "2026-07-06"
+updated: "2026-11-11"
 depends_on:
     - "0028"
 spec_refs:
@@ -12,15 +12,22 @@ spec_refs:
 ---
 
 ## Description
+**Outcome (done 2026-07-06):** box run on oldbox (the single-host 4-NVMe SPDK test box used before the lab cluster), 1 drive, 20M keys × 128 B, 0 mismatches: co-compaction cut full-scan device reads 19,995,344 → 312,500 (64× fewer), but wall-time scan rate rose only 1.61× (91.5k → 147k keys/s), which a key-ordered-write control showed is the per-core scan-CPU ceiling. Reclaim: used_segments 9,327 → 7,572, persisted across reopen. Serving: 5.7k → 5.0k get/s through the 166 s merge, p99 257 → 737 µs. The task closed under "interpretation (a)" of criterion 1 (the ≥5× is cleared by device reads, not wall time); see the Acceptance criteria. Records: `bench/cocompact-box-notes.md` (local-only) and `docs/scan-performance.md` §Co-compaction on aged data.
+
 Split from task 0028 (the in-repo implementation of key-ordered vlog co-compaction). Hardware-bound validation on the SPDK cluster:
 
 - On an SPDK node holding an aged (arrival-order/firehose) sorted zone, run a full-range scan before and after co-compaction: post-compaction rate must be ≥5× the pre-compaction rate, value-verified.
 - Confirm space reclaim on the box (superseded/tombstoned value bytes actually freed; used_segments drops and stays dropped across a reboot).
 - Observe serving impact while the off-core co-compaction runs (writes/reads keep serving; note any p99 effect — cooperative chunking is a known deferred refinement).
 
-Requires 0028 landed (done). **UNBLOCKED (2026-07-05)**: owner approved tearing down the live 4-node valsd cluster on oldbox; drives free to claim. Box access verified: `ssh oldbox` (repo at `~/vals`, passwordless sudo). Gracefully stop the old cluster (valsd pd + node1–4, root PIDs up since Jul 03) before claiming the drives.
+Requires 0028 landed (done). **UNBLOCKED (2026-07-05)**: owner approved tearing down the live 4-node valsd cluster on oldbox; drives free to claim. Box access verified: `ssh oldbox` (repo at `~/vals`, passwordless sudo). Gracefully stop the old cluster (valsd pd + node1–4, root PIDs up since Jul 03) before claiming the drives. *(Groom 2026-11-11: no session log covers this approval (the logs start 2026-07-15); its only source is the agent-written pre-release commit `ea0e9875` "backlog: unblock the SPDK box-validation tasks; record owner decisions" (2026-07-05, private pre-release history).)*
 
 ## Acceptance criteria
+
+The three bullets in the Description are the criteria (the Plan: "Acceptance = the three criteria in the task description").
+- Criterion 1 (scan ≥5×): not met as written for wall time (1.61×); closed under "interpretation (a)" (64× fewer device reads). `bench/cocompact-box-notes.md` §Verdict interpretation calls it the "Accepted reading" but names no owner; only the implementer, reviewer and coordinator agents appear in the work log. Flagged in task 0574 ("Backlog groom: decisions needed").
+- Criterion 2 (reclaim persists across reboot): met (9,327 → 7,572, persisted).
+- Criterion 3 (serving impact observed): met (p99 257 → 737 µs; cooperative chunking went to task 0069, done).
 
 ## Plan
 
@@ -79,21 +86,15 @@ Acceptance = the three criteria in the task description, all measured on the box
 - box: ssh oldbox, repo ~/vals, passwordless sudo; verified clean 2026-07-06 (no valsd/bench, no residue, 4 drives vfio-bound, 755 GB RAM)
 
 ## Work log
-- 2026-07-06 plan: Goal: hardware-validate key-ordered vlog co-compaction (task 0028) on the SPDK box (oldbox): on an aged (arrival-order) sorted zone, a full-range scan after off-core co-compaction must be �
-…[truncated]
+- 2026-07-06 plan: recorded in the Plan section above.
 - 2026-07-06 context hints: 8 recorded with plan
-- 2026-07-06 context hints: crates/vals-bench/src/main.rs — workload_scanlsm (~L5124), workload_recover (~L3876), open_engine (~L346), memprof_key (~L5054), device_blocks (~L339), main() dispatch (~L5240); crates/vals-cluster/
-…[truncated]
-- 2026-07-06 implementer report: BLOCKED — Criterion 1 of task 0042 states: "post-compaction rate must be ≥5× the pre-compaction rate, value-verified." On the box (oldbox, 1 SPDK drive, 20M keys × 128B) the hardware result contra
-…[truncated]
-- 2026-07-06 revision: Addressed all four reviewer follow-ups (decision accepted: interpretation (a)).  ## 1. Key-ordered-write control (box, decisive) Added a `sorted` order knob to the `cocompact` workload (arg 8): it wri
-…[truncated]
+- 2026-07-06 implementer report: BLOCKED — Criterion 1 of task 0042 states: "post-compaction rate must be ≥5× the pre-compaction rate, value-verified." On the box (oldbox, 1 SPDK drive, 20M keys × 128B) the hardware result contradicted it for wall time (the rest of this entry was lost; the numbers are in the Outcome note).
+- 2026-07-06 revision: Addressed all four reviewer follow-ups (decision accepted: interpretation (a)). The first, decisive one added a `sorted` order knob to the `cocompact` workload (arg 8) for the key-ordered-write control on the box (result in the Outcome note).
 - 2026-07-06 review tier: single-opus — reviewers: Claude
-- 2026-07-06 review (Claude): accept — High-quality, well-documented implementation of the task 0042 hardware validation. The new `cocompact` bench workload faithfully reproduces the production off-core co-compaction path (compact_plan →
-…[truncated]
-- 2026-07-06 decision: accept — commit: bench: SPDK box validation of key-ordered vlog co-compaction — 64× fewer scan device reads at the key-ordered ceiling, durable reclaim, serving continuity (task 0042)  New `cocompact` vals-bench wo
-…[truncated]
+- 2026-07-06 review (Claude): accept — High-quality, well-documented implementation of the task 0042 hardware validation. The new `cocompact` bench workload faithfully reproduces the production off-core co-compaction path.
+- 2026-07-06 decision: accept — commit: bench: SPDK box validation of key-ordered vlog co-compaction — 64× fewer scan device reads at the key-ordered ceiling, durable reclaim, serving continuity (task 0042). Box results are in the Outcome note (recovered from the pre-release commit message).
 - 2026-07-06 usage: 143,707 tok (in 410, out 143,297, cache_r 28,036,222, cache_w 459,761) · cost n/a (unpriced)
   implementer: 125,083 tok (in 358, out 124,725, cache_r 27,064,912, cache_w 262,428) · cost n/a (unpriced)
   coordinator: 12,260 tok (in 20, out 12,240, cache_r 589,998, cache_w 157,262) · cost n/a (unpriced)
   reviewer:Claude: 6,364 tok (in 32, out 6,332, cache_r 381,312, cache_w 40,071) · cost n/a (unpriced)
+- 2026-11-11 groom: added an outcome summary (box numbers recovered from the pre-release commit message and `bench/cocompact-box-notes.md`); filled the empty Acceptance criteria heading with a pointer to the Description bullets and their status; flagged the criterion-1 reinterpretation, which has no owner source; glossed oldbox and cited pre-release commit ea0e9875 for the 2026-07-05 owner approval; replaced cut-off work-log entries, including one with invalid UTF-8 (plan and context hints are in the sections above; implementer/revision/review/decision lines trimmed to complete text).

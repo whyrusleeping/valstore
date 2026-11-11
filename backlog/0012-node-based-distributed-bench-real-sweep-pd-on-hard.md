@@ -4,21 +4,21 @@ title: Node-based distributed bench (real sweep + PD on hardware)
 status: done
 priority: 3
 created: "2026-07-02"
-updated: "2026-07-06"
+updated: "2026-11-11"
 depends_on: []
 spec_refs: []
 ---
 
 ## Description
-**UNBLOCKED (2026-07-05)**: owner approved tearing down the live 4-node valsd cluster on oldbox; the four vfio-bound NVMe drives are free to claim. Box access verified: `ssh oldbox` (repo checkout at `~/vals`, passwordless sudo). First box session must gracefully stop the old cluster (valsd pd + node1–4, root PIDs up since Jul 03) before claiming the drives.
+**Outcome (done 2026-07-06):** `vals-bench distnode` drives live Nodes with a PD; per the pre-release commit message, box runs on oldbox (the single-host 4-NVMe SPDK test box) gave FLOWS OK end to end (heal 5k keys in 11.1 s, joiner serves its owned keys alone in 10.8 s, clean teardown) and sweep-heal at a 50k backlog passed (447 keys/s). The 2M-key stress run surfaced a >1 h graceful-shutdown drain wedge, filed as task 0073 (done). Runbook: `plans/distnode-box-bench.md`; run records: `bench/distnode-box-notes.md` (local-only).
 
-BACKLOG.md §Hardware/benchmarking: every distributed bench (`distspdk`/`distspdkmc`/`distmdmc`/`distresil`) drives passive `ShardedServer`s with no anti-entropy sweep, so over-replication cleanup, eager rebalancing, per-zone AE, and the liveness lease are only validated off-hardware. A bench on `Node::serve`/`serve_zoned` (real sweep loops + a PD pushing membership) would hardware-exercise the full healing/rebalancing path. (The `rsweep.sh`/kvchurn recipes already do part of this ad hoc — consider promoting them.)
+**UNBLOCKED (2026-07-05)**: owner approved tearing down the live 4-node valsd cluster on oldbox; the four vfio-bound NVMe drives are free to claim. Box access verified: `ssh oldbox` (repo checkout at `~/vals`, passwordless sudo). First box session must gracefully stop the old cluster (valsd pd + node1–4, root PIDs up since Jul 03) before claiming the drives. *(Groom 2026-11-11: no session log covers this approval (the logs start 2026-07-15); its only source is the agent-written pre-release commit `ea0e9875` "backlog: unblock the SPDK box-validation tasks; record owner decisions" (2026-07-05, private pre-release history), which records an owner session that day.)*
+
+BACKLOG.md (the free-form backlog that preceded `backlog/`; its open items became tasks on 2026-07-02 and it was deleted 2026-08-01, so it is not in the public history) §Hardware/benchmarking: every distributed bench (`distspdk`/`distspdkmc`/`distmdmc`/`distresil`) drives passive `ShardedServer`s with no anti-entropy sweep, so over-replication cleanup, eager rebalancing, per-zone AE, and the liveness lease are only validated off-hardware. A bench on `Node::serve`/`serve_zoned` (real sweep loops + a PD pushing membership) would hardware-exercise the full healing/rebalancing path. (The `rsweep.sh`/kvchurn recipes already do part of this ad hoc — consider promoting them.)
 
 ## Acceptance criteria
 - A repeatable bench mode drives live `Node`s (sweep + compaction + PD) on the SPDK box and reports healing metrics (ae counters, cleanup, lease events) alongside throughput.
 - Documented run recipe (plans/ runbook or bench README).
-
-## Acceptance criteria
 
 ## Plan
 
@@ -61,25 +61,18 @@ VERIFICATION (implementer): cargo build + clippy clean; `cargo run -p vals-bench
 - bench/spdk-liveness-box-notes.md — box conventions (sudo, LD_LIBRARY_PATH, drive list, hygiene)
 
 ## Work log
-- 2026-07-06 plan: Goal: a repeatable vals-bench workload ("distnode") that drives LIVE `Node`s — real anti-entropy sweep loops, background compaction, the liveness lease, and a PdDaemon pushing membership — instead
-…[truncated]
+- 2026-07-06 plan: recorded in the Plan section above.
 - 2026-07-06 context hints: 8 recorded with plan
-- 2026-07-06 context hints: crates/vals-bench/src/main.rs — workload_distspdk (~L1149) cluster/teardown shape; workload_distzone (~L2621) SpdkZoneStore + zone writes; workload_distresil (~L1679) 1-drive-per-node RF=3; main() d
-…[truncated]
-- 2026-07-06 implementer report: Added a repeatable `distnode` bench mode to `vals-bench` that drives LIVE `Node`s (real anti-entropy sweep loops, background compaction, the wipe-before-rejoin liveness lease, and a `PdDaemon` pushing
-…[truncated]
+- 2026-07-06 implementer report: Added a repeatable `distnode` bench mode to `vals-bench` that drives LIVE `Node`s (real anti-entropy sweep loops, background compaction, the wipe-before-rejoin liveness lease, and a `PdDaemon` pushing membership).
 - 2026-07-06 review tier: single-opus — reviewers: Claude
-- 2026-07-06 review (Claude): accept — The change adds a repeatable `distnode` bench mode to vals-bench that drives LIVE Nodes (real anti-entropy sweeps, background compaction, the wipe-before-rejoin liveness lease, and a PdDaemon pushing 
-…[truncated]
-- 2026-07-06 revision: Addressed both review items in `distnode_core` (crates/vals-bench/src/main.rs); build + clippy clean, mem smoke still FLOWS: OK.  ## Fix 1 — P4 live_keys peak now sampled from the join instant - Int
-…[truncated]
-- 2026-07-06 revision: Made the heal/rebalance verify windows env-tunable and documented the AE-budget sizing story — no product code changed.  ## crates/vals-bench/src/main.rs (distnode_core) - Added two env knobs: `VALS
-…[truncated]
-- 2026-07-06 review (Claude): accept — The revision resolves both prior findings and improves the change further. `peak_live` is now a running max bumped on every P4 poll tick from the moment the joiner is advertised (correct mechanism for
-…[truncated]
-- 2026-07-06 decision: accept — commit: bench: distnode — live-Node distributed bench (real sweep + compaction + liveness lease + PD) validated on the SPDK box (task 0012)  New vals-bench workload driving live Node::serve_zoned_with_liven
-…[truncated]
+- 2026-07-06 review (Claude): accept — The change adds a repeatable `distnode` bench mode to vals-bench that drives LIVE Nodes (real anti-entropy sweeps, background compaction, the wipe-before-rejoin liveness lease, and a PdDaemon pushing membership).
+- 2026-07-06 revision: Addressed both review items in `distnode_core` (crates/vals-bench/src/main.rs); build + clippy clean, mem smoke still FLOWS: OK. Fix 1: the P4 live_keys peak is now sampled from the join instant.
+- 2026-07-06 revision: Made the heal/rebalance verify windows env-tunable and documented the AE-budget sizing story — no product code changed.
+- 2026-07-06 review (Claude): accept — The revision resolves both prior findings and improves the change further. `peak_live` is now a running max bumped on every P4 poll tick from the moment the joiner is advertised.
+- 2026-07-06 decision: accept — commit: bench: distnode — live-Node distributed bench (real sweep + compaction + liveness lease + PD) validated on the SPDK box (task 0012). Box results are in the Outcome note above.
 - 2026-07-06 usage: 127,060 tok (in 414, out 126,646, cache_r 21,035,359, cache_w 1,918,938) · cost n/a (unpriced)
   implementer: 77,282 tok (in 236, out 77,046, cache_r 12,746,754, cache_w 494,872) · cost n/a (unpriced)
   coordinator: 39,328 tok (in 120, out 39,208, cache_r 7,369,613, cache_w 1,320,926) · cost n/a (unpriced)
   reviewer:Claude: 10,450 tok (in 58, out 10,392, cache_r 918,992, cache_w 103,140) · cost n/a (unpriced)
+
+- 2026-11-11 groom: added an outcome summary with the box results and follow-on 0073 (recovered from the pre-release commit message); noted the 2026-07-05 owner approval has no session log and cited its only source, pre-release commit ea0e9875; glossed oldbox and BACKLOG.md; removed a duplicate empty Acceptance criteria heading; replaced cut-off work-log entries (plan and context hints are in the sections above; implementer/review/revision lines trimmed to complete text; decision line restored from the pre-release commit message).

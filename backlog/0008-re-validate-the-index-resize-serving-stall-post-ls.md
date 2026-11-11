@@ -4,7 +4,7 @@ title: Re-validate the index-resize serving stall post-LSM (close or fix)
 status: done
 priority: 3
 created: "2026-07-02"
-updated: "2026-07-06"
+updated: "2026-11-11"
 depends_on: []
 spec_refs: []
 ---
@@ -12,7 +12,7 @@ spec_refs: []
 ## Description
 
 **RESOLVED 2026-07-06 (HEAD `664397b`).** Re-ran the 1B-key SPDK ingest on
-oldbox (3-node RF=3, sweep off, flush decoupled at 1 s via
+oldbox (the single-host 4-NVMe SPDK test box used before the lab cluster; 3-node RF=3, sweep off, flush decoupled at 1 s via
 `VALS_FLUSH_INTERVAL_MS=1000`, `region_mib=1 TiB`, kvchurn `--count 1e9 --rounds 0`,
 to hundreds of millions of keys/node). **Full write-up + dip table:
 `bench/resize-stall-1b-revalidation.md`; reusable harness `bench/r1b.sh`.**
@@ -30,17 +30,15 @@ is closed with evidence; the surviving stall is tracked in 0068.
 
 ---
 
-BACKLOG.md §Scaling recorded periodic whole-cluster ingest collapse at 1B-key scale: `HashMap`/`BTreeMap` doubling on the serving core is a multi-second O(n) stall (observed with sweep disabled, hundreds of millions of keys/node). **This diagnosis predates the LSM**: the memtable is now byte-capped (flush drains it) and the per-key in-RAM version index was retired (C.5a-3/4), which plausibly dissolves the unbounded-map-growth mechanism. 
+BACKLOG.md (the free-form backlog that preceded `backlog/`; its open items became tasks on 2026-07-02 and it was deleted 2026-08-01, so it is not in the public history) §Scaling recorded periodic whole-cluster ingest collapse at 1B-key scale: `HashMap`/`BTreeMap` doubling on the serving core is a multi-second O(n) stall (observed with sweep disabled, hundreds of millions of keys/node). **This diagnosis predates the LSM**: the memtable is now byte-capped (flush drains it) and the per-key in-RAM version index was retired (C.5a-3/4, the LSM-stage steps in `docs/out-of-core-index.md`), which plausibly dissolves the unbounded-map-growth mechanism. 
 
 Task: re-run the 1B-key SPDK ingest (rsweep/kvchurn recipe in BACKLOG.md) on current HEAD; if the periodic deep dips are gone, close this with the measurement; if not, fix (pre-size from key-count hints / incremental-sharded growth / off-core growth).
 
-**UNBLOCKED (2026-07-05)**: owner approved tearing down the live 4-node valsd cluster on oldbox; the four vfio-bound NVMe drives are free to claim. Box access verified from this environment: `ssh oldbox` (repo checkout at `~/vals`, passwordless sudo). First box session must gracefully stop the old cluster (valsd pd + node1–4, root PIDs up since Jul 03) before claiming the drives.
+**UNBLOCKED (2026-07-05)**: owner approved tearing down the live 4-node valsd cluster on oldbox; the four vfio-bound NVMe drives are free to claim. Box access verified from this environment: `ssh oldbox` (repo checkout at `~/vals`, passwordless sudo). First box session must gracefully stop the old cluster (valsd pd + node1–4, root PIDs up since Jul 03) before claiming the drives (done: the plan below found it already stopped). *(Groom 2026-11-11: no session log covers this approval (the logs start 2026-07-15); its only source is the agent-written pre-release commit `ea0e9875` "backlog: unblock the SPDK box-validation tasks; record owner decisions" (2026-07-05, private pre-release history), which records an owner session that day.)*
 
 ## Acceptance criteria
 - A/B ingest measurement at ≥hundreds of millions of keys/node recorded (dips present/absent).
 - Either the item is closed with evidence, or a fix lands with a regression measurement.
-
-## Acceptance criteria
 
 ## Plan
 
@@ -74,24 +72,17 @@ Re-run the 1B-key SPDK ingest on current HEAD (664397b) on oldbox and decide: di
 - metrics: curl 127.0.0.1:946{1,2,3}/metrics → vals_records_written etc; check what flush/merge/compaction counters exist to attribute dips
 
 ## Work log
-- 2026-07-05 plan: Re-run the 1B-key SPDK ingest on current HEAD (664397b) on oldbox and decide: dips gone → close the BACKLOG §Scaling "index resize stall" item with the measurement; dips present → diagn
-…[truncated]
+- 2026-07-05 plan: recorded in the Plan section above.
 - 2026-07-05 context hints: 8 recorded with plan
-- 2026-07-05 context hints: box: ssh oldbox; harness ~/run/cluster/rsweep.sh (read it first — killall_vrun, conf templating, 10s sumc sampler are all there to copy); box repo ~/vals (currently 24b87a3; needs 
-…[truncated]
-- 2026-07-06 implementer report: Re-validated the BACKLOG §Scaling "in-memory index resize stalls the serving core" 1B-key ingest item on current HEAD (664397b), on oldbox. **Decision: closed the index-resize item with evi
-…[truncated]
-- 2026-07-06 revision: Addressed both reviewer doc fixes:  1. **backlog/0068 (~line 22):** Corrected the leaked-in original-run figure. "the cluster held ~1.3–1.6 M replica-writes/s (≈130–160 k/s per node × 3)" → "
-…[truncated]
+- 2026-07-06 implementer report: Re-validated the BACKLOG §Scaling "in-memory index resize stalls the serving core" 1B-key ingest item on current HEAD (664397b), on oldbox. Decision: closed the index-resize item with evidence (see the RESOLVED note in the Description).
+- 2026-07-06 revision: Addressed both reviewer doc fixes; the first corrected a leaked-in original-run figure in backlog/0068 (~line 22), "the cluster held ~1.3–1.6 M replica-writes/s (≈130–160 k/s per node × 3)" (0068 holds the corrected wording).
 - 2026-07-06 review tier: single-opus — reviewers: Claude
-- 2026-07-06 review (Claude): accept — Documentation/measurement task completed correctly. The 1B-key SPDK re-validation is recorded (bench/resize-stall-1b-revalidation.md), with a reusable harness (bench/r1b.sh), the BACKLOG §Scaling ite
-…[truncated]
-- 2026-07-06 revision: Addressed both final documentation items, each verified against the box and source first.  **Verification done before editing:** - Box `kvchurn.1b.log`: exactly 10 `MISMATCH [load: write failed]` line
-…[truncated]
-- 2026-07-06 review (Claude): accept — Documentation/measurement task, revised well. The prior nit (RF-factor ambiguity) is resolved with a precise explanation in both the write-up and task 0068, and the implementer added a substantiated a
-…[truncated]
+- 2026-07-06 review (Claude): accept — Documentation/measurement task completed correctly. The 1B-key SPDK re-validation is recorded (bench/resize-stall-1b-revalidation.md), with a reusable harness (bench/r1b.sh).
+- 2026-07-06 revision: Addressed both final documentation items, each verified against the box and source first, e.g. the box `kvchurn.1b.log` has exactly 10 `MISMATCH [load: write failed]` lines (recorded in the write-up).
+- 2026-07-06 review (Claude): accept — Documentation/measurement task, revised well. The prior nit (RF-factor ambiguity) is resolved with a precise explanation in both the write-up and task 0068.
 - 2026-07-06 decision: accept — commit: bench: 1B-key re-validation closes the index-resize stall with evidence; residual merge-blocks-flush stall filed as 0068 (task 0008)
 - 2026-07-06 usage: 105,530 tok (in 290, out 105,240, cache_r 12,554,701, cache_w 311,600) · cost n/a (unpriced)
   implementer: 80,212 tok (in 216, out 79,996, cache_r 10,226,025, cache_w 155,623) · cost n/a (unpriced)
   coordinator: 18,636 tok (in 46, out 18,590, cache_r 1,989,641, cache_w 116,166) · cost n/a (unpriced)
   reviewer:Claude: 6,682 tok (in 28, out 6,654, cache_r 339,035, cache_w 39,811) · cost n/a (unpriced)
+- 2026-11-11 groom: glossed BACKLOG.md and C.5a-3/4; noted the old-cluster teardown step as done; noted the 2026-07-05 owner approval has no session log and cited its only source, pre-release commit ea0e9875; removed a duplicate empty Acceptance criteria heading; replaced cut-off work-log entries (plan and context hints are in the sections above; implementer/review/revision lines trimmed to complete text).
