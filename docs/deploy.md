@@ -681,6 +681,34 @@ What matters operationally:
   formats a region, zeroes every segment header first, so records left on a
   reused drive by an earlier layout can never be replayed as live data.
 
+## Run compression on CPU-limited nodes
+
+Run blocks are zstd level 1 by default (`VALS_RUN_FLUSH_ZSTD_LEVEL`,
+`VALS_RUN_MERGE_ZSTD_LEVEL`, see [configuration.md](configuration.md)). Any
+level, or `off`, can be set on any restart: no format change, and old runs stay
+as written. Measured on fresh-key ingest (task 0573):
+
+| node | setting (flush / merge) | ingest | node CPU per write | device bytes per write |
+|---|---|---|---|---|
+| 8-vCPU AWS i4i.2xlarge, colocated client | 1 / 1 (default) | 479k/s | 8.98 µs | 286 |
+| same | `off` / 1 | +3.1% | −9.5% | +16% |
+| same | −1 / −1 | +1.4% | −4.1% | +4% |
+| same | `off` / −1 | +2.3% | −9.8% | +18% |
+| two-node replay, each node confined to 8 cores | 1 / 1 (default) | 1.29M ACK/s to 1.5B | | 324 |
+| same | −1 / −1 | +4.0% | −4% | +3% |
+| same | `off` / 1 | +4.3% | −4% | +21% |
+| same | `off` / −1 | +4.6% | −5% | +23% |
+| two-node replay, 24 cores | −1 / −1 vs 1 / 1 | within noise (±2%) | | +3% |
+
+So on a node whose CPU is saturated and whose drive has headroom, set the flush
+level to `off` (largest CPU saving; flush runs are short-lived because merges
+rewrite them) and, if CPU is still the limit, the merge level to −1. Keep the
+defaults when the device's write bandwidth or endurance is the limit: the
+two-node replay became device-bound after about 2B writes, where fewer device
+bytes per write was worth 15% of ingest time (0564). Lower levels also make
+point reads that reach a run block a little cheaper (decompression is 30–35%
+faster at −1); `off` on both paths gives version-6 probe costs.
+
 ## Memory sizing
 
 The capacity profile keeps the point index out of core, but each zone engine
